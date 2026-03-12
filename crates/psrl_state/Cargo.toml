@@ -1,0 +1,35 @@
+# PR 0: Migrate psrl_state crate into SMG workspace (plan.md §0.1)
+[package]
+name = "psrl-state"
+version = "0.1.0"
+edition = "2021"
+description = "gRPC client for PSRL state service"
+license = "Apache-2.0"
+authors = [
+    "Sheng Lin <linsh@stu.pku.edu.cn>",
+]
+keywords = ["grpc", "psrl"]
+categories = ["api-bindings"]
+
+[lib]
+name = "psrl_state"
+
+[dependencies]
+# Workspace dependencies
+tokio.workspace = true
+tracing.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+futures.workspace = true
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
+prost-build = "0.14.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

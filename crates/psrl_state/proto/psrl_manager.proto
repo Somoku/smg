@@ -1,0 +1,117 @@
+syntax = "proto3";
+
+package psrl.state;
+
+message RolloutInstanceId {
+	string worker_id = 1;
+	int64 dp_rank = 2;
+}
+
+message CanReserveRequestReq {
+	repeated int64 request_ids = 1;
+	repeated int64 model_versions = 2;
+	bool without_new_reserve_entry = 3;
+	// If empty => false; if len=1 => scalar; if len>1 => per-request flags.
+	repeated bool is_validate = 4;
+}
+
+message CanReserveRequestResp {
+	// Flattened row-major matrix with shape [request_ids, model_versions].
+	repeated bool results = 1;
+	int32 n_versions = 2;
+}
+
+message GetReserveIndicatorReq {
+	int64 request_id = 1;
+	repeated int64 model_versions = 2;
+	bool is_validate = 3;
+}
+
+message GetReserveIndicatorResp {
+	repeated double indicators = 1;
+}
+
+message ReserveRolloutInstanceRequestsReq {
+	repeated RolloutInstanceId rollout_instance_ids = 1;
+	repeated int64 request_ids = 2;
+	repeated int64 model_versions = 3;
+	bool guarantee_not_aborted = 4;
+	bool is_validate = 5;
+}
+
+message ReserveRolloutInstanceRequestsResp {
+	bool success = 1;
+	// If Python returns None for an element, it is encoded as -1.
+	repeated int64 buffer_ids = 2;
+	repeated int64 entry_ids = 3;
+	string error_message = 4;
+}
+
+message UpdateRequestInstanceIdReq {
+	int64 request_id = 1;
+	RolloutInstanceId new_instance_id = 2;
+	bool is_validate = 3;
+}
+
+message UpdateRequestInstanceIdResp {
+	bool success = 1;
+}
+
+message UpdateRequestVersionTagReq {
+	int64 request_id = 1;
+	int64 new_version_tag = 2;
+	bool is_validate = 3;
+}
+
+message UpdateRequestVersionTagResp {
+	bool success = 1;
+}
+
+message CheckAbortedRequestsReq {
+	repeated int64 request_ids = 1;
+	bool remove = 2;
+}
+
+message CheckAbortedRequestsResp {
+	repeated bool is_aborted = 1;
+}
+
+message CheckAbortedModelVersionsReq {
+	repeated int64 model_versions = 1;
+}
+
+message CheckAbortedModelVersionsResp {
+	repeated bool is_aborted = 1;
+}
+
+message GetRolloutInstanceModelVersionReq {
+	RolloutInstanceId rollout_instance_id = 1;
+}
+
+message GetRolloutInstanceModelVersionResp {
+	int64 model_version = 1;
+}
+
+message UpdateRequestStatusReq {
+	repeated int64 request_ids = 1;
+	string status = 2;
+	repeated int64 model_versions = 3;
+	repeated RolloutInstanceId rollout_instance_ids = 4;
+	bool is_validate = 5;
+}
+
+message UpdateRequestStatusResp {
+	repeated bool succeeded = 1;
+}
+
+service PSManagerState {
+	rpc CanReserveRequest(CanReserveRequestReq) returns (CanReserveRequestResp);
+	rpc GetReserveIndicator(GetReserveIndicatorReq) returns (GetReserveIndicatorResp);
+	rpc ReserveRolloutInstanceRequests(ReserveRolloutInstanceRequestsReq) returns (ReserveRolloutInstanceRequestsResp);
+	rpc UpdateRequestInstanceId(UpdateRequestInstanceIdReq) returns (UpdateRequestInstanceIdResp);
+	rpc UpdateRequestVersionTag(UpdateRequestVersionTagReq) returns (UpdateRequestVersionTagResp);
+	rpc CheckAbortedRequests(CheckAbortedRequestsReq) returns (CheckAbortedRequestsResp);
+	rpc CheckAbortedModelVersions(CheckAbortedModelVersionsReq) returns (CheckAbortedModelVersionsResp);
+	rpc GetRolloutInstanceModelVersion(GetRolloutInstanceModelVersionReq) returns (GetRolloutInstanceModelVersionResp);
+	rpc UpdateRequestStatus(UpdateRequestStatusReq) returns (UpdateRequestStatusResp);
+}
