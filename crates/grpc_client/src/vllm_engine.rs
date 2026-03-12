@@ -13,7 +13,7 @@ use openai_protocol::{
     common::{ResponseFormat, StringOrArray, ToolChoice, ToolChoiceValue},
     generate::GenerateRequest,
     responses::ResponsesRequest,
-    sampling_params::SamplingParams as GenerateSamplingParams,
+    sampling_params::{resolve_seed, SamplingParams as GenerateSamplingParams},
 };
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
@@ -563,6 +563,52 @@ impl VllmEngineClient {
         }
     }
 
+    // PR 9 §9.4b: Build constraint from StructuredOutputsParams (vLLM-style nested object)
+    fn build_constraint_from_structured_outputs(
+        params: &GenerateSamplingParams,
+    ) -> Result<Option<proto::sampling_params::Constraint>, String> {
+        let Some(so) = &params.structured_outputs else {
+            return Ok(None);
+        };
+
+        if let Some(json) = &so.json {
+            let schema_str = serde_json::to_string(json)
+                .map_err(|e| format!("Failed to serialize structured_outputs.json: {e}"))?;
+            return Ok(Some(proto::sampling_params::Constraint::JsonSchema(
+                schema_str,
+            )));
+        }
+        if let Some(regex) = &so.regex {
+            return Ok(Some(proto::sampling_params::Constraint::Regex(
+                regex.clone(),
+            )));
+        }
+        if let Some(choices) = &so.choice {
+            return Ok(Some(proto::sampling_params::Constraint::Choice(
+                proto::ChoiceConstraint {
+                    choices: choices.clone(),
+                },
+            )));
+        }
+        if let Some(grammar) = &so.grammar {
+            return Ok(Some(proto::sampling_params::Constraint::Grammar(
+                grammar.clone(),
+            )));
+        }
+        if let Some(true) = so.json_object {
+            return Ok(Some(proto::sampling_params::Constraint::JsonObject(true)));
+        }
+        if let Some(tag) = &so.structural_tag {
+            return Ok(Some(proto::sampling_params::Constraint::StructuralTag(
+                tag.clone(),
+            )));
+        }
+
+        // No constraint fields set (valid — StructuredOutputsParams allows zero constraints)
+        Ok(None)
+    }
+
+    // PR 9 §9.4a: Map new fields for multi-backend support
     fn build_sampling_params_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> Result<proto::SamplingParams, String> {
@@ -611,7 +657,16 @@ impl VllmEngineClient {
         if let Some(val) = p.skip_special_tokens {
             sampling.skip_special_tokens = val;
         }
-        // Note: no_stop_trim not supported in vLLM
+
+        // PR 9 §9.4a: Map no_stop_trim → include_stop_str_in_output (vLLM naming)
+        if let Some(val) = p.no_stop_trim {
+            sampling.include_stop_str_in_output = val;
+        }
+
+        // PR 9 §9.4a: Map spaces_between_special_tokens
+        if let Some(val) = p.spaces_between_special_tokens {
+            sampling.spaces_between_special_tokens = val;
+        }
 
         // Handle stop sequences
         if let Some(stop) = &p.stop {
@@ -641,8 +696,42 @@ impl VllmEngineClient {
             sampling.n = n;
         }
 
-        // Handle constraints (exactly one allowed)
-        sampling.constraint = Self::build_single_constraint_from_plain(p)?;
+        // PR 9 §9.4a: Map logprobs (SamplingParams.logprobs → proto SamplingParams.logprobs)
+        if let Some(lp) = p.logprobs {
+            sampling.logprobs = Some(lp);
+        }
+
+        // PR 9 §9.4a: Map prompt_logprobs
+        if let Some(plp) = p.prompt_logprobs {
+            sampling.prompt_logprobs = Some(plp);
+        }
+
+        // PR 9 §9.4a: Map seed via resolve_seed() — handles both sampling_seed (u64) and seed (i64)
+        if let Some(resolved) = resolve_seed(p) {
+            sampling.seed = Some(resolved as i32);
+        }
+
+        // PR 9 §9.4a: Map logit_bias (String keys → i32 keys for vLLM proto)
+        if let Some(bias) = &p.logit_bias {
+            for (key, &value) in bias {
+                if let Ok(token_id) = key.parse::<i32>() {
+                    sampling.logit_bias.insert(token_id, value);
+                }
+            }
+        }
+
+        // PR 9 §9.4a: Map truncate_prompt_tokens
+        if let Some(val) = p.truncate_prompt_tokens {
+            sampling.truncate_prompt_tokens = Some(val);
+        }
+
+        // PR 9 §9.4b: Handle constraints — flat fields OR structured_outputs (never both,
+        // validated by SamplingParams::validate())
+        if p.structured_outputs.is_some() {
+            sampling.constraint = Self::build_constraint_from_structured_outputs(p)?;
+        } else {
+            sampling.constraint = Self::build_single_constraint_from_plain(p)?;
+        }
 
         Ok(sampling)
     }
@@ -738,6 +827,105 @@ mod tests {
     // vLLM handles multimodal inputs differently than SGLang
 
     // TODO: SessionParams not in current proto - skip test
+
+    // ── PR 9 §9.4a-c: Tests for multi-backend field mapping ──
+
+    #[test]
+    fn test_build_sampling_params_with_logprobs() {
+        let params = GenerateSamplingParams {
+            logprobs: Some(5),
+            prompt_logprobs: Some(3),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(result.logprobs, Some(5));
+        assert_eq!(result.prompt_logprobs, Some(3));
+    }
+
+    #[test]
+    fn test_build_sampling_params_with_seed_from_seed() {
+        let params = GenerateSamplingParams {
+            seed: Some(42),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(result.seed, Some(42));
+    }
+
+    #[test]
+    fn test_build_sampling_params_with_seed_from_sampling_seed() {
+        let params = GenerateSamplingParams {
+            sampling_seed: Some(99),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(result.seed, Some(99));
+    }
+
+    #[test]
+    fn test_build_sampling_params_no_stop_trim() {
+        let params = GenerateSamplingParams {
+            no_stop_trim: Some(true),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert!(result.include_stop_str_in_output);
+    }
+
+    #[test]
+    fn test_build_sampling_params_with_logit_bias() {
+        use std::collections::HashMap;
+        let mut bias = HashMap::new();
+        bias.insert("100".to_string(), 1.5_f32);
+        bias.insert("200".to_string(), -0.5_f32);
+        let params = GenerateSamplingParams {
+            logit_bias: Some(bias),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(result.logit_bias.len(), 2);
+        assert_eq!(result.logit_bias[&100], 1.5);
+        assert_eq!(result.logit_bias[&200], -0.5);
+    }
+
+    #[test]
+    fn test_build_sampling_params_with_structured_outputs_choice() {
+        use openai_protocol::sampling_params::StructuredOutputsParams;
+        let params = GenerateSamplingParams {
+            structured_outputs: Some(StructuredOutputsParams {
+                choice: Some(vec!["yes".to_string(), "no".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        match result.constraint {
+            Some(proto::sampling_params::Constraint::Choice(c)) => {
+                assert_eq!(c.choices, vec!["yes", "no"]);
+            }
+            other => panic!("Expected Choice constraint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_build_sampling_params_with_truncate_prompt_tokens() {
+        let params = GenerateSamplingParams {
+            truncate_prompt_tokens: Some(512),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert_eq!(result.truncate_prompt_tokens, Some(512));
+    }
+
+    #[test]
+    fn test_build_sampling_params_spaces_between_special_tokens() {
+        let params = GenerateSamplingParams {
+            spaces_between_special_tokens: Some(false),
+            ..Default::default()
+        };
+        let result = VllmEngineClient::build_sampling_params_from_plain(Some(&params)).unwrap();
+        assert!(!result.spaces_between_special_tokens);
+    }
 
     #[test]
     fn test_embed_request() {

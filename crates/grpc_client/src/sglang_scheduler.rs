@@ -374,6 +374,19 @@ impl SglangSchedulerClient {
         let sampling_params =
             Self::build_sampling_params_from_plain(body.sampling_params.as_ref())?;
 
+        // PR 9: Ignore SamplingParams.logprobs
+        if body
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.logprobs).is_some()
+        {
+            // Ignore logprobs in sampling_params, use top-level fields instead.
+            warn!(
+                "logprobs field in sampling_params is not supported for SGLang and will be ignored. 
+                Please use the top-level return_logprob and top_logprobs fields instead."
+            );
+        }
+
         let grpc_request = proto::GenerateRequest {
             request_id,
             tokenized: Some(proto::TokenizedInput {
@@ -632,6 +645,7 @@ impl SglangSchedulerClient {
         }
     }
 
+    // PR 9 §9.5a: Map new fields for multi-backend support
     fn build_sampling_params_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> Result<proto::SamplingParams, String> {
@@ -670,6 +684,11 @@ impl SglangSchedulerClient {
         map_field!(skip_special_tokens);
         map_field!(no_stop_trim);
 
+        // PR 9 §9.5a: Map spaces_between_special_tokens
+        if let Some(val) = p.spaces_between_special_tokens {
+            sampling.spaces_between_special_tokens = val;
+        }
+
         // Handle stop sequences
         if let Some(stop) = &p.stop {
             match stop {
@@ -696,7 +715,15 @@ impl SglangSchedulerClient {
             sampling.n = n;
         }
 
+        // PR 9 §9.5a: Map logit_bias (String keys → String keys, SGLang proto uses map<string, float>)
+        if let Some(bias) = &p.logit_bias {
+            for (key, &value) in bias {
+                sampling.logit_bias.insert(key.clone(), value);
+            }
+        }
+
         // Handle constraints (exactly one allowed)
+        // Note: structured_outputs not natively supported by SGLang — flat fields used instead
         sampling.constraint = Self::build_single_constraint_from_plain(p)?;
 
         Ok(sampling)

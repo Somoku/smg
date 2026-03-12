@@ -13,7 +13,7 @@ use openai_protocol::{
     common::{ResponseFormat, StringOrArray},
     generate::GenerateRequest,
     responses::ResponsesRequest,
-    sampling_params::SamplingParams as GenerateSamplingParams,
+    sampling_params::{resolve_seed, SamplingParams as GenerateSamplingParams},
 };
 use tonic::{transport::Channel, Request, Streaming};
 use tracing::{debug, warn};
@@ -333,13 +333,30 @@ impl TrtllmServiceClient {
         token_ids: Vec<u32>,
     ) -> Result<proto::GenerateRequest, String> {
         let sampling_config = Self::build_sampling_config_from_plain(body.sampling_params.as_ref());
+
+        // PR 9 §9.6b: Bridge SamplingParams.logprobs → OutputConfig
+        // Priority: SamplingParams.logprobs overrides GenerateRequest.return_logprob
+        let logprobs = if let Some(lp) = body
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.logprobs)
+        {
+            if lp >= 0 { Some(lp) } else { None }
+        } else if body.return_logprob.unwrap_or(false) {
+            Some(body.top_logprobs_num.unwrap_or(0))
+        } else {
+            None
+        };
+
+        // PR 9 §9.6b: Bridge SamplingParams.prompt_logprobs → OutputConfig
+        let prompt_logprobs = body
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.prompt_logprobs);
+
         let output_config = proto::OutputConfig {
-            logprobs: if body.return_logprob.unwrap_or(false) {
-                Some(body.top_logprobs_num.unwrap_or(0))
-            } else {
-                None
-            },
-            prompt_logprobs: None,
+            logprobs,
+            prompt_logprobs,
             return_context_logits: false,
             return_generation_logits: false,
             exclude_input_from_output: true,
@@ -622,6 +639,7 @@ impl TrtllmServiceClient {
         }
     }
 
+    // PR 9 §9.6a: Map seed resolution and new fields for TRT-LLM
     fn build_sampling_config_from_plain(
         params: Option<&GenerateSamplingParams>,
     ) -> proto::SamplingConfig {
@@ -676,6 +694,14 @@ impl TrtllmServiceClient {
         config.min_tokens = p.min_new_tokens;
         if let Some(n) = p.n {
             config.num_return_sequences = n;
+        }
+
+        // PR 9 §9.6a: Map seed via resolve_seed() — TRT-LLM proto uses optional uint64
+        if let Some(resolved) = resolve_seed(p) {
+            // TRT-LLM seed is u64; convert from i64 (negative means no seed in vLLM semantics)
+            if resolved >= 0 {
+                config.seed = Some(resolved as u64);
+            }
         }
 
         config
