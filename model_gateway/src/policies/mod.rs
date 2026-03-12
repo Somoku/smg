@@ -13,6 +13,8 @@ use crate::core::{HashRing, Worker};
 mod bucket;
 mod cache_aware;
 mod consistent_hashing;
+// PR 2 §2.3: Cost model utilities for throughput-optimal routing
+pub(crate) mod cost_model_utils;
 mod factory;
 mod manual;
 mod power_of_two;
@@ -25,6 +27,8 @@ pub(crate) mod utils;
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
 pub use consistent_hashing::ConsistentHashingPolicy;
+// PR 2 §2.3: Re-export cost model types
+pub use cost_model_utils::{CostModel, CostModelEntry};
 pub use factory::PolicyFactory;
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
