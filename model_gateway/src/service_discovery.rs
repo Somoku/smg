@@ -935,6 +935,7 @@ mod tests {
             instance_to_version_after_sync: Arc::new(parking_lot::Mutex::new(
                 HashMap::new(),
             )),
+            routing_loop_state: None,
         })
     }
 

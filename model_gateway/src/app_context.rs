@@ -24,7 +24,11 @@ use crate::{
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
-    routers::{openai::realtime::RealtimeRegistry, router_manager::RouterManager},
+    routers::{
+        grpc::common::routing_loop_controller::RoutingLoopState,
+        openai::realtime::RealtimeRegistry,
+        router_manager::RouterManager,
+    },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
 };
 
@@ -68,6 +72,8 @@ pub struct AppContext {
     /// Shared map tracking `(worker_id, dp_rank) → version_tag` after sync.
     /// Shared between `WorkerService` and future `RoutingLoopRuntime`.
     pub instance_to_version_after_sync: InstanceVersionMap,
+    // PR 5A §5A.2: Shared routing loop state for admin endpoints.
+    pub routing_loop_state: Option<Arc<RoutingLoopState>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -254,6 +260,8 @@ impl AppContextBuilder {
             .ok_or(AppContextBuildError("router_config"))?;
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
+        // PR 5A §5A.2: Capture before router_config is moved into the struct.
+        let enable_routing_loop = router_config.enable_routing_loop;
 
         let worker_registry = self
             .worker_registry
@@ -313,6 +321,12 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             instance_to_version_after_sync,
+            // PR 5A §5A.2: Initialize routing loop state when enabled.
+            routing_loop_state: if enable_routing_loop {
+                Some(Arc::new(RoutingLoopState::new()))
+            } else {
+                None
+            },
         })
     }
 

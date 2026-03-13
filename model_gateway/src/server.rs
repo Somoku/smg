@@ -724,8 +724,8 @@ pub fn build_app(
         .route("/get_model_info", get(get_model_info))
         .route("/get_server_info", get(get_server_info));
 
-    // Build admin routes with control plane auth if configured, otherwise use simple API key auth
-    let admin_routes = Router::new()
+    // Build control routes with control plane auth if configured, otherwise use simple API key auth
+    let control_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
@@ -746,6 +746,18 @@ pub fn build_app(
             "/v1/tokenizers/{tokenizer_id}/status",
             get(v1_tokenizers_status),
         );
+
+    // PR 5A §5A.2: Conditionally register routing loop controller endpoints.
+    let control_routes = if app_state.context.router_config.enable_routing_loop {
+        use crate::routers::grpc::common::routing_loop_controller;
+        control_routes
+            .route("/routing_loop/pause", post(routing_loop_controller::routing_loop_pause))
+            .route("/routing_loop/resume", post(routing_loop_controller::routing_loop_resume))
+            .route("/routing_loop/status", get(routing_loop_controller::routing_loop_status))
+            .route("/routing_loop/filter", get(routing_loop_controller::routing_loop_filter))
+    } else {
+        control_routes
+    };
 
     // Build worker routes
     let worker_routes = Router::new()
@@ -774,7 +786,7 @@ pub fn build_app(
             ))
         }
     };
-    let admin_routes = apply_control_plane_auth(admin_routes);
+    let control_routes = apply_control_plane_auth(control_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
     // HA management routes
@@ -800,7 +812,7 @@ pub fn build_app(
         .merge(protected_routes)
         .merge(realtime_routes)
         .merge(public_routes)
-        .merge(admin_routes)
+        .merge(control_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))

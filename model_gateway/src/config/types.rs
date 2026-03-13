@@ -96,6 +96,10 @@ pub struct RouterConfig {
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
+    // PR 5A §5A.2: Enable the PSRL routing loop and its admin endpoints.
+    /// Enable the PSRL routing loop and its admin endpoints.
+    #[serde(default)]
+    pub enable_routing_loop: bool,
     /// Path to a WASM component implementing storage hooks.
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -785,6 +789,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            enable_routing_loop: false,
             engine_stats_staleness_threshold_ms: 0,
             storage_hook_wasm_path: None,
             server_cert: None,
