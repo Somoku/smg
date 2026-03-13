@@ -39,6 +39,15 @@ pub mod persistence_utils;
 #[expect(dead_code, reason = "Infrastructure for routing loop (Phase 2 PRs)")]
 pub(crate) mod request_queue;
 pub mod router_manager;
+// PR 5 §5.3: Routing loop utilities (PSRL metadata parsing, PartialRolloutState)
+// Suppress dead_code for both lib and test targets: items are used in tests and
+// will be consumed by Phase 3 (PR 6 routing loop integration).
+#[expect(
+    clippy::allow_attributes,
+    reason = "allow needed here because dead_code fires for lib but not for test target"
+)]
+#[allow(dead_code)]
+pub(crate) mod routing_loop_utils;
 pub mod tokenize;
 
 pub use factory::RouterFactory;

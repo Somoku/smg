@@ -257,6 +257,112 @@ pub enum RequestSortIndicator {
     SmallId,
 }
 
+// PR 5 §5.1b: Candidate sort indicator for PSRL routing strategy.
+/// Determines how candidate workers are sorted during PSRL routing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSortIndicator {
+    /// Sort candidates by version tag (default).
+    #[default]
+    Version,
+    /// Sort candidates by reserve capability.
+    ReserveCapability,
+}
+
+// PR 5 §5.1a: PSRL configuration.
+/// Configuration for the PSRL (Partial-rollout Supervised Routing Loop).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PsrlConfig {
+    /// Routing loop polling interval in milliseconds.
+    #[serde(default)]
+    pub check_interval_ms: u64,
+    /// PS Manager IP address.
+    #[serde(default = "default_ps_manager_ip")]
+    pub ps_manager_ip: String,
+    /// PS Manager gRPC port.
+    #[serde(default = "default_ps_manager_grpc_port")]
+    pub ps_manager_grpc_port: u16,
+    /// Routing strategy configuration.
+    #[serde(default)]
+    pub routing_strategy: PsrlRoutingStrategy,
+    /// Enable migration strategy.
+    #[serde(default)]
+    pub enable_mig_strategy: bool,
+}
+
+impl Default for PsrlConfig {
+    fn default() -> Self {
+        Self {
+            check_interval_ms: 0,
+            ps_manager_ip: default_ps_manager_ip(),
+            ps_manager_grpc_port: default_ps_manager_grpc_port(),
+            routing_strategy: PsrlRoutingStrategy::default(),
+            enable_mig_strategy: false,
+        }
+    }
+}
+
+// PR 5 §5.1b: PSRL routing strategy configuration.
+/// Detailed routing strategy settings within PSRL.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PsrlRoutingStrategy {
+    /// Routing method name (e.g., "throughput_optimal").
+    #[serde(default = "default_psrl_routing_method")]
+    pub method: String,
+    /// Sort indicator for request priority in the global queue.
+    #[serde(default)]
+    pub request_sort_indicator: RequestSortIndicator,
+    /// Sort indicator for candidate workers.
+    #[serde(default)]
+    pub candidate_sort_indicator: CandidateSortIndicator,
+    /// Enable multi-priority queue (partitioned by version tag).
+    #[serde(default)]
+    pub enable_multi_priority_queue: bool,
+    /// Enable group sampling on multi instances.
+    #[serde(default)]
+    pub enable_group_sampling_on_multi_instances: bool,
+    /// Path to cost model JSON file.
+    #[serde(default)]
+    pub cost_model_path: Option<String>,
+    /// Minimum marginal throughput gain for accepting a request.
+    #[serde(default = "default_delta_throughput")]
+    pub delta_throughput_threshold: f64,
+    /// Per-request token budget for headroom-aware scheduling.
+    #[serde(default = "default_request_budget")]
+    pub request_budget: usize,
+    /// Staleness threshold for engine stats snapshots (milliseconds).
+    #[serde(default = "default_snapshot_staleness_threshold_ms")]
+    pub snapshot_staleness_threshold_in_ms: u64,
+    /// Maximum waiting requests before preemption.
+    #[serde(default = "default_max_waiting_reqs")]
+    pub max_num_waiting_reqs_after_preemption: usize,
+    /// Maximum concurrent sequences per worker instance.
+    #[serde(default = "default_max_concurrent_seqs")]
+    pub max_concurrent_seqs_per_instance: usize,
+    /// Balanced concurrent sequences threshold per instance.
+    #[serde(default = "default_balanced_concurrent_seqs")]
+    pub balanced_concurrent_seqs_per_instance: usize,
+}
+
+impl Default for PsrlRoutingStrategy {
+    fn default() -> Self {
+        Self {
+            method: default_psrl_routing_method(),
+            request_sort_indicator: RequestSortIndicator::default(),
+            candidate_sort_indicator: CandidateSortIndicator::default(),
+            enable_multi_priority_queue: false,
+            enable_group_sampling_on_multi_instances: false,
+            cost_model_path: None,
+            delta_throughput_threshold: default_delta_throughput(),
+            request_budget: default_request_budget(),
+            snapshot_staleness_threshold_in_ms: default_snapshot_staleness_threshold_ms(),
+            max_num_waiting_reqs_after_preemption: default_max_waiting_reqs(),
+            max_concurrent_seqs_per_instance: default_max_concurrent_seqs(),
+            balanced_concurrent_seqs_per_instance: default_balanced_concurrent_seqs(),
+        }
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
