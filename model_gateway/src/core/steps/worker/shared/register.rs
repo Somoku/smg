@@ -48,6 +48,42 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 worker.model_id(),
                 worker_id
             );
+
+            // Populate instance_to_version_after_sync from the worker's version_tag label.
+            // For DP-aware workers (URL contains `@dp_rank`), use the base URL's worker ID
+            // and the parsed dp_rank as the map key. For non-DP workers, use the worker's
+            // own ID with dp_rank=0.
+            let init_version_tag = worker
+                .metadata()
+                .spec
+                .labels
+                .get("version_tag")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+
+            let (instance_base_worker_id, instance_dp_rank) = {
+                let parts: Vec<&str> = worker.url().split('@').collect();
+                if parts.len() == 2 {
+                    let base_url = parts[0];
+                    let dp_rank = parts[1].parse::<usize>().unwrap_or(0);
+                    let base_worker_id = app_context
+                        .worker_registry
+                        .reserve_id_for_url(base_url)
+                        .as_str()
+                        .to_string();
+                    (base_worker_id, dp_rank)
+                } else {
+                    (worker_id.as_str().to_string(), 0)
+                }
+            };
+
+            {
+                let mut version_map = app_context.instance_to_version_after_sync.lock();
+                version_map
+                    .entry((instance_base_worker_id, instance_dp_rank))
+                    .or_insert(init_version_tag);
+            }
+
             worker_ids.push(worker_id);
         }
 

@@ -45,6 +45,10 @@ use crate::{
         steps::{TokenizerConfigRequest, WorkflowEngines},
         worker::WorkerType,
         worker_manager::WorkerManager,
+        worker_service::{
+            WorkerRoutingControlRequest, WorkerStatsUpdateRequest,
+            WorkerVersionTagUpdateRequest,
+        },
         Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
@@ -502,6 +506,59 @@ async fn update_worker(
 }
 
 // ============================================================================
+// PR 1 §1.5: Worker stats, pause/resume, version_tag handlers
+// ============================================================================
+
+// PR 1 §1.5: Handler for POST /workers/stats
+async fn update_worker_stats(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<WorkerStatsUpdateRequest>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .update_worker_stats(update)
+        .into_response()
+}
+
+// PR 1 §1.5: Handler for POST /workers/version_tag
+async fn update_worker_version_tag(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<WorkerVersionTagUpdateRequest>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .update_worker_version_tag(update)
+        .await
+        .into_response()
+}
+
+// PR 1 §1.5: Handler for POST /workers/pause
+async fn pause_workers(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<WorkerRoutingControlRequest>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .pause_workers(update)
+        .into_response()
+}
+
+// PR 1 §1.5: Handler for POST /workers/resume
+async fn resume_workers(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<WorkerRoutingControlRequest>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .resume_workers(update)
+        .into_response()
+}
+
+// ============================================================================
 // Tokenize / Detokenize Handlers
 // ============================================================================
 
@@ -696,7 +753,12 @@ pub fn build_app(
         .route(
             "/workers/{worker_id}",
             get(get_worker).put(update_worker).delete(delete_worker),
-        );
+        )
+        // PR 1 §1.5: Engine stats push, routing control, and version tag endpoints
+        .route("/workers/stats", post(update_worker_stats))
+        .route("/workers/version_tag", post(update_worker_version_tag))
+        .route("/workers/pause", post(pause_workers))
+        .route("/workers/resume", post(resume_workers));
 
     // Apply authentication middleware to control plane routes
     let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {

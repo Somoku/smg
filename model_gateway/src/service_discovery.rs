@@ -927,10 +927,14 @@ mod tests {
                 worker_registry,
                 worker_job_queue,
                 router_config,
+                Arc::new(parking_lot::Mutex::new(HashMap::new())),
             )),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
+            instance_to_version_after_sync: Arc::new(parking_lot::Mutex::new(
+                HashMap::new(),
+            )),
         })
     }
 

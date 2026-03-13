@@ -38,10 +38,11 @@ pub use openai_protocol::{
 };
 pub use retry::{is_retryable_status, RetryExecutor};
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
-    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
+    AttachedBody, BasicWorker, ConnectionMode, EngineSchedulerStats, EngineStats,
+    EngineStatsSnapshot, EngineStatsState, EngineStatsUpdateOutcome, RuntimeType, Worker,
+    WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
 };
 pub use worker_builder::BasicWorkerBuilder;
 pub use worker_manager::{LoadMonitor, WorkerManager};
 pub use worker_registry::{HashRing, WorkerRegistry};
-pub use worker_service::WorkerService;
+pub use worker_service::{InstanceVersionMap, WorkerService};

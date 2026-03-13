@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -17,8 +18,8 @@ use tracing::debug;
 use crate::{
     config::RouterConfig,
     core::{
-        steps::WorkflowEngines, JobQueue, KvEventMonitor, LoadMonitor, WorkerRegistry,
-        WorkerService,
+        steps::WorkflowEngines, InstanceVersionMap, JobQueue, KvEventMonitor, LoadMonitor,
+        WorkerRegistry, WorkerService,
     },
     middleware::TokenBucket,
     observability::inflight_tracker::InFlightRequestTracker,
@@ -64,6 +65,9 @@ pub struct AppContext {
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
+    /// Shared map tracking `(worker_id, dp_rank) → version_tag` after sync.
+    /// Shared between `WorkerService` and future `RoutingLoopRuntime`.
+    pub instance_to_version_after_sync: InstanceVersionMap,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -258,11 +262,16 @@ impl AppContextBuilder {
             .worker_job_queue
             .ok_or(AppContextBuildError("worker_job_queue"))?;
 
+        // Create shared instance-to-version map
+        let instance_to_version_after_sync: InstanceVersionMap =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+
         // Create WorkerService from the already-built components
         let worker_service = Arc::new(WorkerService::new(
             worker_registry.clone(),
             worker_job_queue.clone(),
             router_config.clone(),
+            instance_to_version_after_sync.clone(),
         ));
 
         Ok(AppContext {
@@ -303,6 +312,7 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
+            instance_to_version_after_sync,
         })
     }
 

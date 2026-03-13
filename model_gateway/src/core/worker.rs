@@ -1,15 +1,17 @@
 use std::{
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, LazyLock,
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::body::Body;
+use chrono::{DateTime, NaiveDateTime, Utc};
 // Re-export protocol types as the canonical types for the gateway
 pub use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerType};
 use openai_protocol::{
@@ -114,6 +116,159 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
     }
 }
 
+// ============================================================================
+// PR 1 §1.1a-c: Engine Stats types for load-aware routing
+// ============================================================================
+
+// PR 1 §1.1c: Get current time in milliseconds since epoch
+pub fn current_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// PR 1 §1.1c: Parse snapshot timestamp string into epoch milliseconds
+pub fn parse_snapshot_timestamp_ms(ts: &str) -> Option<u64> {
+    // Try RFC 3339 first (e.g., "2024-01-15T12:00:00Z")
+    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.timestamp_millis().max(0) as u64);
+    }
+    // Fall back to naive datetime (e.g., "2024-01-15T12:00:00.000")
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%S%.f") {
+        let utc_dt: DateTime<Utc> = DateTime::from_naive_utc_and_offset(ndt, Utc);
+        return Some(utc_dt.timestamp_millis().max(0) as u64);
+    }
+    None
+}
+
+fn default_snapshot_timestamp() -> String {
+    Utc::now().to_rfc3339()
+}
+
+// PR 1 §1.1a: Per-scheduler stats snapshot from the backend engine
+/// Per-scheduler stats from the backend engine, used for load-aware routing.
+///
+/// Named `EngineSchedulerStats` to avoid conflict with
+/// `openai_protocol::worker::WorkerStats` (the HTTP endpoint response type).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct EngineSchedulerStats {
+    #[serde(default)]
+    pub req_id_to_prompt_token_num: HashMap<String, usize>,
+    #[serde(default)]
+    pub req_id_to_response_token_num: HashMap<String, usize>,
+    #[serde(default)]
+    pub num_running_reqs: usize,
+    #[serde(default)]
+    pub num_waiting_reqs: usize,
+    #[serde(default)]
+    pub kv_cache_usage: f64,
+}
+
+// PR 1 §1.1a: Timestamped snapshot wrapper
+/// Timestamped wrapper around [`EngineSchedulerStats`].
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EngineStatsSnapshot {
+    #[serde(default = "default_snapshot_timestamp")]
+    pub timestamp: String,
+    #[serde(default)]
+    pub scheduler_stats: EngineSchedulerStats,
+}
+
+impl Default for EngineStatsSnapshot {
+    fn default() -> Self {
+        Self {
+            timestamp: default_snapshot_timestamp(),
+            scheduler_stats: EngineSchedulerStats::default(),
+        }
+    }
+}
+
+// PR 1 §1.1a-b: Top-level engine stats with accessor methods
+/// Top-level engine stats, posted by workers to the `/workers/stats` endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct EngineStats {
+    #[serde(default)]
+    pub snapshot: EngineStatsSnapshot,
+}
+
+impl EngineStats {
+    // PR 1 §1.1b: Accessor methods for load-aware routing policies
+
+    /// Number of waiting requests in the engine's scheduler queue.
+    pub fn waiting_queue_size(&self) -> usize {
+        self.snapshot.scheduler_stats.num_waiting_reqs
+    }
+
+    /// Number of running requests in the engine's scheduler.
+    pub fn running_queue_size(&self) -> usize {
+        self.snapshot.scheduler_stats.num_running_reqs
+    }
+
+    /// Combined waiting + running queue size.
+    pub fn waiting_and_running_queue_size(&self) -> usize {
+        self.waiting_queue_size() + self.running_queue_size()
+    }
+
+    /// Total token count across all tracked requests (prompt + response).
+    pub fn total_token_num(&self) -> usize {
+        self.snapshot
+            .scheduler_stats
+            .req_id_to_prompt_token_num
+            .values()
+            .sum::<usize>()
+            + self
+                .snapshot
+                .scheduler_stats
+                .req_id_to_response_token_num
+                .values()
+                .sum::<usize>()
+    }
+
+    /// Token count with budget alignment.
+    ///
+    /// For each request, computes `prompt_tokens + ceil(response_tokens / budget) * budget`,
+    /// ensuring response token counts are rounded up to the nearest budget boundary.
+    pub fn token_num_with_budget(&self, request_budget: usize) -> usize {
+        let budget = request_budget.max(1);
+        self.snapshot
+            .scheduler_stats
+            .req_id_to_prompt_token_num
+            .iter()
+            .map(|(req_id, prompt_tokens)| {
+                let response_tokens = self
+                    .snapshot
+                    .scheduler_stats
+                    .req_id_to_response_token_num
+                    .get(req_id)
+                    .copied()
+                    .unwrap_or(0);
+                prompt_tokens + (response_tokens + 1).div_ceil(budget) * budget
+            })
+            .sum()
+    }
+}
+
+// PR 1 §1.1c: Internal state tracking for staleness detection
+/// Internal state wrapping [`EngineStats`] with update timestamp.
+#[derive(Debug, Clone, Default)]
+pub struct EngineStatsState {
+    pub stats: EngineStats,
+    pub updated_at_ms: u64,
+}
+
+// PR 1 §1.1c: Update outcome enum
+/// Outcome of an [`EngineStats`] update attempt.
+#[derive(Debug, Clone)]
+pub enum EngineStatsUpdateOutcome {
+    /// Update was applied successfully.
+    Applied,
+    /// Update was rejected because the snapshot timestamp is older than the current data.
+    Stale { reason: String },
+    /// Update was rejected (e.g., timestamp parsing failed).
+    Rejected { reason: String },
+}
+
 /// Core worker abstraction that represents a backend service
 #[async_trait]
 pub trait Worker: Send + Sync + fmt::Debug {
@@ -177,9 +332,10 @@ pub trait Worker: Send + Sync + fmt::Debug {
     /// Get the circuit breaker for this worker
     fn circuit_breaker(&self) -> &CircuitBreaker;
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    // PR 1 §1.4: Updated to include pause check
+    /// Check if the worker is available (not paused + healthy + circuit closed/half-open)
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker().can_execute()
+        !self.is_paused() && self.is_healthy() && self.circuit_breaker().can_execute()
     }
 
     /// Record the outcome of a request to this worker
@@ -317,7 +473,7 @@ pub trait Worker: Send + Sync + fmt::Debug {
 
     /// Get the id2label mapping for a classification model.
     /// Returns None if model is not a classifier or not found.
-    fn id2label(&self, model_id: &str) -> Option<&std::collections::HashMap<u32, String>> {
+    fn id2label(&self, model_id: &str) -> Option<&HashMap<u32, String>> {
         self.metadata()
             .find_model(model_id)
             .filter(|m| m.is_classifier())
@@ -379,6 +535,33 @@ pub trait Worker: Send + Sync + fmt::Debug {
     async fn reset_grpc_client(&self) -> WorkerResult<()> {
         Ok(())
     }
+    // PR 1 §1.2: Engine stats trait methods with safe defaults
+
+    /// Get the latest engine-reported stats.
+    /// Returns default (all-zero) stats if no stats have been pushed.
+    fn engine_stats(&self) -> EngineStats {
+        EngineStats::default()
+    }
+
+    /// Update engine stats with staleness check.
+    fn update_engine_stats(
+        &self,
+        _stats: EngineStats,
+        _snapshot_staleness_threshold_ms: u64,
+    ) -> EngineStatsUpdateOutcome {
+        EngineStatsUpdateOutcome::Rejected {
+            reason: "worker does not support stats updates".to_string(),
+        }
+    }
+
+    /// Check if the worker is paused from routing selection.
+    fn is_paused(&self) -> bool {
+        false
+    }
+
+    /// Set routing pause state for the worker.
+    fn set_paused(&self, _paused: bool) {}
+
     async fn grpc_health_check(&self) -> WorkerResult<bool>;
     async fn http_health_check(&self) -> WorkerResult<bool>;
 }
@@ -490,6 +673,11 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
+    // PR 1 §1.3: Engine stats storage and pause flag
+    /// Whether this worker is paused from routing selection.
+    pub paused: Arc<AtomicBool>,
+    /// Engine-reported stats with update timestamp for staleness checking.
+    pub engine_stats_state: Arc<parking_lot::RwLock<EngineStatsState>>,
 }
 
 impl fmt::Debug for BasicWorker {
@@ -787,6 +975,78 @@ impl Worker for BasicWorker {
             }
         }
     }
+
+    // PR 1 §1.3: BasicWorker engine stats and pause implementations
+
+    fn engine_stats(&self) -> EngineStats {
+        self.engine_stats_state.read().stats.clone()
+    }
+
+    fn update_engine_stats(
+        &self,
+        stats: EngineStats,
+        snapshot_staleness_threshold_ms: u64,
+    ) -> EngineStatsUpdateOutcome {
+        let now_ms = current_time_ms();
+
+        // Parse the snapshot timestamp
+        let snapshot_ts_ms =
+            match parse_snapshot_timestamp_ms(&stats.snapshot.timestamp) {
+                Some(ts) => ts,
+                None => {
+                    return EngineStatsUpdateOutcome::Rejected {
+                        reason: format!(
+                            "failed to parse snapshot timestamp: {}",
+                            stats.snapshot.timestamp
+                        ),
+                    };
+                }
+            };
+
+        // Check snapshot staleness: if the snapshot is older than threshold, reject
+        if snapshot_staleness_threshold_ms > 0
+            && now_ms > snapshot_ts_ms + snapshot_staleness_threshold_ms
+        {
+            return EngineStatsUpdateOutcome::Stale {
+                reason: format!(
+                    "snapshot timestamp {snapshot_ts_ms}ms is older than threshold \
+                     ({snapshot_staleness_threshold_ms}ms, now={now_ms}ms)"
+                ),
+            };
+        }
+
+        // Check monotonicity: reject if incoming snapshot is older than current
+        {
+            let current = self.engine_stats_state.read();
+            if let Some(current_ts) =
+                parse_snapshot_timestamp_ms(&current.stats.snapshot.timestamp)
+            {
+                if snapshot_ts_ms < current_ts {
+                    return EngineStatsUpdateOutcome::Stale {
+                        reason: format!(
+                            "incoming snapshot ({snapshot_ts_ms}ms) is older than current \
+                             ({current_ts}ms)"
+                        ),
+                    };
+                }
+            }
+        }
+
+        // Apply the update
+        let mut state = self.engine_stats_state.write();
+        state.stats = stats;
+        state.updated_at_ms = now_ms;
+
+        EngineStatsUpdateOutcome::Applied
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
 }
 
 /// RAII guard for worker load management
@@ -1016,7 +1276,7 @@ mod tests {
 
     #[test]
     fn test_worker_with_labels() {
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("env".to_string(), "prod".to_string());
         labels.insert("zone".to_string(), "us-west".to_string());
 
@@ -1790,5 +2050,357 @@ mod tests {
         assert!(worker.supports_model("text-embedding-3-small"));
         assert!(!worker.supports_model("non-existent-model"));
         assert!(worker.has_models_discovered());
+    }
+
+    // ============================================================================
+    // PR 1 §1.6: Engine stats and pause tests
+    // ============================================================================
+
+    #[test]
+    fn test_engine_stats_default_returns_zeros() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+        let stats = worker.engine_stats();
+        assert_eq!(stats.waiting_queue_size(), 0);
+        assert_eq!(stats.running_queue_size(), 0);
+        assert_eq!(stats.total_token_num(), 0);
+    }
+
+    #[test]
+    fn test_engine_stats_update_and_read() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+
+        let mut prompt_tokens = HashMap::new();
+        prompt_tokens.insert("r1".to_string(), 100);
+        let mut response_tokens = HashMap::new();
+        response_tokens.insert("r1".to_string(), 50);
+
+        let scheduler_stats = EngineSchedulerStats {
+            num_running_reqs: 5,
+            num_waiting_reqs: 3,
+            req_id_to_prompt_token_num: prompt_tokens,
+            req_id_to_response_token_num: response_tokens,
+            ..EngineSchedulerStats::default()
+        };
+
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: Utc::now().to_rfc3339(),
+                scheduler_stats,
+            },
+        };
+
+        let outcome =
+            worker.update_engine_stats(stats, 60_000);
+        assert!(matches!(outcome, EngineStatsUpdateOutcome::Applied));
+
+        let read = worker.engine_stats();
+        assert_eq!(read.running_queue_size(), 5);
+        assert_eq!(read.waiting_queue_size(), 3);
+        assert_eq!(read.total_token_num(), 150);
+    }
+
+    #[test]
+    fn test_engine_stats_staleness_rejection() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+
+        // Create stats with an old timestamp (10 minutes ago)
+        let old_ts = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: old_ts,
+                scheduler_stats: EngineSchedulerStats::default(),
+            },
+        };
+
+        // With a 5-second staleness threshold, this should be rejected
+        let outcome = worker.update_engine_stats(stats, 5_000);
+        assert!(
+            matches!(outcome, EngineStatsUpdateOutcome::Stale { .. }),
+            "Expected Stale, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_engine_stats_staleness_accepted() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+
+        // Create stats with a recent timestamp
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: Utc::now().to_rfc3339(),
+                scheduler_stats: EngineSchedulerStats::default(),
+            },
+        };
+
+        // With a large threshold, should be accepted
+        let outcome = worker.update_engine_stats(stats, 60_000);
+        assert!(
+            matches!(outcome, EngineStatsUpdateOutcome::Applied),
+            "Expected Applied, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_engine_stats_monotonicity_rejection() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+
+        // First update with current timestamp
+        let now = Utc::now();
+        let stats1 = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: now.to_rfc3339(),
+                scheduler_stats: EngineSchedulerStats::default(),
+            },
+        };
+        let outcome = worker.update_engine_stats(stats1, 60_000);
+        assert!(matches!(outcome, EngineStatsUpdateOutcome::Applied));
+
+        // Second update with older timestamp should be rejected
+        let older = (now - chrono::Duration::seconds(30)).to_rfc3339();
+        let stats2 = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: older,
+                scheduler_stats: EngineSchedulerStats::default(),
+            },
+        };
+        let outcome = worker.update_engine_stats(stats2, 60_000);
+        assert!(
+            matches!(outcome, EngineStatsUpdateOutcome::Stale { .. }),
+            "Expected Stale for older snapshot, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_engine_stats_invalid_timestamp_rejection() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: "not-a-timestamp".to_string(),
+                scheduler_stats: EngineSchedulerStats::default(),
+            },
+        };
+        let outcome = worker.update_engine_stats(stats, 60_000);
+        assert!(
+            matches!(outcome, EngineStatsUpdateOutcome::Rejected { .. }),
+            "Expected Rejected for invalid timestamp, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn test_engine_stats_waiting_queue_size() {
+        let scheduler_stats = EngineSchedulerStats {
+            num_waiting_reqs: 42,
+            ..EngineSchedulerStats::default()
+        };
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        assert_eq!(stats.waiting_queue_size(), 42);
+    }
+
+    #[test]
+    fn test_engine_stats_running_queue_size() {
+        let scheduler_stats = EngineSchedulerStats {
+            num_running_reqs: 17,
+            ..EngineSchedulerStats::default()
+        };
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        assert_eq!(stats.running_queue_size(), 17);
+    }
+
+    #[test]
+    fn test_engine_stats_waiting_and_running_queue_size() {
+        let scheduler_stats = EngineSchedulerStats {
+            num_running_reqs: 10,
+            num_waiting_reqs: 5,
+            ..EngineSchedulerStats::default()
+        };
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        assert_eq!(stats.waiting_and_running_queue_size(), 15);
+    }
+
+    #[test]
+    fn test_engine_stats_total_token_num() {
+        let mut scheduler_stats = EngineSchedulerStats::default();
+        scheduler_stats
+            .req_id_to_prompt_token_num
+            .insert("r1".to_string(), 100);
+        scheduler_stats
+            .req_id_to_prompt_token_num
+            .insert("r2".to_string(), 200);
+        scheduler_stats
+            .req_id_to_response_token_num
+            .insert("r1".to_string(), 50);
+        scheduler_stats
+            .req_id_to_response_token_num
+            .insert("r2".to_string(), 75);
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        assert_eq!(stats.total_token_num(), 425); // 100+200+50+75
+    }
+
+    #[test]
+    fn test_engine_stats_total_token_num_empty() {
+        let stats = EngineStats::default();
+        assert_eq!(stats.total_token_num(), 0);
+    }
+
+    #[test]
+    fn test_engine_stats_token_num_with_budget() {
+        let mut scheduler_stats = EngineSchedulerStats::default();
+        // r1: prompt=100, response=50 → prompt + ceil(51/64)*64 = 100 + 64 = 164
+        scheduler_stats
+            .req_id_to_prompt_token_num
+            .insert("r1".to_string(), 100);
+        scheduler_stats
+            .req_id_to_response_token_num
+            .insert("r1".to_string(), 50);
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        // budget=64: (50+1).div_ceil(64) * 64 = 1 * 64 = 64
+        // total = 100 + 64 = 164
+        assert_eq!(stats.token_num_with_budget(64), 164);
+    }
+
+    #[test]
+    fn test_engine_stats_token_num_with_budget_zero_budget() {
+        let mut scheduler_stats = EngineSchedulerStats::default();
+        scheduler_stats
+            .req_id_to_prompt_token_num
+            .insert("r1".to_string(), 100);
+        scheduler_stats
+            .req_id_to_response_token_num
+            .insert("r1".to_string(), 50);
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        // budget=0 → clamped to 1: (50+1).div_ceil(1) * 1 = 51
+        // total = 100 + 51 = 151
+        assert_eq!(stats.token_num_with_budget(0), 151);
+    }
+
+    #[test]
+    fn test_engine_stats_token_num_with_budget_missing_response() {
+        let mut scheduler_stats = EngineSchedulerStats::default();
+        // r1 has prompt but no response tokens
+        scheduler_stats
+            .req_id_to_prompt_token_num
+            .insert("r1".to_string(), 100);
+        let stats = EngineStats {
+            snapshot: EngineStatsSnapshot {
+                timestamp: default_snapshot_timestamp(),
+                scheduler_stats,
+            },
+        };
+        // response=0 → (0+1).div_ceil(64) * 64 = 1 * 64 = 64
+        // total = 100 + 64 = 164
+        assert_eq!(stats.token_num_with_budget(64), 164);
+    }
+
+    #[test]
+    fn test_is_paused_default_false() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+        assert!(!worker.is_paused());
+    }
+
+    #[test]
+    fn test_set_paused_true_and_false() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+        worker.set_paused(true);
+        assert!(worker.is_paused());
+        worker.set_paused(false);
+        assert!(!worker.is_paused());
+    }
+
+    #[test]
+    fn test_is_available_paused_worker() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+        assert!(worker.is_available());
+        worker.set_paused(true);
+        assert!(!worker.is_available());
+    }
+
+    #[test]
+    fn test_is_available_healthy_unpaused() {
+        let worker = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .api_key("test")
+            .build();
+        assert!(worker.is_available());
+        worker.set_healthy(false);
+        assert!(!worker.is_available());
+    }
+
+    #[test]
+    fn test_parse_snapshot_timestamp_rfc3339() {
+        let ts = parse_snapshot_timestamp_ms("2025-01-01T00:00:00Z");
+        assert!(ts.is_some());
+        // 2025-01-01T00:00:00Z in epoch millis = 1735689600000
+        assert_eq!(ts.unwrap(), 1_735_689_600_000);
+    }
+
+    #[test]
+    fn test_parse_snapshot_timestamp_naive() {
+        let ts = parse_snapshot_timestamp_ms("2025-01-01T00:00:00.000");
+        assert!(ts.is_some());
+        assert_eq!(ts.unwrap(), 1_735_689_600_000);
+    }
+
+    #[test]
+    fn test_parse_snapshot_timestamp_invalid() {
+        assert!(parse_snapshot_timestamp_ms("not-a-timestamp").is_none());
+        assert!(parse_snapshot_timestamp_ms("").is_none());
     }
 }

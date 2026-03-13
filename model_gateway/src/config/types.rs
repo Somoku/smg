@@ -88,6 +88,11 @@ pub struct RouterConfig {
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
+    // PR 1 §1.5: Staleness threshold for engine stats updates (milliseconds).
+    // Stats snapshots older than this threshold are rejected.
+    // Default 0 means staleness checking is disabled.
+    #[serde(default)]
+    pub engine_stats_staleness_threshold_ms: u64,
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
@@ -236,6 +241,20 @@ pub enum ManualAssignmentMode {
     MinLoad,
     /// Select worker with minimum active routing keys
     MinGroup,
+}
+
+// PR 4 §4.1: Request sort indicator for priority queue ordering
+/// Determines which sort key to use for request priority in the global request queue.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestSortIndicator {
+    /// Shorter request text gets higher priority (lower tuple).
+    #[default]
+    ShortLength,
+    /// Longer request text gets higher priority (lower tuple).
+    LongLength,
+    /// Lower request ID gets higher priority (lower tuple).
+    SmallId,
 }
 
 /// Policy configuration for routing
@@ -561,6 +580,7 @@ impl Default for RouterConfig {
             ca_certificates: vec![],
             mcp_config: None,
             enable_wasm: false,
+            engine_stats_staleness_threshold_ms: 0,
             storage_hook_wasm_path: None,
             server_cert: None,
             server_key: None,

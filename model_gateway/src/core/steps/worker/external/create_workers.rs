@@ -69,8 +69,12 @@ impl StepExecutor<WorkerWorkflowData> for CreateExternalWorkersStep {
             )
         };
 
-        // Build labels from config
-        let labels: HashMap<String, String> = config.labels.clone();
+        // Build labels from config, injecting default version_tag if not provided.
+        // This ensures every worker has a version_tag for PSRL version-based routing.
+        let mut labels: HashMap<String, String> = config.labels.clone();
+        labels
+            .entry("version_tag".to_string())
+            .or_insert_with(|| "0".to_string());
 
         // Normalize URL (ensure https:// for external APIs)
         let normalized_url = normalize_external_url(&config.url);

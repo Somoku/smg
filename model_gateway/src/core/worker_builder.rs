@@ -9,7 +9,8 @@ use openai_protocol::{
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     worker::{
-        BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad, WorkerType,
+        BasicWorker, ConnectionMode, EngineStatsState, RuntimeType, WorkerMetadata,
+        WorkerRoutingKeyLoad, WorkerType,
     },
 };
 use crate::{observability::metrics::Metrics, routers::grpc::client::GrpcClient};
@@ -232,6 +233,9 @@ impl BasicWorkerBuilder {
             metadata,
             grpc_client,
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
+            // PR 1 §1.3: Initialize pause flag and engine stats
+            paused: Arc::new(AtomicBool::new(false)),
+            engine_stats_state: Arc::new(parking_lot::RwLock::new(EngineStatsState::default())),
         }
     }
 }
