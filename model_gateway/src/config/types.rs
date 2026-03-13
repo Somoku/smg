@@ -331,6 +331,59 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    // PR 3 §3.3: Load-aware request-num-balance strategy.
+    /// Routes to the worker with the fewest active requests, rejecting when all
+    /// workers are at `max_concurrent_seqs_per_instance`.
+    #[serde(rename = "request_num_balance")]
+    RequestNumBalance {
+        #[serde(default = "default_balanced_concurrent_seqs")]
+        balanced_concurrent_seqs_per_instance: usize,
+        #[serde(default = "default_max_concurrent_seqs")]
+        max_concurrent_seqs_per_instance: usize,
+    },
+
+    // PR 3 §3.3: Load-aware throughput-optimal strategy backed by TP/PP cost model.
+    /// Selects the worker whose marginal throughput gain from accepting the next
+    /// request exceeds `delta_throughput_threshold`.
+    #[serde(rename = "throughput_optimal")]
+    ThroughputOptimal {
+        #[serde(default)]
+        cost_model_path: Option<String>,
+        #[serde(default = "default_max_waiting_reqs")]
+        max_num_waiting_reqs_after_preemption: usize,
+        #[serde(default = "default_balanced_concurrent_seqs")]
+        balanced_concurrent_seqs_per_instance: usize,
+        #[serde(default = "default_max_concurrent_seqs")]
+        max_concurrent_seqs_per_instance: usize,
+        #[serde(default = "default_delta_throughput")]
+        delta_throughput_threshold: f64,
+        #[serde(default = "default_max_prompt_length")]
+        max_prompt_length: usize,
+        #[serde(default = "default_request_budget")]
+        request_budget: usize,
+    },
+
+    // PR 3 §3.3: Throughput-optimal with per-request token budget.
+    /// Same as `ThroughputOptimal` but adds `request_budget` tokens to each
+    /// request's estimated token count for headroom-aware scheduling.
+    #[serde(rename = "throughput_optimal_with_budget")]
+    ThroughputOptimalWithBudget {
+        #[serde(default)]
+        cost_model_path: Option<String>,
+        #[serde(default = "default_max_waiting_reqs")]
+        max_num_waiting_reqs_after_preemption: usize,
+        #[serde(default = "default_balanced_concurrent_seqs")]
+        balanced_concurrent_seqs_per_instance: usize,
+        #[serde(default = "default_max_concurrent_seqs")]
+        max_concurrent_seqs_per_instance: usize,
+        #[serde(default = "default_delta_throughput")]
+        delta_throughput_threshold: f64,
+        #[serde(default = "default_max_prompt_length")]
+        max_prompt_length: usize,
+        #[serde(default = "default_request_budget")]
+        request_budget: usize,
+    },
 }
 
 fn default_block_size() -> usize {
@@ -353,6 +406,48 @@ fn default_manual_max_idle_secs() -> u64 {
     4 * 3600
 }
 
+// PR 3 §3.3: Defaults for load-aware policy config variants
+fn default_balanced_concurrent_seqs() -> usize {
+    512
+}
+
+fn default_max_concurrent_seqs() -> usize {
+    1024
+}
+
+fn default_max_waiting_reqs() -> usize {
+    1_000
+}
+
+fn default_delta_throughput() -> f64 {
+    0.5
+}
+
+fn default_max_prompt_length() -> usize {
+    8_192
+}
+
+fn default_request_budget() -> usize {
+    1_024
+}
+
+// PR 5 §5.1a-b: Defaults for PSRL config types
+fn default_ps_manager_ip() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_ps_manager_grpc_port() -> u16 {
+    50_051
+}
+
+fn default_psrl_routing_method() -> String {
+    "throughput_optimal".to_string()
+}
+
+fn default_snapshot_staleness_threshold_ms() -> u64 {
+    60_000
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -364,6 +459,10 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            // PR 3 §3.3: Load-aware policy names
+            PolicyConfig::RequestNumBalance { .. } => "request_num_balance",
+            PolicyConfig::ThroughputOptimal { .. } => "throughput_optimal",
+            PolicyConfig::ThroughputOptimalWithBudget { .. } => "throughput_optimal_with_budget",
         }
     }
 }

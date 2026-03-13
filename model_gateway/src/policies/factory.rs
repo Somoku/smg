@@ -6,6 +6,11 @@ use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
     LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
     PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
+    // PR 3 §3.4: Load-aware policy types
+    load_aware::{
+        RequestNumBalanceConfig, RequestNumBalancePolicy, ThroughputOptimalConfig,
+        ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
+    },
 };
 use crate::config::PolicyConfig;
 
@@ -72,6 +77,57 @@ impl PolicyFactory {
                 };
                 Arc::new(PrefixHashPolicy::new(config))
             }
+            // PR 3 §3.4: Load-aware policy factory wiring
+            PolicyConfig::RequestNumBalance {
+                balanced_concurrent_seqs_per_instance,
+                max_concurrent_seqs_per_instance,
+            } => {
+                let config = RequestNumBalanceConfig {
+                    balanced_concurrent_seqs_per_instance: *balanced_concurrent_seqs_per_instance,
+                    max_concurrent_seqs_per_instance: *max_concurrent_seqs_per_instance,
+                };
+                Arc::new(RequestNumBalancePolicy::with_config(config))
+            }
+            PolicyConfig::ThroughputOptimal {
+                cost_model_path,
+                max_num_waiting_reqs_after_preemption,
+                balanced_concurrent_seqs_per_instance,
+                max_concurrent_seqs_per_instance,
+                delta_throughput_threshold,
+                max_prompt_length,
+                request_budget,
+            } => {
+                let config = ThroughputOptimalConfig {
+                    cost_model_path: cost_model_path.clone(),
+                    max_num_waiting_reqs_after_preemption: *max_num_waiting_reqs_after_preemption,
+                    balanced_concurrent_seqs_per_instance: *balanced_concurrent_seqs_per_instance,
+                    max_concurrent_seqs_per_instance: *max_concurrent_seqs_per_instance,
+                    delta_throughput_threshold: *delta_throughput_threshold,
+                    max_prompt_length: *max_prompt_length,
+                    request_budget: *request_budget,
+                };
+                Arc::new(ThroughputOptimalPolicy::with_config(config))
+            }
+            PolicyConfig::ThroughputOptimalWithBudget {
+                cost_model_path,
+                max_num_waiting_reqs_after_preemption,
+                balanced_concurrent_seqs_per_instance,
+                max_concurrent_seqs_per_instance,
+                delta_throughput_threshold,
+                max_prompt_length,
+                request_budget,
+            } => {
+                let config = ThroughputOptimalConfig {
+                    cost_model_path: cost_model_path.clone(),
+                    max_num_waiting_reqs_after_preemption: *max_num_waiting_reqs_after_preemption,
+                    balanced_concurrent_seqs_per_instance: *balanced_concurrent_seqs_per_instance,
+                    max_concurrent_seqs_per_instance: *max_concurrent_seqs_per_instance,
+                    delta_throughput_threshold: *delta_throughput_threshold,
+                    max_prompt_length: *max_prompt_length,
+                    request_budget: *request_budget,
+                };
+                Arc::new(ThroughputOptimalWithBudgetPolicy::with_config(config))
+            }
         }
     }
 
@@ -88,6 +144,16 @@ impl PolicyFactory {
                 Some(Arc::new(ConsistentHashingPolicy::new()))
             }
             "prefix_hash" | "prefixhash" => Some(Arc::new(PrefixHashPolicy::with_defaults())),
+            // PR 3 §3.4: Load-aware policy name aliases
+            "request_num_balance" | "requestnumbalance" => {
+                Some(Arc::new(RequestNumBalancePolicy::new()))
+            }
+            "throughput_optimal" | "throughputoptimal" => {
+                Some(Arc::new(ThroughputOptimalPolicy::new()))
+            }
+            "throughput_optimal_with_budget" | "throughputoptimalwithbudget" => {
+                Some(Arc::new(ThroughputOptimalWithBudgetPolicy::new()))
+            }
             _ => None,
         }
     }
@@ -136,6 +202,35 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing);
         assert_eq!(policy.name(), "consistent_hashing");
+
+        // PR 3 §3.4: Load-aware policy factory tests
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::RequestNumBalance {
+            balanced_concurrent_seqs_per_instance: 256,
+            max_concurrent_seqs_per_instance: 512,
+        });
+        assert_eq!(policy.name(), "request_num_balance");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::ThroughputOptimal {
+            cost_model_path: None,
+            max_num_waiting_reqs_after_preemption: 1000,
+            balanced_concurrent_seqs_per_instance: 512,
+            max_concurrent_seqs_per_instance: 1024,
+            delta_throughput_threshold: 0.5,
+            max_prompt_length: 8192,
+            request_budget: 1024,
+        });
+        assert_eq!(policy.name(), "throughput_optimal");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::ThroughputOptimalWithBudget {
+            cost_model_path: None,
+            max_num_waiting_reqs_after_preemption: 1000,
+            balanced_concurrent_seqs_per_instance: 512,
+            max_concurrent_seqs_per_instance: 1024,
+            delta_throughput_threshold: 0.5,
+            max_prompt_length: 8192,
+            request_budget: 1024,
+        });
+        assert_eq!(policy.name(), "throughput_optimal_with_budget");
     }
 
     #[tokio::test]
@@ -154,6 +249,13 @@ mod tests {
         assert!(PolicyFactory::create_by_name("Manual").is_some());
         assert!(PolicyFactory::create_by_name("consistent_hashing").is_some());
         assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
+        // PR 3 §3.4: Load-aware policy name aliases
+        assert!(PolicyFactory::create_by_name("request_num_balance").is_some());
+        assert!(PolicyFactory::create_by_name("RequestNumBalance").is_some());
+        assert!(PolicyFactory::create_by_name("throughput_optimal").is_some());
+        assert!(PolicyFactory::create_by_name("ThroughputOptimal").is_some());
+        assert!(PolicyFactory::create_by_name("throughput_optimal_with_budget").is_some());
+        assert!(PolicyFactory::create_by_name("ThroughputOptimalWithBudget").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

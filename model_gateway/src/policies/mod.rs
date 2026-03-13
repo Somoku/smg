@@ -16,6 +16,8 @@ mod consistent_hashing;
 // PR 2 §2.3: Cost model utilities for throughput-optimal routing
 pub(crate) mod cost_model_utils;
 mod factory;
+// PR 3 §3.5: Load-aware routing policies (request_num_balance, throughput_optimal, throughput_optimal_with_budget)
+pub(crate) mod load_aware;
 mod manual;
 mod power_of_two;
 mod prefix_hash;
@@ -30,6 +32,11 @@ pub use consistent_hashing::ConsistentHashingPolicy;
 // PR 2 §2.3: Re-export cost model types
 pub use cost_model_utils::{CostModel, CostModelEntry};
 pub use factory::PolicyFactory;
+// PR 3 §3.5: Re-export load-aware policy types
+pub use load_aware::{
+    RequestNumBalanceConfig, RequestNumBalancePolicy, ThroughputOptimalConfig,
+    ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
+};
 // Re-export PrefixMatchResult from kv_index for production use
 pub use kv_index::PrefixMatchResult;
 pub use manual::{ManualConfig, ManualPolicy};
@@ -176,6 +183,11 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    // PR 3 §3.1: Pre-grouped candidate priority IDs for load-aware routing.
+    /// Parallel array aligned with `workers` indices — used by load-aware policies
+    /// for PSRL candidate grouping. When `None`, policies fall back to
+    /// `version_tag` label from worker metadata.
+    pub candidate_group_ids: Option<&'a [u64]>,
 }
 
 #[cfg(test)]

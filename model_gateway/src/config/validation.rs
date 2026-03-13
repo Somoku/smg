@@ -172,7 +172,11 @@ impl ConfigValidator {
             PolicyConfig::Random
             | PolicyConfig::RoundRobin
             | PolicyConfig::Manual { .. }
-            | PolicyConfig::ConsistentHashing => {}
+            | PolicyConfig::ConsistentHashing
+            // PR 3 §3.3: Load-aware policies — all fields have safe defaults
+            | PolicyConfig::RequestNumBalance { .. }
+            | PolicyConfig::ThroughputOptimal { .. }
+            | PolicyConfig::ThroughputOptimalWithBudget { .. } => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,

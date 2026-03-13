@@ -180,6 +180,7 @@ impl WorkerSelectionStage {
                 tokens,
                 headers,
                 hash_ring,
+                candidate_group_ids: None,
             },
         )?;
         let selected = available[idx].clone();
@@ -289,6 +290,7 @@ impl WorkerSelectionStage {
             tokens,
             headers,
             hash_ring,
+            candidate_group_ids: None,
         };
         let prefill_idx = policy.select_worker(&available_prefill, &info)?;
         let decode_idx = policy.select_worker(&available_decode, &info)?;
