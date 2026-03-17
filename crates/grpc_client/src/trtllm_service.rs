@@ -336,12 +336,12 @@ impl TrtllmServiceClient {
 
         // PR 9 §9.6b: Bridge SamplingParams.logprobs → OutputConfig
         // Priority: SamplingParams.logprobs overrides GenerateRequest.return_logprob
-        let logprobs = if let Some(lp) = body
-            .sampling_params
-            .as_ref()
-            .and_then(|p| p.logprobs)
-        {
-            if lp >= 0 { Some(lp) } else { None }
+        let logprobs = if let Some(lp) = body.sampling_params.as_ref().and_then(|p| p.logprobs) {
+            if lp >= 0 {
+                Some(lp)
+            } else {
+                None
+            }
         } else if body.return_logprob.unwrap_or(false) {
             Some(body.top_logprobs_num.unwrap_or(0))
         } else {

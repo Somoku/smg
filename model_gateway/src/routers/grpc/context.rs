@@ -22,7 +22,8 @@ use tracing::debug;
 use super::{
     client::GrpcClient,
     multimodal::MultimodalComponents,
-    proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
+    partial_rollout::ProtoPartialRolloutState,
+    proto_wrapper::{ProtoEmbedComplete, ProtoGenerateComplete, ProtoRequest, ProtoStream},
 };
 use crate::core::{RuntimeType, Worker, WorkerLoadGuard};
 
@@ -83,6 +84,10 @@ pub(crate) struct ProcessingState {
 
     // Stage 4: Request building outputs
     pub proto_request: Option<ProtoRequest>,
+
+    // PR 18 (Gap 5): Accumulated partial-rollout state carried across
+    // routing-loop iterations and consumed by request-building stages.
+    pub partial_rollout_state: Option<ProtoPartialRolloutState>,
 
     // Stage 5: Dispatch metadata
     pub dispatch: Option<DispatchMetadata>,
@@ -530,6 +535,14 @@ pub(crate) enum ExecutionResult {
     /// Embedding requests return a single response, not a stream
     Embedding {
         response: ProtoEmbedComplete,
+    },
+    // PR 12 §12.2: Pre-drained result — ProtoStream already consumed by
+    // drain_stream_for_partial_rollout(). Used by the PSRL dispatch path
+    // for the stop/length case so ResponseProcessingStage can run normally
+    // without accessing a live gRPC stream.
+    /// Pre-drained execution result: complete messages already collected from the stream.
+    PreDrained {
+        complete: Vec<ProtoGenerateComplete>,
     },
 }
 

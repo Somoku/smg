@@ -7,7 +7,10 @@ use std::sync::Arc;
 use smg_data_connector::{ConversationItemStorage, ConversationStorage, ResponseStorage};
 use smg_mcp::McpOrchestrator;
 
-use crate::routers::grpc::{context::SharedComponents, pipeline::RequestPipeline};
+use crate::routers::grpc::{
+    context::SharedComponents, pipeline::RequestPipeline,
+    pipeline_routing_loop::RoutingLoopPipeline,
+};
 
 /// Context for /v1/responses endpoint
 ///
@@ -32,6 +35,15 @@ pub(crate) struct ResponsesContext {
 
     /// MCP orchestrator for tool support
     pub mcp_orchestrator: Arc<McpOrchestrator>,
+
+    // PR 17 (Gap 4): When Some, regular /v1/responses chat executions are dispatched
+    // through the routing loop for PSRL worker selection and PS Manager tracking.
+    // Harmony responses use their own pipeline and bypass the routing loop for now
+    // (see TODO in router.rs::route_responses_impl).
+    /// Routing-loop pipeline for PSRL-aware chat dispatch (regular responses only).
+    /// `None` when `enable_routing_loop = false`.
+    // PR-A (Notes 1+2): store as Arc so responses context and router share one pipeline instance.
+    pub routing_loop_pipeline: Option<Arc<RoutingLoopPipeline>>,
 }
 
 impl ResponsesContext {
@@ -51,6 +63,16 @@ impl ResponsesContext {
             conversation_storage,
             conversation_item_storage,
             mcp_orchestrator,
+            routing_loop_pipeline: None,
         }
+    }
+
+    /// Set the routing-loop pipeline (builder-style).
+    ///
+    /// Called by `GrpcRouter::new()` when `enable_routing_loop = true` to wire
+    /// PSRL-aware dispatch into regular (non-Harmony) /v1/responses handling.
+    pub fn with_routing_loop(mut self, rl_pipeline: Arc<RoutingLoopPipeline>) -> Self {
+        self.routing_loop_pipeline = Some(rl_pipeline);
+        self
     }
 }

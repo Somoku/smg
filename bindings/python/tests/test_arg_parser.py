@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 from smg.launch_router import RouterArgs, parse_router_args
 from smg.router import policy_from_str
+from smg.router_args import PSRL_ROUTING_POLICY_CHOICES, ROUTING_POLICY_CHOICES
 
 
 class TestRouterArgs:
@@ -410,6 +411,21 @@ class TestPolicyFromStr:
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
+        # PR Python §3.1: The Python adapter must resolve the new PSRL policy names.
+        assert policy_from_str("request_num_balance") == PolicyType.RequestNumBalance
+        assert policy_from_str("throughput_optimal") == PolicyType.ThroughputOptimal
+        assert (
+            policy_from_str("throughput_optimal_with_budget")
+            == PolicyType.ThroughputOptimalWithBudget
+        )
+
+    def test_psrl_policy_lists_match_router_choices(self):
+        """Test that PSRL policies are exposed through the CLI choice constants."""
+        # PR Python §3.1: Ensure the new CLI constants expose the PSRL policy names.
+        assert set(PSRL_ROUTING_POLICY_CHOICES).issubset(set(ROUTING_POLICY_CHOICES))
+        assert "request_num_balance" in ROUTING_POLICY_CHOICES
+        assert "throughput_optimal" in ROUTING_POLICY_CHOICES
+        assert "throughput_optimal_with_budget" in ROUTING_POLICY_CHOICES
 
     def test_invalid_policy(self):
         """Test conversion of invalid policy string."""
@@ -608,6 +624,89 @@ class TestParseRouterArgs:
         # Note: model-path and tokenizer-path arguments are not available in current implementation
         # This test is skipped until those arguments are added
         pytest.skip("Tokenizer arguments not available in current implementation")
+
+    def test_parse_psrl_policy_choices(self):
+        """Test parsing the new PSRL-capable routing policies."""
+        # PR Python §3.1: The CLI should accept the new PSRL policies for main/prefill/decode.
+        router_args = parse_router_args(
+            [
+                "--policy",
+                "request_num_balance",
+                "--prefill-policy",
+                "throughput_optimal",
+                "--decode-policy",
+                "throughput_optimal_with_budget",
+            ]
+        )
+
+        assert router_args.policy == "request_num_balance"
+        assert router_args.prefill_policy == "throughput_optimal"
+        assert router_args.decode_policy == "throughput_optimal_with_budget"
+
+    def test_parse_psrl_args(self):
+        """Test parsing PSRL routing loop and policy tuning arguments."""
+        # PR Python §3.1: The PSRL CLI group should parse the new flat binding fields.
+        router_args = parse_router_args(
+            [
+                "--prefix-token-count",
+                "512",
+                "--prefix-hash-load-factor",
+                "2.0",
+                "--policy-balanced-concurrent-seqs-per-instance",
+                "640",
+                "--policy-max-concurrent-seqs-per-instance",
+                "2048",
+                "--policy-cost-model-path",
+                "/tmp/cost-model.json",
+                "--policy-max-num-waiting-reqs-after-preemption",
+                "1200",
+                "--policy-delta-throughput-threshold",
+                "0.75",
+                "--policy-max-prompt-length",
+                "16384",
+                "--policy-request-budget",
+                "4096",
+                "--enable-routing-loop",
+                "--psrl-check-interval-ms",
+                "20",
+                "--psrl-ps-manager-ip",
+                "10.0.0.8",
+                "--psrl-ps-manager-grpc-port",
+                "51000",
+                "--psrl-request-sort-indicator",
+                "long_length",
+                "--psrl-candidate-sort-indicator",
+                "reserve_capability",
+                "--enable-multi-priority-queue",
+                "--psrl-enable-group-sampling-on-multi-instances",
+                "--psrl-snapshot-staleness-threshold-in-ms",
+                "2500",
+                "--psrl-max-num-waiting-reqs-after-preemption",
+                "1500",
+                "--psrl-mig-enable",
+            ]
+        )
+
+        assert router_args.prefix_token_count == 512
+        assert router_args.prefix_hash_load_factor == 2.0
+        assert router_args.policy_balanced_concurrent_seqs_per_instance == 640
+        assert router_args.policy_max_concurrent_seqs_per_instance == 2048
+        assert router_args.policy_cost_model_path == "/tmp/cost-model.json"
+        assert router_args.policy_max_num_waiting_reqs_after_preemption == 1200
+        assert router_args.policy_delta_throughput_threshold == 0.75
+        assert router_args.policy_max_prompt_length == 16384
+        assert router_args.policy_request_budget == 4096
+        assert router_args.enable_routing_loop is True
+        assert router_args.psrl_check_interval_ms == 20
+        assert router_args.psrl_ps_manager_ip == "10.0.0.8"
+        assert router_args.psrl_ps_manager_grpc_port == 51000
+        assert router_args.psrl_request_sort_indicator == "long_length"
+        assert router_args.psrl_candidate_sort_indicator == "reserve_capability"
+        assert router_args.enable_multi_priority_queue is True
+        assert router_args.psrl_enable_group_sampling_on_multi_instances is True
+        assert router_args.psrl_snapshot_staleness_threshold_in_ms == 2500
+        assert router_args.psrl_max_num_waiting_reqs_after_preemption == 1500
+        assert router_args.psrl_mig_enable is True
 
     def test_parse_invalid_args(self):
         """Test parsing invalid arguments."""

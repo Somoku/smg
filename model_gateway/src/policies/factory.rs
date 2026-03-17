@@ -3,14 +3,24 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RoundRobinPolicy,
     // PR 3 §3.4: Load-aware policy types
     load_aware::{
         RequestNumBalanceConfig, RequestNumBalancePolicy, ThroughputOptimalConfig,
         ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
     },
+    BucketConfig,
+    BucketPolicy,
+    CacheAwareConfig,
+    CacheAwarePolicy,
+    ConsistentHashingPolicy,
+    LoadBalancingPolicy,
+    ManualConfig,
+    ManualPolicy,
+    PowerOfTwoPolicy,
+    PrefixHashConfig,
+    PrefixHashPolicy,
+    RandomPolicy,
+    RoundRobinPolicy,
 };
 use crate::config::PolicyConfig;
 
@@ -221,15 +231,16 @@ mod tests {
         });
         assert_eq!(policy.name(), "throughput_optimal");
 
-        let policy = PolicyFactory::create_from_config(&PolicyConfig::ThroughputOptimalWithBudget {
-            cost_model_path: None,
-            max_num_waiting_reqs_after_preemption: 1000,
-            balanced_concurrent_seqs_per_instance: 512,
-            max_concurrent_seqs_per_instance: 1024,
-            delta_throughput_threshold: 0.5,
-            max_prompt_length: 8192,
-            request_budget: 1024,
-        });
+        let policy =
+            PolicyFactory::create_from_config(&PolicyConfig::ThroughputOptimalWithBudget {
+                cost_model_path: None,
+                max_num_waiting_reqs_after_preemption: 1000,
+                balanced_concurrent_seqs_per_instance: 512,
+                max_concurrent_seqs_per_instance: 1024,
+                delta_throughput_threshold: 0.5,
+                max_prompt_length: 8192,
+                request_budget: 1024,
+            });
         assert_eq!(policy.name(), "throughput_optimal_with_budget");
     }
 

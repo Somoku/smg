@@ -25,9 +25,8 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
-        grpc::common::routing_loop_controller::RoutingLoopState,
-        openai::realtime::RealtimeRegistry,
-        router_manager::RouterManager,
+        openai::realtime::RealtimeRegistry, router_manager::RouterManager,
+        routing_loop_utils::RoutingLoopRuntime,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
 };
@@ -70,10 +69,15 @@ pub struct AppContext {
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Shared map tracking `(worker_id, dp_rank) → version_tag` after sync.
-    /// Shared between `WorkerService` and future `RoutingLoopRuntime`.
+    /// Shared between `WorkerService` and `RoutingLoopRuntime`.
     pub instance_to_version_after_sync: InstanceVersionMap,
-    // PR 5A §5A.2: Shared routing loop state for admin endpoints.
-    pub routing_loop_state: Option<Arc<RoutingLoopState>>,
+    // PR 10 §10.5 + §10.8: Routing loop runtime (replaces routing_loop_state from PR 5A).
+    /// Shared runtime for the PSRL routing loop task.
+    ///
+    /// `Some` when `enable_routing_loop = true`. Initialized during `AppContext::build()`
+    /// with channel, tracking maps, and optional PS Manager client.
+    /// The routing loop task is spawned in `server.rs` using this runtime.
+    pub routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
 }
 
 impl std::fmt::Debug for AppContext {
@@ -260,8 +264,6 @@ impl AppContextBuilder {
             .ok_or(AppContextBuildError("router_config"))?;
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
-        // PR 5A §5A.2: Capture before router_config is moved into the struct.
-        let enable_routing_loop = router_config.enable_routing_loop;
 
         let worker_registry = self
             .worker_registry
@@ -321,12 +323,11 @@ impl AppContextBuilder {
             kv_event_monitor: self.kv_event_monitor,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             instance_to_version_after_sync,
-            // PR 5A §5A.2: Initialize routing loop state when enabled.
-            routing_loop_state: if enable_routing_loop {
-                Some(Arc::new(RoutingLoopState::new()))
-            } else {
-                None
-            },
+            // PR 10 §10.5 + §10.8: routing_loop_runtime is initialized in server.rs
+            // after AppContext is built, because it requires spawning the loop task.
+            // The builder leaves it None; server.rs sets it via Arc::get_mut or by
+            // constructing with the runtime Arc after the build.
+            routing_loop_runtime: None,
         })
     }
 

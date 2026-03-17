@@ -990,18 +990,17 @@ impl Worker for BasicWorker {
         let now_ms = current_time_ms();
 
         // Parse the snapshot timestamp
-        let snapshot_ts_ms =
-            match parse_snapshot_timestamp_ms(&stats.snapshot.timestamp) {
-                Some(ts) => ts,
-                None => {
-                    return EngineStatsUpdateOutcome::Rejected {
-                        reason: format!(
-                            "failed to parse snapshot timestamp: {}",
-                            stats.snapshot.timestamp
-                        ),
-                    };
-                }
-            };
+        let snapshot_ts_ms = match parse_snapshot_timestamp_ms(&stats.snapshot.timestamp) {
+            Some(ts) => ts,
+            None => {
+                return EngineStatsUpdateOutcome::Rejected {
+                    reason: format!(
+                        "failed to parse snapshot timestamp: {}",
+                        stats.snapshot.timestamp
+                    ),
+                };
+            }
+        };
 
         // Check snapshot staleness: if the snapshot is older than threshold, reject
         if snapshot_staleness_threshold_ms > 0
@@ -1018,8 +1017,7 @@ impl Worker for BasicWorker {
         // Check monotonicity: reject if incoming snapshot is older than current
         {
             let current = self.engine_stats_state.read();
-            if let Some(current_ts) =
-                parse_snapshot_timestamp_ms(&current.stats.snapshot.timestamp)
+            if let Some(current_ts) = parse_snapshot_timestamp_ms(&current.stats.snapshot.timestamp)
             {
                 if snapshot_ts_ms < current_ts {
                     return EngineStatsUpdateOutcome::Stale {
@@ -1199,6 +1197,22 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         is_healthy: worker.is_healthy(),
         load: worker.load(),
         job_status: None,
+    }
+}
+
+// PR 11 §11.4.1: Parse a worker URL that may contain a `@dp_rank` suffix.
+/// Split a worker URL into `(base_url, dp_rank)`.
+///
+/// For DP-aware deployments, worker URLs carry a `@<rank>` suffix (e.g.
+/// `http://host:8080@2`).  This function strips the suffix and returns the
+/// numeric rank.  Plain URLs (no `@`) return `(url, 0)`.
+pub fn parse_worker_dp_url(url: &str) -> (&str, usize) {
+    if let Some(at_pos) = url.rfind('@') {
+        let base = &url[..at_pos];
+        let rank = url[at_pos + 1..].parse::<usize>().unwrap_or(0);
+        (base, rank)
+    } else {
+        (url, 0)
     }
 }
 
@@ -2095,8 +2109,7 @@ mod tests {
             },
         };
 
-        let outcome =
-            worker.update_engine_stats(stats, 60_000);
+        let outcome = worker.update_engine_stats(stats, 60_000);
         assert!(matches!(outcome, EngineStatsUpdateOutcome::Applied));
 
         let read = worker.engine_stats();

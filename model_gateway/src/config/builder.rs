@@ -369,6 +369,15 @@ impl RouterConfigBuilder {
         self
     }
 
+    // ==================== Routing Loop ====================
+
+    // PR Python §1.4: Builder method to enable/disable the PSRL routing loop.
+    /// Enable or disable the PSRL routing loop and its admin endpoints.
+    pub fn routing_loop(mut self, enable: bool) -> Self {
+        self.config.enable_routing_loop = enable;
+        self
+    }
+
     pub fn model_path<S: Into<String>>(mut self, path: S) -> Self {
         self.config.model_path = Some(path.into());
         self

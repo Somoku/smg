@@ -7,8 +7,11 @@
 
 use std::sync::Arc;
 
-use axum::response::Response;
-use openai_protocol::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse};
+use axum::{http::HeaderMap, response::Response};
+use openai_protocol::{
+    chat::{ChatCompletionRequest, ChatCompletionResponse},
+    responses::{ResponseStatus, ResponsesRequest, ResponsesResponse},
+};
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput};
 use tracing::{debug, error, trace, warn};
@@ -94,16 +97,15 @@ pub(super) async fn execute_without_mcp(
         )
     })?;
 
-    // Execute chat pipeline (errors already have proper HTTP status codes)
-    let chat_response = ctx
-        .pipeline
-        .execute_chat_for_responses(
-            Arc::new(chat_request),
-            params.headers,
-            params.model_id,
-            ctx.components.clone(),
-        )
-        .await?; // Preserve the Response error as-is
+    // PR 17 (Gap 4): route regular responses chat execution through the routing-loop
+    // pipeline when enabled; fall back to direct RequestPipeline execution otherwise.
+    let chat_response = execute_chat_for_responses_with_routing_loop(
+        ctx,
+        Arc::new(chat_request),
+        params.headers,
+        params.model_id,
+    )
+    .await?; // Preserve the Response error as-is
 
     // Convert ChatCompletionResponse → ResponsesResponse
     conversions::chat_to_responses(&chat_response, original_request, params.response_id).map_err(
@@ -119,6 +121,25 @@ pub(super) async fn execute_without_mcp(
             )
         },
     )
+}
+
+// PR 17 (Gap 4): central helper for regular responses execution.
+// Both single-shot and MCP loop paths call this so routing-loop dispatch is consistent.
+async fn execute_chat_for_responses_with_routing_loop(
+    ctx: &ResponsesContext,
+    chat_request: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+) -> Result<ChatCompletionResponse, Response> {
+    if let Some(routing_loop_pipeline) = ctx.routing_loop_pipeline.as_ref() {
+        routing_loop_pipeline
+            .execute_chat_for_responses(chat_request, headers, model_id, ctx.components.clone())
+            .await
+    } else {
+        ctx.pipeline
+            .execute_chat_for_responses(chat_request, headers, model_id, ctx.components.clone())
+            .await
+    }
 }
 
 /// Execute the MCP tool calling loop
@@ -179,16 +200,14 @@ pub(super) async fn execute_tool_loop(
         // Prepare tools and tool_choice for this iteration
         prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
 
-        // Execute chat pipeline (errors already have proper HTTP status codes)
-        let chat_response = ctx
-            .pipeline
-            .execute_chat_for_responses(
-                Arc::new(chat_request),
-                params.headers.clone(),
-                params.model_id.clone(),
-                ctx.components.clone(),
-            )
-            .await?;
+        // PR 17 (Gap 4): keep MCP-loop iterations on the same routing-loop execution path.
+        let chat_response = execute_chat_for_responses_with_routing_loop(
+            ctx,
+            Arc::new(chat_request),
+            params.headers.clone(),
+            params.model_id.clone(),
+        )
+        .await?;
 
         // Check for function calls (extract all for parallel execution)
         let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
@@ -387,5 +406,255 @@ pub(super) async fn execute_tool_loop(
 
             // Continue to next iteration
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use axum::response::Response;
+    use llm_tokenizer::{
+        chat_template::ChatTemplateParams,
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+        MockTokenizer, TokenizerRegistry,
+    };
+    use openai_protocol::chat::ChatCompletionRequest;
+    use reasoning_parser::ParserFactory as ReasoningParserFactory;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use smg_mcp::{McpConfig, McpOrchestrator};
+    use tool_parser::ParserFactory as ToolParserFactory;
+
+    use super::execute_chat_for_responses_with_routing_loop;
+    use crate::{
+        config::{PolicyConfig, RequestSortIndicator},
+        core::WorkerRegistry,
+        policies::PolicyRegistry,
+        routers::{
+            error::HEADER_X_SMG_ERROR_CODE,
+            grpc::{
+                common::responses::ResponsesContext, context::SharedComponents,
+                pipeline::RequestPipeline, pipeline_routing_loop::RoutingLoopPipeline,
+            },
+            routing_loop_utils::RoutingLoopRuntime,
+        },
+    };
+
+    #[derive(Default)]
+    struct TemplateMockTokenizer {
+        inner: MockTokenizer,
+    }
+
+    impl Encoder for TemplateMockTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for TemplateMockTokenizer {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for TemplateMockTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn apply_chat_template(
+            &self,
+            messages: &[serde_json::Value],
+            _params: ChatTemplateParams,
+        ) -> anyhow::Result<String> {
+            Ok(messages
+                .iter()
+                .filter_map(|msg| msg.get("content").and_then(|value| value.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+    }
+
+    fn make_shared_components() -> Arc<SharedComponents> {
+        Arc::new(SharedComponents {
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            multimodal: None,
+        })
+    }
+
+    fn make_pipeline() -> Arc<RequestPipeline> {
+        Arc::new(RequestPipeline::new_regular(
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            ToolParserFactory::default(),
+            ReasoningParserFactory::default(),
+            None,
+            None,
+        ))
+    }
+
+    async fn make_mcp_orchestrator() -> Arc<McpOrchestrator> {
+        let empty_config = McpConfig {
+            servers: vec![],
+            pool: Default::default(),
+            proxy: None,
+            warmup: vec![],
+            inventory: Default::default(),
+            policy: Default::default(),
+        };
+        Arc::new(
+            McpOrchestrator::new(empty_config)
+                .await
+                .expect("test MCP orchestrator should initialize"),
+        )
+    }
+
+    fn make_closed_routing_loop_pipeline(
+        standard_pipeline: Arc<RequestPipeline>,
+    ) -> Arc<RoutingLoopPipeline> {
+        let (runtime, rx) = RoutingLoopRuntime::new_with_channel(
+            RequestSortIndicator::SmallId,
+            false,
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            0,
+            String::new(),
+            None,
+        );
+        // PR-A (Note 1): test helper returns Arc<RoutingLoopPipeline> to match ResponsesContext.
+        // Force routing-loop send failure so this test can verify the helper used RL path.
+        drop(rx);
+        Arc::new(RoutingLoopPipeline::new(runtime, standard_pipeline))
+    }
+
+    async fn make_responses_context(with_routing_loop: bool) -> ResponsesContext {
+        let components = make_shared_components();
+        let pipeline = make_pipeline();
+
+        let tokenizer_id = TokenizerRegistry::generate_id();
+        components
+            .tokenizer_registry
+            .load(&tokenizer_id, "mock-model", "mock://tokenizer", || async {
+                Ok(Arc::new(TemplateMockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .expect("mock tokenizer should register");
+
+        let base = ResponsesContext::new(
+            Arc::clone(&pipeline),
+            Arc::clone(&components),
+            Arc::new(MemoryResponseStorage::new()),
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            make_mcp_orchestrator().await,
+        );
+
+        if with_routing_loop {
+            base.with_routing_loop(make_closed_routing_loop_pipeline(pipeline))
+        } else {
+            base
+        }
+    }
+
+    fn make_chat_request() -> Arc<ChatCompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": false
+            }))
+            .expect("test chat request should deserialize"),
+        )
+    }
+
+    fn error_code(response: &Response) -> Option<&str> {
+        response
+            .headers()
+            .get(HEADER_X_SMG_ERROR_CODE)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_for_responses_prefers_routing_loop_when_available() {
+        let ctx = make_responses_context(true).await;
+
+        let err = execute_chat_for_responses_with_routing_loop(
+            &ctx,
+            make_chat_request(),
+            None,
+            Some("mock-model".to_string()),
+        )
+        .await
+        .expect_err("closed routing-loop channel should return error");
+
+        assert_eq!(error_code(&err), Some("routing_loop_send_failed"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_for_responses_falls_back_without_routing_loop() {
+        let ctx = make_responses_context(false).await;
+
+        let err = execute_chat_for_responses_with_routing_loop(
+            &ctx,
+            make_chat_request(),
+            None,
+            Some("mock-model".to_string()),
+        )
+        .await
+        .expect_err("no-worker fallback path should error in test setup");
+
+        assert_ne!(error_code(&err), Some("routing_loop_send_failed"));
+    }
+
+    #[tokio::test]
+    async fn test_with_routing_loop_stores_shared_arc_instance() {
+        // PR-A (Note 2): ensure context wiring keeps the same Arc instance.
+        let components = make_shared_components();
+        let pipeline = make_pipeline();
+
+        let base = ResponsesContext::new(
+            Arc::clone(&pipeline),
+            Arc::clone(&components),
+            Arc::new(MemoryResponseStorage::new()),
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            make_mcp_orchestrator().await,
+        );
+
+        let rl_pipeline = make_closed_routing_loop_pipeline(Arc::clone(&pipeline));
+        let ctx = base.with_routing_loop(Arc::clone(&rl_pipeline));
+
+        let stored = ctx
+            .routing_loop_pipeline
+            .as_ref()
+            .expect("routing loop pipeline should be present");
+        assert!(Arc::ptr_eq(stored, &rl_pipeline));
     }
 }

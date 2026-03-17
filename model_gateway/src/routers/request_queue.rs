@@ -453,11 +453,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_version_partitioning() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,
@@ -481,11 +477,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_push_pop_from_queue() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,
@@ -505,11 +497,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_push_back_to_queue() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         // Push to queue 1 directly via push_back_to_queue
         mq.push_back_to_queue(
             1,
@@ -526,11 +514,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_queue_keys() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 3,
@@ -553,11 +537,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_per_version_sizes() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,
@@ -581,11 +561,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_remove_empty_queues() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,
@@ -607,11 +583,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_filter() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,
@@ -634,11 +606,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_len_total() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         assert_eq!(mq.len(), 0);
         mq.push(TestReq {
             id: 1,
@@ -662,11 +630,7 @@ mod tests {
     #[test]
     fn test_multi_queue_enable_multi_priority_queue() {
         // When disabled, all go to queue key 0
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            false,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, false, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,
@@ -685,11 +649,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_pop_order_across_queues() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         // BTreeMap iterates in key order, so queue 1 is drained first
         mq.push(TestReq {
             id: 1,
@@ -711,11 +671,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_unversioned_requests() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         // version_tag=-1 → queue key = i32::MAX
         mq.push(TestReq {
             id: 1,
@@ -737,11 +693,8 @@ mod tests {
 
     #[test]
     fn test_multi_queue_is_empty() {
-        let mut mq: MultiPriorityRequestQueue<TestReq> = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq: MultiPriorityRequestQueue<TestReq> =
+            MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         assert!(mq.is_empty());
         mq.push(TestReq {
             id: 1,
@@ -755,11 +708,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_get_queue() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         assert!(mq.get_queue(1).is_none());
         mq.push(TestReq {
             id: 1,
@@ -772,11 +721,7 @@ mod tests {
 
     #[test]
     fn test_multi_queue_remove_queue() {
-        let mut mq = MultiPriorityRequestQueue::new(
-            RequestSortIndicator::SmallId,
-            true,
-            None,
-        );
+        let mut mq = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true, None);
         mq.push(TestReq {
             id: 1,
             version_tag: 1,

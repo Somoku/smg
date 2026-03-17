@@ -104,6 +104,10 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+    // PR Python §1.4: PSRL configuration — routing strategy, PS manager connection, MIG strategy.
+    /// PSRL configuration: routing strategy, PS manager connection, MIG strategy.
+    #[serde(default)]
+    pub psrl: PsrlConfig,
 }
 
 /// Tokenizer cache configuration
@@ -297,12 +301,27 @@ pub struct PsrlConfig {
 impl Default for PsrlConfig {
     fn default() -> Self {
         Self {
-            check_interval_ms: 0,
+            // PR 14: Default to 10 ms to match sgl-model-gateway default.
+            // 0 would cause yield-only sleep which burns CPU at high queue pressure.
+            check_interval_ms: 10,
             ps_manager_ip: default_ps_manager_ip(),
             ps_manager_grpc_port: default_ps_manager_grpc_port(),
             routing_strategy: PsrlRoutingStrategy::default(),
             enable_mig_strategy: false,
         }
+    }
+}
+
+impl PsrlConfig {
+    // PR 10 §10.1: Convenience method to get the full PS Manager gRPC address.
+    /// Returns the full PS Manager gRPC endpoint (e.g. `http://127.0.0.1:50051`).
+    ///
+    /// Constructed from `ps_manager_ip` and `ps_manager_grpc_port` fields.
+    pub fn ps_manager_addr(&self) -> String {
+        format!(
+            "http://{}:{}",
+            self.ps_manager_ip, self.ps_manager_grpc_port
+        )
     }
 }
 
@@ -794,6 +813,8 @@ impl Default for RouterConfig {
             storage_hook_wasm_path: None,
             server_cert: None,
             server_key: None,
+            // PR Python §1.4: PSRL config defaults.
+            psrl: PsrlConfig::default(),
         }
     }
 }
@@ -890,6 +911,17 @@ mod tests {
         assert!(config.trace_config.is_none());
         assert!(config.log_dir.is_none());
         assert!(config.log_level.is_none());
+
+        // PR 14: RouterConfig must carry PSRL defaults (no hardcoded fallback in server/router).
+        assert_eq!(config.psrl.check_interval_ms, 10);
+        assert_eq!(config.psrl.ps_manager_ip, "127.0.0.1");
+        assert_eq!(config.psrl.ps_manager_grpc_port, 50051);
+        assert_eq!(
+            config.psrl.routing_strategy.candidate_sort_indicator,
+            CandidateSortIndicator::Version
+        );
+        assert!(!config.psrl.routing_strategy.enable_multi_priority_queue);
+        assert!(!config.psrl.enable_mig_strategy);
     }
 
     #[test]
@@ -937,6 +969,43 @@ mod tests {
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
+    }
+
+    #[test]
+    fn test_router_config_deserialization_defaults_psrl_when_missing() {
+        // PR 14: keep backward compatibility with config files that predate `router.psrl`.
+        let mut config_value = serde_json::to_value(RouterConfig::default()).unwrap();
+        let config_object = config_value
+            .as_object_mut()
+            .expect("RouterConfig JSON value must be an object");
+        config_object.remove("psrl");
+
+        let deserialized: RouterConfig = serde_json::from_value(config_value).unwrap();
+        assert_eq!(deserialized.psrl, PsrlConfig::default());
+    }
+
+    #[test]
+    fn test_router_config_psrl_yaml_roundtrip() {
+        // PR 14: verify runtime PSRL knobs serialize/deserialize through YAML config.
+        let mut config = RouterConfig::default();
+        config.psrl.check_interval_ms = 25;
+        config.psrl.ps_manager_ip = "10.1.2.3".to_string();
+        config.psrl.ps_manager_grpc_port = 51000;
+        config.psrl.enable_mig_strategy = true;
+        config.psrl.routing_strategy.request_sort_indicator = RequestSortIndicator::LongLength;
+        config.psrl.routing_strategy.candidate_sort_indicator =
+            CandidateSortIndicator::ReserveCapability;
+        config.psrl.routing_strategy.enable_multi_priority_queue = true;
+        config
+            .psrl
+            .routing_strategy
+            .enable_group_sampling_on_multi_instances = true;
+
+        let yaml = serde_yaml::to_string(&config).unwrap();
+        let parsed: RouterConfig = serde_yaml::from_str(&yaml).unwrap();
+
+        assert_eq!(parsed.psrl, config.psrl);
+        assert_eq!(parsed.psrl.ps_manager_addr(), "http://10.1.2.3:51000");
     }
 
     #[test]

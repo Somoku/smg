@@ -154,16 +154,25 @@ impl ThroughputRuntime {
     }
 
     // PR 3 §3.2a: Token estimation helpers
+    // PR 13 Gap 2: Removed the text.len()/4 character-count heuristic — it was a wrong
+    // approximation that could skew ThroughputOptimalPolicy decisions. When tokens are not
+    // available, return 1 as a neutral estimate. The routing loop now passes
+    // PreparationOutput::token_ids via SelectWorkerInfo::tokens, so the accurate count
+    // is available on all paths where it matters.
     #[inline]
+    #[expect(
+        clippy::panic,
+        reason = "tokens is contract-required for ThroughputOptimalPolicy callers; \
+                  callers must populate SelectWorkerInfo::tokens before invoking"
+    )]
     fn request_token_num(info: &SelectWorkerInfo<'_>) -> i64 {
         if let Some(tokens) = info.tokens {
-            return tokens.len().max(1) as i64;
+            tokens.len().max(1) as i64
+        } else {
+            panic!(
+                "SelectWorkerInfo.tokens is required for ThroughputOptimalPolicy but was not provided. Please ensure that the token count is passed in SelectWorkerInfo for accurate routing decisions."
+            )
         }
-        if let Some(text) = info.request_text {
-            // Lightweight estimate to avoid tokenization in hot path.
-            return (text.len().div_ceil(4)).max(1) as i64;
-        }
-        1
     }
 
     #[inline]
@@ -457,7 +466,10 @@ impl ThroughputOptimalPolicy {
                     continue;
                 }
 
-                if !self.rt.can_run_directly(worker, request_token_num, token_num) {
+                if !self
+                    .rt
+                    .can_run_directly(worker, request_token_num, token_num)
+                {
                     continue;
                 }
 
@@ -633,6 +645,18 @@ mod tests {
         );
     }
 
+    // PR 13 Gap 2 test helper: throughput policies now require explicit tokens in
+    // SelectWorkerInfo, so the tests share a stable tokenized request fixture.
+    const TEST_REQUEST_TOKENS: &[u32] = &[11, 22, 33, 44];
+
+    fn throughput_info<'a>(request_text: &'a str) -> SelectWorkerInfo<'a> {
+        SelectWorkerInfo {
+            request_text: Some(request_text),
+            tokens: Some(TEST_REQUEST_TOKENS),
+            ..Default::default()
+        }
+    }
+
     // ── RequestNumBalance tests ─────────────────────────────────────────
 
     // PR 3 §3.6 test: Picks worker with lowest load()
@@ -797,10 +821,7 @@ mod tests {
         );
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1, w2];
-        let info = SelectWorkerInfo {
-            request_text: Some("hello world"),
-            ..Default::default()
-        };
+        let info = throughput_info("hello world");
         let selected = policy.select_worker(&workers, &info);
         assert_eq!(selected, Some(1));
     }
@@ -839,10 +860,7 @@ mod tests {
         );
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("test"),
-            ..Default::default()
-        };
+        let info = throughput_info("test");
         let selected = policy.select_worker(&workers, &info);
         assert_eq!(selected, None);
     }
@@ -864,10 +882,7 @@ mod tests {
         );
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("test"),
-            ..Default::default()
-        };
+        let info = throughput_info("test");
         let selected = policy.select_worker(&workers, &info);
         assert_eq!(selected, None);
     }
@@ -893,10 +908,7 @@ mod tests {
         );
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("test"),
-            ..Default::default()
-        };
+        let info = throughput_info("test");
         let selected = policy.select_worker(&workers, &info);
         assert_eq!(selected, None);
     }
@@ -911,20 +923,10 @@ mod tests {
         });
 
         let w1 = build_worker("http://w1:8000", default_throughput_labels());
-        push_stats(
-            &w1,
-            0,
-            0,
-            HashMap::new(),
-            HashMap::new(),
-            0.0,
-        );
+        push_stats(&w1, 0, 0, HashMap::new(), HashMap::new(), 0.0);
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("test query"),
-            ..Default::default()
-        };
+        let info = throughput_info("test query");
         let selected = policy.select_worker(&workers, &info);
         // Should select the idle worker using fallback cost model
         assert_eq!(selected, Some(0));
@@ -959,9 +961,8 @@ mod tests {
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1, w2];
         let info = SelectWorkerInfo {
-            request_text: Some("test"),
             candidate_group_ids: Some(&candidate_ids),
-            ..Default::default()
+            ..throughput_info("test")
         };
         let selected = policy.select_worker(&workers, &info);
         // group 0 (w2 at index 1) is checked first
@@ -982,35 +983,19 @@ mod tests {
 
         // Running reqs > 0 but no token map entries → should use kv_cache_usage fallback.
         // kv_cache_usage=0.5, max_total_tokens=20000 → estimated tokens = ceil(0.5*20000) = 10000
-        push_stats(
-            &w1,
-            1,
-            0,
-            HashMap::new(),
-            HashMap::new(),
-            0.5,
-        );
+        push_stats(&w1, 1, 0, HashMap::new(), HashMap::new(), 0.5);
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("short"),
-            ..Default::default()
-        };
+        let info = throughput_info("short");
         let selected = policy.select_worker(&workers, &info);
         assert_eq!(selected, Some(0));
     }
 
-    // PR 3 §3.6 test: request_text (len/4 heuristic) vs tokens (exact count)
+    // PR 13 Gap 2: request_token_num no longer uses text.len()/4 heuristic.
+    // When tokens are available, the exact count is returned.
     #[test]
     fn test_throughput_optimal_request_text_estimation() {
-        // Text estimation: "hello world" = 11 chars → ceil(11/4) = 3 tokens
-        let text_estimate = ThroughputRuntime::request_token_num(&SelectWorkerInfo {
-            request_text: Some("hello world"),
-            ..Default::default()
-        });
-        assert_eq!(text_estimate, 3);
-
-        // Exact tokens take precedence
+        // With exact tokens: exact count takes precedence.
         let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
         let token_estimate = ThroughputRuntime::request_token_num(&SelectWorkerInfo {
             request_text: Some("hello world"),
@@ -1034,10 +1019,7 @@ mod tests {
         push_stats(&w1, 0, 0, HashMap::new(), HashMap::new(), 0.0);
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("test"),
-            ..Default::default()
-        };
+        let info = throughput_info("test");
         let selected = policy.select_worker(&workers, &info);
         // Should select idle worker with budget calculation
         assert_eq!(selected, Some(0));
@@ -1065,10 +1047,7 @@ mod tests {
         );
 
         let workers: Vec<Arc<dyn Worker>> = vec![w1];
-        let info = SelectWorkerInfo {
-            request_text: Some("test query"),
-            ..Default::default()
-        };
+        let info = throughput_info("test query");
         let selected = policy.select_worker(&workers, &info);
         assert_eq!(selected, Some(0));
     }
@@ -1079,7 +1058,10 @@ mod tests {
     #[test]
     fn test_fallback_cost_model_entry() {
         let throughput = DEFAULT_FALLBACK_COST_MODEL_ENTRY.estimate_throughput(4, 1000);
-        assert!(throughput > 0.0, "Fallback cost model should produce positive throughput");
+        assert!(
+            throughput > 0.0,
+            "Fallback cost model should produce positive throughput"
+        );
         assert!(throughput.is_finite(), "Throughput should be finite");
 
         // Zero requests → zero throughput
@@ -1104,11 +1086,11 @@ mod tests {
         assert_eq!(ThroughputRuntime::tp_pp_key(&w_default), "TP1_PP1");
     }
 
-    // PR 3 §3.6 test: No tokens or text → returns 1
+    // PR 13 Gap 2: ThroughputOptimal callers must now pass explicit tokens.
     #[test]
-    fn test_request_token_num_none() {
-        let estimate = ThroughputRuntime::request_token_num(&SelectWorkerInfo::default());
-        assert_eq!(estimate, 1);
+    #[should_panic(expected = "SelectWorkerInfo.tokens is required for ThroughputOptimalPolicy")]
+    fn test_request_token_num_without_tokens_panics() {
+        let _ = ThroughputRuntime::request_token_num(&SelectWorkerInfo::default());
     }
 
     // PR 3 §3.6 test: Policy name correctness

@@ -8,7 +8,8 @@ including parameter validation, URL validation, and configuration validation.
 from unittest.mock import MagicMock, patch
 
 import pytest
-from smg.launch_router import RouterArgs, launch_router
+from smg.launch_router import RouterArgs, launch_router, parse_router_args
+from smg.router import Router
 
 
 class TestURLValidation:
@@ -317,8 +318,16 @@ class TestConfigurationValidation:
 
     def test_policy_validation(self):
         """Test policy configuration validation."""
-        # Valid policies
-        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
+        # PR Python §3.1: The Python validation layer should accept the new PSRL policies too.
+        valid_policies = [
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "request_num_balance",
+            "throughput_optimal",
+            "throughput_optimal_with_budget",
+        ]
 
         for policy in valid_policies:
             args = RouterArgs(policy=policy)
@@ -326,8 +335,16 @@ class TestConfigurationValidation:
 
     def test_pd_policy_validation(self):
         """Test PD policy configuration validation."""
-        # Valid PD policies
-        valid_policies = ["random", "round_robin", "cache_aware", "power_of_two"]
+        # PR Python §3.1: Prefill/decode policy strings should also accept PSRL-capable policies.
+        valid_policies = [
+            "random",
+            "round_robin",
+            "cache_aware",
+            "power_of_two",
+            "request_num_balance",
+            "throughput_optimal",
+            "throughput_optimal_with_budget",
+        ]
 
         for prefill_policy in valid_policies:
             for decode_policy in valid_policies:
@@ -391,6 +408,31 @@ class TestConfigurationValidation:
         for headers in valid_headers:
             args = RouterArgs(request_id_headers=headers)
             assert args.request_id_headers == headers
+
+    def test_invalid_psrl_request_sort_indicator_is_preserved(self):
+        """Test invalid PSRL request sort indicator strings are not rejected in Python."""
+        # PR Python §3.3: Confirm Python preserves unknown request-sort strings for Rust fallback handling.
+        router_args = parse_router_args(["--psrl-request-sort-indicator", "unexpected-order"])
+        assert router_args.psrl_request_sort_indicator == "unexpected-order"
+
+        with patch("smg.router._Router") as router_ctor:
+            router_ctor.return_value = MagicMock()
+            Router.from_args(router_args)
+            assert router_ctor.call_args.kwargs["psrl_request_sort_indicator"] == "unexpected-order"
+
+    def test_invalid_psrl_candidate_sort_indicator_is_preserved(self):
+        """Test invalid PSRL candidate sort indicator strings are not rejected in Python."""
+        # PR Python §3.3: Confirm Python preserves unknown candidate-sort strings for Rust fallback handling.
+        router_args = parse_router_args(["--psrl-candidate-sort-indicator", "unexpected-candidate"])
+        assert router_args.psrl_candidate_sort_indicator == "unexpected-candidate"
+
+        with patch("smg.router._Router") as router_ctor:
+            router_ctor.return_value = MagicMock()
+            Router.from_args(router_args)
+            assert (
+                router_ctor.call_args.kwargs["psrl_candidate_sort_indicator"]
+                == "unexpected-candidate"
+            )
 
 
 class TestLaunchValidation:

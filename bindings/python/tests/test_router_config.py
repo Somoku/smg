@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import policy_from_str
+from smg.router import Router, policy_from_str
 from smg.smg_rs import PolicyType
 
 
@@ -326,6 +326,108 @@ class TestRouterConfigValidation:
         assert policy_from_str("round_robin") == PolicyType.RoundRobin
         assert policy_from_str("cache_aware") == PolicyType.CacheAware
         assert policy_from_str("power_of_two") == PolicyType.PowerOfTwo
+        # PR Python §3.2: Router.from_args must recognize the new PSRL policy types.
+        assert policy_from_str("request_num_balance") == PolicyType.RequestNumBalance
+        assert policy_from_str("throughput_optimal") == PolicyType.ThroughputOptimal
+        assert (
+            policy_from_str("throughput_optimal_with_budget")
+            == PolicyType.ThroughputOptimalWithBudget
+        )
+
+    def test_router_from_args_maps_request_num_balance(self):
+        """Test Router.from_args mapping for request_num_balance."""
+        # PR Python §3.2: Verify RequestNumBalance reaches the Rust constructor.
+        with patch("smg.router._Router") as router_ctor:
+            router_ctor.return_value = MagicMock()
+
+            Router.from_args(RouterArgs(policy="request_num_balance"))
+
+            kwargs = router_ctor.call_args.kwargs
+            assert kwargs["policy"] == PolicyType.RequestNumBalance
+
+    def test_router_from_args_maps_throughput_optimal_config(self):
+        """Test Router.from_args mapping for throughput_optimal fields."""
+        # PR Python §3.2: Verify ThroughputOptimal and its cost-model tuning fields flow through.
+        with patch("smg.router._Router") as router_ctor:
+            router_ctor.return_value = MagicMock()
+
+            Router.from_args(
+                RouterArgs(
+                    policy="throughput_optimal",
+                    policy_cost_model_path="/tmp/cost-model.json",
+                    policy_balanced_concurrent_seqs_per_instance=768,
+                    policy_max_concurrent_seqs_per_instance=1536,
+                    policy_request_budget=2048,
+                )
+            )
+
+            kwargs = router_ctor.call_args.kwargs
+            assert kwargs["policy"] == PolicyType.ThroughputOptimal
+            assert kwargs["policy_cost_model_path"] == "/tmp/cost-model.json"
+            assert kwargs["policy_balanced_concurrent_seqs_per_instance"] == 768
+            assert kwargs["policy_max_concurrent_seqs_per_instance"] == 1536
+            assert kwargs["policy_request_budget"] == 2048
+
+    def test_router_from_args_allows_routing_loop_for_psrl_policy(self):
+        """Test enable_routing_loop with a PSRL policy."""
+        # PR Python §3.2: RequestNumBalance should work with enable_routing_loop enabled.
+        router = Router.from_args(
+            RouterArgs(
+                policy="request_num_balance",
+                enable_routing_loop=True,
+                psrl_check_interval_ms=20,
+            )
+        )
+
+        assert isinstance(router, Router)
+
+    def test_router_from_args_allows_routing_loop_for_cache_aware(self):
+        """Test enable_routing_loop with a non-PSRL policy."""
+        # PR Python §3.2: CacheAware should also work because routing-loop enablement is unrestricted.
+        router = Router.from_args(
+            RouterArgs(
+                policy="cache_aware",
+                enable_routing_loop=True,
+                psrl_request_sort_indicator="unexpected-order",
+            )
+        )
+
+        assert isinstance(router, Router)
+
+    def test_router_from_args_passes_flat_psrl_fields(self):
+        """Test PSRL fields flow from RouterArgs into the Rust constructor kwargs."""
+        # PR Python §3.2: Flat PSRL fields must be passed through without nesting or stripping.
+        with patch("smg.router._Router") as router_ctor:
+            router_ctor.return_value = MagicMock()
+
+            Router.from_args(
+                RouterArgs(
+                    enable_routing_loop=True,
+                    psrl_check_interval_ms=25,
+                    psrl_ps_manager_ip="10.0.0.9",
+                    psrl_ps_manager_grpc_port=52000,
+                    psrl_request_sort_indicator="small_id",
+                    psrl_candidate_sort_indicator="reserve_capability",
+                    enable_multi_priority_queue=True,
+                    psrl_enable_group_sampling_on_multi_instances=True,
+                    psrl_snapshot_staleness_threshold_in_ms=4000,
+                    psrl_max_num_waiting_reqs_after_preemption=2222,
+                    psrl_mig_enable=True,
+                )
+            )
+
+            kwargs = router_ctor.call_args.kwargs
+            assert kwargs["enable_routing_loop"] is True
+            assert kwargs["psrl_check_interval_ms"] == 25
+            assert kwargs["psrl_ps_manager_ip"] == "10.0.0.9"
+            assert kwargs["psrl_ps_manager_grpc_port"] == 52000
+            assert kwargs["psrl_request_sort_indicator"] == "small_id"
+            assert kwargs["psrl_candidate_sort_indicator"] == "reserve_capability"
+            assert kwargs["enable_multi_priority_queue"] is True
+            assert kwargs["psrl_enable_group_sampling_on_multi_instances"] is True
+            assert kwargs["psrl_snapshot_staleness_threshold_in_ms"] == 4000
+            assert kwargs["psrl_max_num_waiting_reqs_after_preemption"] == 2222
+            assert kwargs["psrl_mig_enable"] is True
 
     def test_invalid_policy_enum_conversion(self):
         """Test invalid policy string to enum conversion."""

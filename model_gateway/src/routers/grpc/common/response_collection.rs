@@ -66,6 +66,9 @@ pub(crate) async fn collect_responses(
                 "Embedding result encountered in response collection",
             ));
         }
+        // PR 12 §12.2: PreDrained — already collected by drain_stream_for_partial_rollout().
+        // Return the pre-collected complete messages directly without re-reading a stream.
+        ExecutionResult::PreDrained { complete } => complete,
     };
 
     if all_responses.is_empty() {

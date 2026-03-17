@@ -29,6 +29,10 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
         "prefix_hash": PolicyType.PrefixHash,
+        # PR Python §2.2: Map PSRL routing policy strings to the new Rust PolicyType variants.
+        "request_num_balance": PolicyType.RequestNumBalance,
+        "throughput_optimal": PolicyType.ThroughputOptimal,
+        "throughput_optimal_with_budget": PolicyType.ThroughputOptimalWithBudget,
     }
     return policy_map[policy_str]
 
@@ -314,7 +318,8 @@ class Router:
         # Build control plane auth config
         args_dict["control_plane_auth"] = build_control_plane_auth_config(args_dict)
 
-        # Remove fields that shouldn't be passed to Rust Router constructor
+        # PR Python §2.2: Keep the flat PSRL fields in args_dict so they pass directly into the
+        # PyO3 Router constructor; only remove fields that are converted into nested helper types.
         fields_to_remove = [
             "oracle_wallet_path",
             "oracle_tns_alias",

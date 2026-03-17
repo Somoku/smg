@@ -239,6 +239,15 @@ impl PipelineStage for HarmonyRequestBuildingStage {
             }
         };
 
+        // PR 18 (Gap 5): apply accumulated loopback token_ids/max-token budget
+        // at proto-request level so Harmony Chat/Responses can resume after abort.
+        // Each call rebuilds the proto from scratch, so all accumulated token_ids are
+        // injected unconditionally into the freshly built proto.
+        helpers::maybe_apply_partial_rollout_loopback(
+            &mut proto_request,
+            ctx.state.partial_rollout_state.as_ref(),
+        );
+
         // Inject Harmony stop token IDs into sampling params for ALL Harmony requests
         // These stop tokens (<|return|> and <|call|>) prevent the model from generating
         // malformed Harmony sequences

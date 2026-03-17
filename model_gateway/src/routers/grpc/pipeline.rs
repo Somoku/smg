@@ -865,4 +865,151 @@ impl RequestPipeline {
 
         Ok((execution_result, load_guards))
     }
+
+    // PR 10 §10.4: execute_preparation_only — run only the preparation stage.
+    /// Run only Stage 0 (Preparation) and return the prepared `RequestContext`.
+    ///
+    /// Used by router handlers that need to run preparation before deciding
+    /// whether to route the request through the PSRL routing loop or the
+    /// normal pipeline. The returned context is submitted to the routing loop
+    /// as a `RoutingQueueEntry` (PSRL path) or the full pipeline resumes
+    /// from `execute_chat`/`execute_generate` (non-PSRL path).
+    ///
+    /// Returns `Ok(ctx)` on success, `Err(response)` if preparation fails.
+    pub async fn execute_preparation_only(
+        &self,
+        ctx: RequestContext,
+    ) -> Result<RequestContext, Response> {
+        // Stage 0 is always PreparationStage (index 0 in self.stages)
+        let prep_stage = self
+            .stages
+            .first()
+            .ok_or_else(|| error::internal_error("empty_pipeline", "Pipeline has no stages"))?;
+
+        let mut ctx = ctx;
+        match prep_stage.execute(&mut ctx).await {
+            Ok(None) => Ok(ctx),
+            Ok(Some(response)) => {
+                // Preparation should never return an early response
+                error!(
+                    function = "execute_preparation_only",
+                    stage = prep_stage.name(),
+                    "Preparation stage returned unexpected early response"
+                );
+                Err(response)
+            }
+            Err(response) => Err(response),
+        }
+    }
+
+    // PR 12 §12.1: execute_response_processing_only — run only the last stage (ResponseProcessing)
+    // on a RequestContext that already has execution_result set (used by PSRL dispatch after drain).
+    /// Execute only the last pipeline stage (ResponseProcessing) on a `RequestContext`
+    /// whose `execution_result` has already been populated (e.g., `ExecutionResult::PreDrained`).
+    ///
+    /// Used by the PSRL dispatch task after `drain_stream_for_partial_rollout()` converts
+    /// the raw stream into a `PreDrained` execution result. The caller is responsible for
+    /// setting `ctx.state.response.execution_result` before calling this method.
+    ///
+    /// Returns the final `axum::Response`.
+    pub async fn execute_response_processing_only(&self, mut ctx: RequestContext) -> Response {
+        // The last stage (index stages.len()-1) is always ResponseProcessing.
+        let last_stage = match self.stages.last() {
+            Some(s) => s,
+            None => {
+                error!(
+                    function = "execute_response_processing_only",
+                    "Pipeline has no stages"
+                );
+                return error::internal_error("empty_pipeline", "Pipeline has no stages");
+            }
+        };
+
+        match last_stage.execute(&mut ctx).await {
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                // ResponseProcessing set final_response in ctx; extract it.
+                match ctx.state.response.final_response {
+                    Some(response) => match response {
+                        FinalResponse::Chat(r) => axum::Json(r).into_response(),
+                        FinalResponse::Generate(r) => axum::Json(r).into_response(),
+                        FinalResponse::Embedding(r) => axum::Json(r).into_response(),
+                        FinalResponse::Classify(r) => axum::Json(r).into_response(),
+                    },
+                    None => {
+                        error!(
+                            function = "execute_response_processing_only",
+                            "No response produced by ResponseProcessing stage"
+                        );
+                        error::internal_error("no_response_produced", "No response produced")
+                    }
+                }
+            }
+            Err(response) => {
+                error!(
+                    "ResponseProcessing stage failed with status {}",
+                    response.status()
+                );
+                response
+            }
+        }
+    }
+
+    // PR 12 §12.1: execute_through_execution — run stages 2-5 (ClientAcquisition through
+    // RequestExecution) and return the raw ExecutionResult before ResponseProcessing.
+    /// Execute stages 2–5 (ClientAcquisition, RequestBuilding, DispatchMetadata, Execution)
+    /// on a `RequestContext` where preparation (stage 0) and worker selection (stage 1)
+    /// have already been completed by the routing loop.
+    ///
+    /// Used by the PSRL dispatch task for partial rollout interception.
+    /// The caller drains the returned `ExecutionResult` stream and decides whether to
+    /// continue (stop/length) or loopback (abort) before running ResponseProcessing.
+    ///
+    /// Returns `Ok((ctx, execution_result))` on success, `Err(response)` if any stage fails.
+    pub async fn execute_through_execution(
+        &self,
+        mut ctx: RequestContext,
+    ) -> Result<(RequestContext, ExecutionResult), Response> {
+        // Stages 2-5: skip stage 0 (Preparation) and stage 1 (WorkerSelection),
+        // and stop before stage 6 (ResponseProcessing — last stage).
+        // Stage indices: 0=Prep, 1=WorkerSelection, 2=ClientAcq, 3=ReqBuilding,
+        //                4=DispatchMeta, 5=RequestExecution, 6=ResponseProcessing
+        let stages_to_run = self.stages.iter().skip(2).take(self.stages.len() - 3);
+
+        for stage in stages_to_run {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    // Unexpected early response from a pre-execution stage.
+                    error!(
+                        "Stage {} returned unexpected early response in execute_through_execution",
+                        stage.name()
+                    );
+                    return Err(response);
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        "Stage {} failed with status {} in execute_through_execution",
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+
+        // Extract ExecutionResult from the context (set by RequestExecutionStage).
+        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "execute_through_execution",
+                "No ExecutionResult produced by pipeline (RequestExecutionStage did not run?)"
+            );
+            error::internal_error(
+                "no_execution_result",
+                "No ExecutionResult produced by pipeline",
+            )
+        })?;
+
+        Ok((ctx, execution_result))
+    }
 }

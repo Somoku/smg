@@ -76,6 +76,15 @@ impl PipelineStage for GenerateRequestBuildingStage {
                 error::bad_request("build_request_failed", e)
             })?;
 
+        // PR 18 (Gap 5): apply accumulated loopback token_ids/max-token budget
+        // at proto-request level so Generate shares the same mechanism as Chat/Responses.
+        // Each call rebuilds the proto from scratch, so all accumulated token_ids are
+        // injected unconditionally into the freshly built proto.
+        helpers::maybe_apply_partial_rollout_loopback(
+            &mut proto_request,
+            ctx.state.partial_rollout_state.as_ref(),
+        );
+
         if self.inject_pd_metadata {
             if let Some(workers) = ctx.state.workers.as_ref() {
                 helpers::maybe_inject_pd_metadata(&mut proto_request, workers);

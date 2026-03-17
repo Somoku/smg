@@ -9,6 +9,28 @@ from smg.smg_rs import get_available_tool_call_parsers
 
 logger = logging.getLogger(__name__)
 
+# PR Python §2.1: Expanded routing policy choices exposed by the Python bindings.
+ROUTING_POLICY_CHOICES = [
+    "random",
+    "round_robin",
+    "cache_aware",
+    "power_of_two",
+    "manual",
+    "bucket",
+    "consistent_hashing",
+    "prefix_hash",
+    "request_num_balance",
+    "throughput_optimal",
+    "throughput_optimal_with_budget",
+]
+
+# PR Python §2.1: Informational list of PSRL-native policies; not used to restrict routing loop enablement.
+PSRL_ROUTING_POLICY_CHOICES = [
+    "request_num_balance",
+    "throughput_optimal",
+    "throughput_optimal_with_budget",
+]
+
 
 @dataclasses.dataclass
 class RouterArgs:
@@ -39,6 +61,28 @@ class RouterArgs:
     block_size: int = 16
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
+    # PR Python §2.1: PrefixHash tuning and load-aware policy fields.
+    prefix_token_count: int = 256
+    prefix_hash_load_factor: float = 1.25
+    policy_balanced_concurrent_seqs_per_instance: int = 512
+    policy_max_concurrent_seqs_per_instance: int = 1024
+    policy_cost_model_path: str | None = None
+    policy_max_num_waiting_reqs_after_preemption: int = 1000
+    policy_delta_throughput_threshold: float = 0.5
+    policy_max_prompt_length: int = 8192
+    policy_request_budget: int = 1024
+    # PR Python §2.1: Routing loop and PSRL flat config fields.
+    enable_routing_loop: bool = False
+    psrl_check_interval_ms: int = 10
+    psrl_ps_manager_ip: str = "127.0.0.1"
+    psrl_ps_manager_grpc_port: int = 50051
+    psrl_request_sort_indicator: str = "short_length"
+    psrl_candidate_sort_indicator: str = "version"
+    enable_multi_priority_queue: bool = False
+    psrl_enable_group_sampling_on_multi_instances: bool = False
+    psrl_snapshot_staleness_threshold_in_ms: int = 1000
+    psrl_max_num_waiting_reqs_after_preemption: int = 1000
+    psrl_mig_enable: bool = False
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
     dp_aware: bool = False
@@ -225,6 +269,9 @@ class RouterArgs:
         auth_group = parser.add_argument_group(
             "Control Plane Authentication", "API key and JWT/OIDC authentication"
         )
+        psrl_group = parser.add_argument_group(
+            "PSRL", "PSRL routing loop and policy tuning configuration"
+        )
 
         # Worker configuration
         if not exclude_host_port:
@@ -256,11 +303,12 @@ class RouterArgs:
         )
 
         # Routing policy configuration
+        # PR Python §2.1: Surface all routing policies, including PSRL-specific variants, in the CLI.
         routing_group.add_argument(
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=ROUTING_POLICY_CHOICES,
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
@@ -270,14 +318,7 @@ class RouterArgs:
             f"--{prefix}prefill-policy",
             type=str,
             default=None,
-            choices=[
-                "random",
-                "round_robin",
-                "cache_aware",
-                "power_of_two",
-                "manual",
-                "bucket",
-            ],
+            choices=ROUTING_POLICY_CHOICES,
             help=(
                 "Specific policy for prefill nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -287,7 +328,7 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=ROUTING_POLICY_CHOICES,
             help=(
                 "Specific policy for decode nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -417,6 +458,128 @@ class RouterArgs:
             type=int,
             default=RouterArgs.load_monitor_interval,
             help="Interval in seconds between load monitor checks for PowerOfTwo routing (default: 10)",
+        )
+
+        # PR Python §2.1: Expose flat PSRL and policy-tuning arguments in the Python CLI.
+        psrl_group.add_argument(
+            f"--{prefix}prefix-token-count",
+            type=int,
+            default=RouterArgs.prefix_token_count,
+            help="Prefix token count used by the prefix_hash routing policy",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}prefix-hash-load-factor",
+            type=float,
+            default=RouterArgs.prefix_hash_load_factor,
+            help="Load factor used by the prefix_hash routing policy",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-balanced-concurrent-seqs-per-instance",
+            type=int,
+            default=RouterArgs.policy_balanced_concurrent_seqs_per_instance,
+            help="Balanced concurrent sequence target per instance for PSRL load-aware policies",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-max-concurrent-seqs-per-instance",
+            type=int,
+            default=RouterArgs.policy_max_concurrent_seqs_per_instance,
+            help="Maximum concurrent sequences per instance for PSRL load-aware policies",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-cost-model-path",
+            type=str,
+            default=RouterArgs.policy_cost_model_path,
+            help="Optional path to the PSRL throughput cost model file",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-max-num-waiting-reqs-after-preemption",
+            type=int,
+            default=RouterArgs.policy_max_num_waiting_reqs_after_preemption,
+            help="Max waiting requests after preemption for PSRL throughput policies",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-delta-throughput-threshold",
+            type=float,
+            default=RouterArgs.policy_delta_throughput_threshold,
+            help="Delta throughput threshold for PSRL throughput policies",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-max-prompt-length",
+            type=int,
+            default=RouterArgs.policy_max_prompt_length,
+            help="Maximum prompt length used by PSRL throughput policies",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}policy-request-budget",
+            type=int,
+            default=RouterArgs.policy_request_budget,
+            help="Request budget used by PSRL throughput-with-budget routing",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}enable-routing-loop",
+            action="store_true",
+            default=RouterArgs.enable_routing_loop,
+            help="Enable the PSRL routing loop runtime wiring in RouterConfig",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-check-interval-ms",
+            type=int,
+            default=RouterArgs.psrl_check_interval_ms,
+            help="Polling interval in milliseconds for PSRL state checks",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-ps-manager-ip",
+            type=str,
+            default=RouterArgs.psrl_ps_manager_ip,
+            help="PSRL PS manager IP address",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-ps-manager-grpc-port",
+            type=int,
+            default=RouterArgs.psrl_ps_manager_grpc_port,
+            help="PSRL PS manager gRPC port",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-request-sort-indicator",
+            type=str,
+            default=RouterArgs.psrl_request_sort_indicator,
+            help="PSRL request sort indicator string passed through to the Rust bindings",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-candidate-sort-indicator",
+            type=str,
+            default=RouterArgs.psrl_candidate_sort_indicator,
+            help="PSRL candidate sort indicator string passed through to the Rust bindings",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}enable-multi-priority-queue",
+            action="store_true",
+            default=RouterArgs.enable_multi_priority_queue,
+            help="Enable the PSRL multi-priority request queue",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-enable-group-sampling-on-multi-instances",
+            action="store_true",
+            default=RouterArgs.psrl_enable_group_sampling_on_multi_instances,
+            help="Enable PSRL group sampling across multiple instances",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-snapshot-staleness-threshold-in-ms",
+            type=int,
+            default=RouterArgs.psrl_snapshot_staleness_threshold_in_ms,
+            help="Snapshot staleness threshold in milliseconds for PSRL routing",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-max-num-waiting-reqs-after-preemption",
+            type=int,
+            default=RouterArgs.psrl_max_num_waiting_reqs_after_preemption,
+            help="PSRL routing-loop max waiting requests after preemption",
+        )
+        psrl_group.add_argument(
+            f"--{prefix}psrl-mig-enable",
+            action="store_true",
+            default=RouterArgs.psrl_mig_enable,
+            help="Enable the PSRL MIG routing strategy",
         )
 
         # Logging configuration

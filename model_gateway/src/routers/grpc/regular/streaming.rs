@@ -162,6 +162,16 @@ impl StreamingProcessor {
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }
+            // PR 12 §12.2: PreDrained is used by the PSRL dispatch path — not reachable
+            // in the regular streaming path (streaming requests are not PSRL).
+            context::ExecutionResult::PreDrained { .. } => {
+                utils::send_error_sse(
+                    &tx,
+                    "PreDrained execution result not supported in streaming",
+                    "internal_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
         }
 
         // Return SSE response
@@ -683,6 +693,16 @@ impl StreamingProcessor {
                     &tx,
                     "Embeddings not supported in streaming generate",
                     "invalid_request_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
+            // PR 12 §12.2: PreDrained is used by the PSRL dispatch path — not reachable
+            // in the regular generate streaming path (streaming requests are not PSRL).
+            context::ExecutionResult::PreDrained { .. } => {
+                utils::send_error_sse(
+                    &tx,
+                    "PreDrained execution result not supported in streaming generate",
+                    "internal_error",
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }

@@ -23,8 +23,8 @@ use tracing::{debug, warn};
 use crate::{
     config::RouterConfig,
     core::{
-        worker::worker_to_info, worker_registry::WorkerId, EngineStats,
-        EngineStatsUpdateOutcome, Job, JobQueue, Worker, WorkerRegistry,
+        worker::worker_to_info, worker_registry::WorkerId, EngineStats, EngineStatsUpdateOutcome,
+        Job, JobQueue, Worker, WorkerRegistry,
     },
 };
 
@@ -638,12 +638,11 @@ impl WorkerService {
         ) {
             (Some(worker_id_raw), None, None) => {
                 let worker_id = Self::parse_worker_id(worker_id_raw)?;
-                let worker = self
-                    .worker_registry
-                    .get(&worker_id)
-                    .ok_or_else(|| WorkerServiceError::NotFound {
+                let worker = self.worker_registry.get(&worker_id).ok_or_else(|| {
+                    WorkerServiceError::NotFound {
                         worker_id: worker_id_raw.to_string(),
-                    })?;
+                    }
+                })?;
                 Ok((worker_id, worker))
             }
             (None, Some(base_worker_id_raw), Some(dp_rank)) => {
@@ -651,8 +650,9 @@ impl WorkerService {
             }
             _ => Err(WorkerServiceError::InvalidId {
                 raw: "worker stats target".to_string(),
-                message: "target must specify either `worker_id`, or both `base_worker_id` and `dp_rank`"
-                    .to_string(),
+                message:
+                    "target must specify either `worker_id`, or both `base_worker_id` and `dp_rank`"
+                        .to_string(),
             }),
         }
     }
@@ -783,22 +783,16 @@ impl WorkerService {
     /// Called by `POST /workers/stats`. Each update item targets a single worker
     /// via `worker_id` or `base_worker_id` + `dp_rank`. Stats are applied with
     /// staleness checking using the configured threshold.
-    pub fn update_worker_stats(
-        &self,
-        update: WorkerStatsUpdateRequest,
-    ) -> UpdateWorkerStatsResult {
+    pub fn update_worker_stats(&self, update: WorkerStatsUpdateRequest) -> UpdateWorkerStatsResult {
         let total = update.updates.len();
         let mut results = Vec::with_capacity(total);
-        let staleness_threshold_ms = self
-            .router_config
-            .engine_stats_staleness_threshold_ms;
+        let staleness_threshold_ms = self.router_config.engine_stats_staleness_threshold_ms;
 
         for item in update.updates {
             match self.resolve_worker_from_target(&item) {
                 Ok((worker_id, worker)) => {
                     let worker_url = worker.url().to_string();
-                    let outcome =
-                        worker.update_engine_stats(item.stats, staleness_threshold_ms);
+                    let outcome = worker.update_engine_stats(item.stats, staleness_threshold_ms);
                     results.push(Self::build_stats_update_result(
                         &worker_id,
                         worker_url,
@@ -870,13 +864,8 @@ impl WorkerService {
                             paused,
                             base_worker_id: base_worker_id.clone(),
                             dp_rank: worker.dp_rank().or_else(|| {
-                                if requested_ranks
-                                    .as_ref()
-                                    .is_some_and(|r| r.len() == 1)
-                                {
-                                    requested_ranks
-                                        .as_ref()
-                                        .and_then(|r| r.first().copied())
+                                if requested_ranks.as_ref().is_some_and(|r| r.len() == 1) {
+                                    requested_ranks.as_ref().and_then(|r| r.first().copied())
                                 } else {
                                     None
                                 }
@@ -925,10 +914,7 @@ impl WorkerService {
     ///
     /// Called by `POST /workers/pause`. Paused workers are excluded from
     /// load-balancing selection via `is_available()`.
-    pub fn pause_workers(
-        &self,
-        update: WorkerRoutingControlRequest,
-    ) -> UpdateWorkerRoutingResult {
+    pub fn pause_workers(&self, update: WorkerRoutingControlRequest) -> UpdateWorkerRoutingResult {
         self.apply_worker_routing_control(update, true)
     }
 
@@ -936,10 +922,7 @@ impl WorkerService {
     /// Resume routing for one or multiple workers.
     ///
     /// Called by `POST /workers/resume`.
-    pub fn resume_workers(
-        &self,
-        update: WorkerRoutingControlRequest,
-    ) -> UpdateWorkerRoutingResult {
+    pub fn resume_workers(&self, update: WorkerRoutingControlRequest) -> UpdateWorkerRoutingResult {
         self.apply_worker_routing_control(update, false)
     }
 
@@ -1354,12 +1337,11 @@ mod tests {
         let worker_id = register_worker(&registry, "http://worker1:8000");
 
         // Pause first
-        let pause_request: WorkerRoutingControlRequest =
-            vec![WorkerRoutingControlTargetRequest {
-                worker_id: Some(worker_id.as_str().to_string()),
-                base_worker_id: None,
-                dp_rank: None,
-            }];
+        let pause_request: WorkerRoutingControlRequest = vec![WorkerRoutingControlTargetRequest {
+            worker_id: Some(worker_id.as_str().to_string()),
+            base_worker_id: None,
+            dp_rank: None,
+        }];
         service.pause_workers(pause_request);
 
         // Verify paused
@@ -1367,12 +1349,11 @@ mod tests {
         assert!(worker.is_paused());
 
         // Resume
-        let resume_request: WorkerRoutingControlRequest =
-            vec![WorkerRoutingControlTargetRequest {
-                worker_id: Some(worker_id.as_str().to_string()),
-                base_worker_id: None,
-                dp_rank: None,
-            }];
+        let resume_request: WorkerRoutingControlRequest = vec![WorkerRoutingControlTargetRequest {
+            worker_id: Some(worker_id.as_str().to_string()),
+            base_worker_id: None,
+            dp_rank: None,
+        }];
         let result = service.resume_workers(resume_request);
         assert_eq!(result.action, "resumed");
         assert_eq!(result.updated, 1);
@@ -1504,20 +1485,14 @@ mod tests {
         let config = RouterConfig::default();
         let version_map: InstanceVersionMap = Arc::new(Mutex::new(HashMap::new()));
 
-        let service =
-            WorkerService::new(registry, job_queue, config, version_map.clone());
+        let service = WorkerService::new(registry, job_queue, config, version_map.clone());
 
         // Insert via the map directly
-        version_map
-            .lock()
-            .insert(("w1".to_string(), 0), 100);
+        version_map.lock().insert(("w1".to_string(), 0), 100);
 
         // Verify readable through the service accessor
         let service_map = service.instance_to_version_map();
-        assert_eq!(
-            service_map.lock().get(&("w1".to_string(), 0)),
-            Some(&100)
-        );
+        assert_eq!(service_map.lock().get(&("w1".to_string(), 0)), Some(&100));
     }
 
     // ====================================================================
@@ -1613,8 +1588,7 @@ mod tests {
 
     #[test]
     fn test_parse_worker_id_valid() {
-        let result =
-            WorkerService::parse_worker_id("00000000-0000-0000-0000-000000000001");
+        let result = WorkerService::parse_worker_id("00000000-0000-0000-0000-000000000001");
         assert!(result.is_ok());
         assert_eq!(
             result.expect("valid").as_str(),

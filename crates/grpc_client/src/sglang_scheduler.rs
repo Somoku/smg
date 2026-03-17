@@ -378,7 +378,8 @@ impl SglangSchedulerClient {
         if body
             .sampling_params
             .as_ref()
-            .and_then(|p| p.logprobs).is_some()
+            .and_then(|p| p.logprobs)
+            .is_some()
         {
             // Ignore logprobs in sampling_params, use top-level fields instead.
             warn!(

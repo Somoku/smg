@@ -1,19 +1,42 @@
 // PR 5 §5.2: Routing loop utilities for PSRL metadata parsing.
+// PR 10 §10.1: RoutingLoopRuntime completed with channel, tracking maps, PS Manager client.
+// PR 13 §13.1: RoutingQueueEntry now carries RequestContext directly (post-PreparationStage)
+//   instead of PreparedRequest + headers. Eliminates the discard-and-recreate cycle where
+//   pipeline_routing_loop.rs ran execute_preparation_only(), discarded the resulting context,
+//   then re-wrapped the original Arc<Request> into PreparedRequest. Now the prepared context
+//   flows through the queue boundary intact, preserving PreparationOutput (token_ids,
+//   original_text, processed_messages, tool_constraints, filtered_request).
+// PR 13 §13.1: PreparedRequest enum removed. Replaced by ctx: RequestContext which carries
+//   the RequestType variant (Chat/Generate/...) plus all PreparedRequest accessors as free fns.
 //!
-//! Ports `RoutingMeta`, `PartialRolloutState`, `parse_psrl_request_meta()`, and
+//! Ports `RoutingMeta`, `parse_psrl_request_meta()`, and
 //! all helper parsing functions from sgl-model-gateway's `routing_loop_utils.rs`.
 //!
 //! PR 5 §5.2g: `RoutingLoopRuntime` and `RoutingQueueEntry` define the shared
-//! runtime state and queue entry types for the PSRL routing loop. Additional
-//! fields (channel, tracking maps, PS Manager client) will be added in PR 10.
+//! runtime state and queue entry types for the PSRL routing loop.
+//!
+//! PR 10 §10.1: `RoutingLoopRuntime` is now complete with all fields:
+//! - `tx`: mpsc channel sender for submitting requests from router handlers
+//! - `incomplete_request_to_instance`: in-flight request → (worker_id, dp_rank) map
+//! - `instance_to_version_after_sync`: shared version map from WorkerService
+//! - `prompt_to_running_request_ids`: prompt affinity map for group-pin routing
+//! - `ps_manager_client`: optional PS Manager gRPC client
+//! - `ps_manager_addr`: PS Manager address for diagnostics
 
-use std::sync::atomic::AtomicBool;
+use std::{
+    collections::HashMap,
+    sync::{atomic::AtomicBool, Arc},
+};
 
-use axum::{http::HeaderMap, response::Response};
-use tokio::sync::oneshot;
+use axum::response::Response;
+use psrl_state::PSManagerStateClient;
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+use crate::routers::grpc::context::{RequestContext, RequestType};
 
 use crate::{
     config::types::RequestSortIndicator,
+    core::InstanceVersionMap,
     routers::request_queue::{MultiPriorityRequestQueue, RequestPriority},
 };
 
@@ -31,41 +54,27 @@ pub struct RoutingMeta {
     pub rollout_instance_hint: Option<(String, usize)>,
 }
 
-// PR 5 §5.2a: Partial-rollout state accumulated across loopback iterations.
-/// Partial-rollout state accumulated across loopback iterations of a single request.
-#[derive(Debug, Clone)]
-pub struct PartialRolloutState {
-    pub token_ids: Vec<u32>,
-    pub logprobs: serde_json::Value,
-}
-
-impl PartialRolloutState {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            token_ids: Vec::new(),
-            logprobs: serde_json::Value::Null,
-        }
-    }
-}
-
-impl Default for PartialRolloutState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 // ── Routing loop runtime types ──────────────────────────────────────────
 
 // PR 5 §5.2g: Shared runtime state container for the PSRL routing loop.
-/// Runtime context shared by the HTTP routing loop, admin endpoints, and
+// PR 10 §10.1: Completed with mpsc channel, request-tracking maps, and PS Manager client.
+/// Runtime context shared by the HTTP routing loop task, admin endpoints, and
 /// worker-selection logic.
 ///
-/// Core fields (`is_paused`, `is_routing`, `request_queue`) are defined here.
-/// Additional fields — mpsc channel, request-tracking maps, PS Manager client —
-/// will be added when the routing loop itself is implemented (PR 10 in
-/// `missing.md`).
+/// Wrapped in `Arc` and shared between:
+/// - The routing loop task (spawned at startup)
+/// - Router handlers (submit requests via `tx`)
+/// - Admin endpoints (`/routing_loop/*`)
+/// - Worker-selection logic (reads `incomplete_request_to_instance` for group-pin)
 pub struct RoutingLoopRuntime {
+    // ── §10.1: mpsc channel sender ───────────────────────────────────────
+    /// Sender half of the unbounded mpsc channel.
+    ///
+    /// Router handlers send `RoutingQueueEntry` values here; the routing loop
+    /// task receives them on the `rx` side that is passed to `routing_loop()`.
+    pub tx: mpsc::UnboundedSender<RoutingQueueEntry>,
+
+    // ── §5.2g: Core routing loop state ──────────────────────────────────
     /// When `true`, the routing loop pauses dispatching new requests.
     /// Toggled by `/routing_loop/pause` and `/routing_loop/resume` admin endpoints.
     pub is_paused: AtomicBool,
@@ -78,56 +87,143 @@ pub struct RoutingLoopRuntime {
     ///
     /// Uses `tokio::sync::Mutex` because the routing loop holds this lock
     /// across `.await` points (drain channel → batch push, per-version iteration).
-    pub request_queue: tokio::sync::Mutex<MultiPriorityRequestQueue<RoutingQueueEntry>>,
+    pub request_queue: Mutex<MultiPriorityRequestQueue<RoutingQueueEntry>>,
+
+    // ── §10.1: In-flight tracking maps ──────────────────────────────────
+    /// In-flight requests: `request_id → (base_worker_id, dp_rank)`.
+    ///
+    /// Inserted before spawning a dispatch task; removed on task completion
+    /// (stop, length, or abort outcomes). Used by group-pin routing (Stage 3).
+    pub incomplete_request_to_instance: Mutex<HashMap<i64, (String, usize)>>,
+
+    /// Shared version map: `(worker_id, dp_rank) → version_tag` after the last sync.
+    ///
+    /// Cloned from `AppContext::instance_to_version_after_sync`. Updated by
+    /// `WorkerService` on each sync; read by PSRL worker selection (Stage 2).
+    pub instance_to_version_after_sync: InstanceVersionMap,
+
+    /// Prompt-affinity map: `prompt_id → Vec<request_id>`.
+    ///
+    /// Tracks which request_ids share the same prompt, enabling group-pin routing.
+    /// Inserted before dispatch; empty `Vec` entries removed after dispatch completes.
+    pub prompt_to_running_request_ids: Mutex<HashMap<i64, Vec<i64>>>,
+
+    // ── §10.1: Loop configuration ────────────────────────────────────────
+    /// Routing loop polling interval in milliseconds (0 = no sleep).
+    pub check_interval_ms: u64,
+
+    // ── §10.1: PS Manager integration ───────────────────────────────────
+    /// PS Manager gRPC endpoint (for logging/diagnostics, e.g. `http://127.0.0.1:50051`).
+    pub ps_manager_addr: String,
+
+    /// Optional PS Manager gRPC client.
+    ///
+    /// `None` when `ps_manager_addr` is not configured or connection failed.
+    /// Used for abort checks and request lifecycle tracking RPCs.
+    pub ps_manager_client: Option<Arc<PSManagerStateClient>>,
 }
 
 impl RoutingLoopRuntime {
-    /// Create a new `RoutingLoopRuntime` with the given sort indicator and
-    /// multi-priority queue configuration.
-    pub fn new(
+    /// Create a new `RoutingLoopRuntime` with an unbounded mpsc channel.
+    ///
+    /// Returns `(runtime, rx)` where `rx` is the receiver to pass to `routing_loop()`.
+    ///
+    /// # Arguments
+    /// - `sort_indicator` — queue ordering strategy
+    /// - `enable_multi_priority_queue` — partition queue by version tag
+    /// - `instance_to_version_after_sync` — shared version map from AppContext
+    /// - `check_interval_ms` — routing loop sleep between iterations
+    /// - `ps_manager_addr` — PS Manager address string (may be empty)
+    /// - `ps_manager_client` — optional connected PS Manager client
+    pub fn new_with_channel(
         sort_indicator: RequestSortIndicator,
         enable_multi_priority_queue: bool,
-    ) -> Self {
-        Self {
+        instance_to_version_after_sync: InstanceVersionMap,
+        check_interval_ms: u64,
+        ps_manager_addr: String,
+        ps_manager_client: Option<Arc<PSManagerStateClient>>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<RoutingQueueEntry>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let runtime = Arc::new(Self {
+            tx,
             is_paused: AtomicBool::new(false),
             is_routing: AtomicBool::new(false),
-            request_queue: tokio::sync::Mutex::new(MultiPriorityRequestQueue::new(
+            request_queue: Mutex::new(MultiPriorityRequestQueue::new(
                 sort_indicator,
                 enable_multi_priority_queue,
                 None,
             )),
+            incomplete_request_to_instance: Mutex::new(HashMap::new()),
+            instance_to_version_after_sync,
+            prompt_to_running_request_ids: Mutex::new(HashMap::new()),
+            check_interval_ms,
+            ps_manager_addr,
+            ps_manager_client,
+        });
+        (runtime, rx)
+    }
+
+    /// Create a `RoutingLoopRuntime` without an external channel (for tests).
+    ///
+    /// Returns the runtime directly; the internal `tx` is the only sender.
+    #[cfg(test)]
+    pub fn new(sort_indicator: RequestSortIndicator, enable_multi_priority_queue: bool) -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        Self {
+            tx,
+            is_paused: AtomicBool::new(false),
+            is_routing: AtomicBool::new(false),
+            request_queue: Mutex::new(MultiPriorityRequestQueue::new(
+                sort_indicator,
+                enable_multi_priority_queue,
+                None,
+            )),
+            incomplete_request_to_instance: Mutex::new(HashMap::new()),
+            instance_to_version_after_sync: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            prompt_to_running_request_ids: Mutex::new(HashMap::new()),
+            check_interval_ms: 0,
+            ps_manager_addr: String::new(),
+            ps_manager_client: None,
         }
     }
 }
 
 // PR 5 §5.2g: Queue entry for the PSRL routing loop.
-/// Entry in the HTTP routing loop queue.
+// PR 13 §13.1: Replaced `headers: Option<HeaderMap>` + `request: PreparedRequest`
+//   with `ctx: RequestContext` (post-PreparationStage). The context carries all fields
+//   that PreparedRequest provided (model_id, headers, request type) plus PreparationOutput
+//   (token_ids, original_text, processed_messages, tool_constraints, filtered_request).
+//   This eliminates the discard-and-recreate cycle in pipeline_routing_loop.rs and
+//   build_context_from_prepared() in routing_loop.rs.
+/// Entry in the routing loop queue.
 ///
 /// Each entry represents a single request awaiting worker selection and dispatch.
 /// The `result_tx` oneshot is used to send the HTTP response back to the
 /// originating handler once the request is dispatched and completed.
 pub struct RoutingQueueEntry {
-    /// Optional HTTP headers forwarded from the original request.
-    pub headers: Option<HeaderMap>,
-    /// JSON body of the request (chat completion, generate, etc.).
-    pub body: serde_json::Value,
-    /// Static route identifier (e.g., `"/v1/chat/completions"`).
-    pub route: &'static str,
-    /// Model ID extracted from the request body, if present.
-    pub model_id: Option<String>,
-    /// Whether the request is a streaming request.
-    pub is_stream: bool,
-    /// Raw text content used for length-based priority sorting.
-    pub text: String,
+    /// The fully-prepared request context (post-PreparationStage).
+    ///
+    /// Carries `ctx.input.request_type` (the typed Arc request), `ctx.input.headers`,
+    /// `ctx.input.model_id`, and `ctx.state.preparation` (token_ids, original_text, etc.).
+    /// The routing loop's dispatch_task picks this context up directly and passes it to
+    /// `execute_through_execution` (stages 2–5), which skips WorkerSelectionStage because
+    /// `ctx.state.workers` is pre-set by the routing loop.
+    // PR 13 §13.1: ctx is pub(crate) via RequestContext's own visibility.
+    // The private_interfaces lint is expected here — RoutingQueueEntry is crate-internal
+    // despite its pub visibility (required by RoutingLoopRuntime's pub fields).
+    #[expect(
+        private_interfaces,
+        reason = "RoutingQueueEntry is crate-internal; ctx visibility matches usage scope"
+    )]
+    pub ctx: RequestContext,
     /// Oneshot sender for delivering the response back to the request handler.
     pub result_tx: oneshot::Sender<Response>,
-    /// Accumulated partial-rollout state from previous loopback iterations.
-    pub partial_response: Option<PartialRolloutState>,
     /// Optional routing metadata for PSRL routing decisions.
     pub routing_meta: Option<RoutingMeta>,
 }
 
 // PR 5 §5.2g: RequestPriority implementation for RoutingQueueEntry.
+// PR 13 §13.1: get_priority now calls input_len_from_ctx instead of request.input_len().
 impl RequestPriority for RoutingQueueEntry {
     #[inline]
     fn get_version_tag(&self) -> i64 {
@@ -137,12 +233,8 @@ impl RequestPriority for RoutingQueueEntry {
     #[inline]
     fn get_priority(&self, indicator: RequestSortIndicator) -> (i64, i64, i64) {
         match indicator {
-            RequestSortIndicator::ShortLength => {
-                get_priority_by_version_and_token_num(self, true)
-            }
-            RequestSortIndicator::LongLength => {
-                get_priority_by_version_and_token_num(self, false)
-            }
+            RequestSortIndicator::ShortLength => get_priority_by_version_and_token_num(self, true),
+            RequestSortIndicator::LongLength => get_priority_by_version_and_token_num(self, false),
             RequestSortIndicator::SmallId => get_priority_by_version_and_id(self),
         }
     }
@@ -150,10 +242,7 @@ impl RequestPriority for RoutingQueueEntry {
 
 /// Compute version-based priority: unversioned (`-1`) → lowest priority (`i64::MAX`).
 fn get_priority_by_version(request: &RoutingQueueEntry) -> i64 {
-    let version_tag = request
-        .routing_meta
-        .as_ref()
-        .map_or(-1, |m| m.version_tag);
+    let version_tag = request.routing_meta.as_ref().map_or(-1, |m| m.version_tag);
     if version_tag == -1 {
         i64::MAX
     } else {
@@ -169,20 +258,20 @@ fn get_priority_by_version_and_token_num(
     request: &RoutingQueueEntry,
     short_request_first: bool,
 ) -> (i64, i64, i64) {
-    let validate_priority = request
-        .routing_meta
-        .as_ref()
-        .is_none_or(|m| !m.is_validate);
+    let validate_priority = request.routing_meta.as_ref().is_none_or(|m| !m.is_validate);
     let version_priority = get_priority_by_version(request);
+    // PR 13 §13.1: Use input_len_from_ctx — token count from PreparationOutput (accurate)
+    // or char-count proxy from request body. Replaces request.request.input_len().
+    let input_len = input_len_from_ctx(&request.ctx);
     if short_request_first {
-        let length_priority = request.text.len().min(i32::MAX as usize) as i32;
+        let length_priority = input_len.min(i32::MAX as usize) as i32;
         (
             validate_priority as i64,
             version_priority,
             length_priority as i64,
         )
     } else {
-        let length_priority = -(request.text.len().min(i32::MAX as usize) as i32);
+        let length_priority = -(input_len.min(i32::MAX as usize) as i32);
         (
             validate_priority as i64,
             version_priority,
@@ -195,10 +284,7 @@ fn get_priority_by_version_and_token_num(
 ///
 /// Lower request_id → dispatched first.
 fn get_priority_by_version_and_id(request: &RoutingQueueEntry) -> (i64, i64, i64) {
-    let validate_priority = request
-        .routing_meta
-        .as_ref()
-        .is_none_or(|m| !m.is_validate);
+    let validate_priority = request.routing_meta.as_ref().is_none_or(|m| !m.is_validate);
     let version_priority = get_priority_by_version(request);
     let id_priority = request
         .routing_meta
@@ -206,6 +292,120 @@ fn get_priority_by_version_and_id(request: &RoutingQueueEntry) -> (i64, i64, i64
         .and_then(|m| m.request_id)
         .unwrap_or(i64::MAX);
     (validate_priority as i64, version_priority, id_priority)
+}
+
+// ── PR 13 §13.1: Context-based helper functions ─────────────────────────
+
+// PR 13 §13.1: input_len_from_ctx replaces PreparedRequest::input_len().
+// Prefers accurate token count from PreparationOutput; falls back to char-count proxy.
+/// Input length for priority sorting, read from a prepared `RequestContext`.
+///
+/// Prefers `ctx.state.preparation.token_ids.len()` when available (accurate token count
+/// from `PreparationStage`). Falls back to a character-count proxy from the request body
+/// when preparation output is absent.
+pub(crate) fn input_len_from_ctx(ctx: &RequestContext) -> usize {
+    // Prefer token count from PreparationOutput (accurate)
+    if let Some(prep) = &ctx.state.preparation {
+        if !prep.token_ids.is_empty() {
+            return prep.token_ids.len();
+        }
+    }
+    0 // Default to 0 if no token count is available
+}
+
+// PR 13 §13.1: extract_text_from_request_type replaces PreparedRequest::text_for_routing().
+// Used as a fallback when PreparationOutput::original_text is absent.
+/// Extract routing text from a `RequestType` for cache-aware policy routing.
+///
+/// Returns the raw text for prefix-hash / consistent-hash worker selection.
+/// `None` when the request uses tokenized input (`input_ids`) with no text field.
+///
+/// Used as a fallback when `ctx.state.preparation.original_text` is absent.
+pub(crate) fn extract_text_from_request_type(request_type: &RequestType) -> Option<String> {
+    match request_type {
+        RequestType::Chat(r) => {
+            let text = r
+                .messages
+                .last()
+                .map(|m| {
+                    use openai_protocol::chat::ChatMessage;
+                    match m {
+                        ChatMessage::User { content, .. }
+                        | ChatMessage::System { content, .. }
+                        | ChatMessage::Developer { content, .. }
+                        | ChatMessage::Tool { content, .. } => content.to_simple_string(),
+                        ChatMessage::Assistant { content, .. } => content
+                            .as_ref()
+                            .map(|c| c.to_simple_string())
+                            .unwrap_or_default(),
+                        ChatMessage::Function { content, .. } => content.clone(),
+                    }
+                })
+                .unwrap_or_default();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        RequestType::Generate(r) => r.text.clone(),
+        RequestType::Responses(_) | RequestType::Embedding(_) | RequestType::Classify(_) => None,
+    }
+}
+
+// PR 13 §13.1: parse_psrl_request_meta_from_context replaces the JSON-serialization roundtrip
+// in pipeline_routing_loop.rs where serde_json::to_value(request) was called just to extract
+// PSRL metadata. Now reads directly from the typed RequestType fields and headers.
+/// Parse PSRL routing metadata from a fully-prepared `RequestContext`.
+///
+/// Reads headers from `ctx.input.headers` and PSRL fields directly from the typed
+/// `RequestType` variants — no JSON serialization roundtrip needed.
+///
+/// Returns `None` if no PSRL metadata is present (untagged request, no PS Manager tracking).
+pub fn parse_psrl_request_meta_from_context(ctx: &RequestContext) -> Option<RoutingMeta> {
+    let headers = ctx.input.headers.as_ref();
+
+    let request_id = headers
+        .and_then(|h| h.get("x-request-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let prompt_id = headers
+        .and_then(|h| h.get("x-prompt-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok());
+
+    let version_tag = headers
+        .and_then(|h| h.get("x-version-tag"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(-1);
+
+    let is_validate = headers
+        .and_then(|h| h.get("x-is-validate"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_bool_like)
+        .unwrap_or(false);
+
+    let rollout_instance_hint = parse_rollout_instance_hint_from_headers(headers);
+
+    // Return None if no PSRL metadata is present.
+    if request_id.is_none()
+        && prompt_id.is_none()
+        && version_tag == -1
+        && !is_validate
+        && rollout_instance_hint.is_none()
+    {
+        return None;
+    }
+
+    Some(RoutingMeta {
+        request_id,
+        prompt_id,
+        version_tag,
+        is_validate,
+        rollout_instance_hint,
+    })
 }
 
 // ── Parsing ─────────────────────────────────────────────────────────────
@@ -220,7 +420,7 @@ fn get_priority_by_version_and_id(request: &RoutingQueueEntry) -> (i64, i64, i64
 /// - `x-is-validate` / `is_validate`
 /// - `x-base-worker-id` + `x-target-dp-rank` / `rollout_instance_id`
 pub fn parse_psrl_request_meta(
-    headers: Option<&HeaderMap>,
+    headers: Option<&http::HeaderMap>,
     body: Option<&serde_json::Value>,
 ) -> Option<RoutingMeta> {
     let request_id = headers
@@ -322,7 +522,7 @@ fn parse_bool_from_body(body: Option<&serde_json::Value>, key: &str) -> Option<b
 
 // PR 5 §5.2e: Parse rollout instance hint from headers.
 fn parse_rollout_instance_hint_from_headers(
-    headers: Option<&HeaderMap>,
+    headers: Option<&http::HeaderMap>,
 ) -> Option<(String, usize)> {
     let base_worker_id = headers
         .and_then(|h| h.get("x-base-worker-id"))
@@ -408,19 +608,80 @@ fn parse_rollout_instance_hint_from_body(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
+    use axum::{http::HeaderMap, response::Response};
     use serde_json::json;
+    use tokio::sync::oneshot;
+
+    use crate::{
+        config::types::RequestSortIndicator,
+        routers::{
+            grpc::{
+                context::{RequestContext, RequestType, SharedComponents},
+            },
+            request_queue::RequestPriority,
+            routing_loop_utils::{
+                extract_text_from_request_type, input_len_from_ctx, parse_psrl_request_meta,
+                parse_psrl_request_meta_from_context, RoutingLoopRuntime, RoutingMeta,
+                RoutingQueueEntry,
+            },
+        },
+    };
 
     fn headers_with(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
         for (key, value) in pairs {
             map.insert(
-                http::header::HeaderName::from_bytes(key.as_bytes())
-                    .expect("valid header name"),
+                http::header::HeaderName::from_bytes(key.as_bytes()).expect("valid header name"),
                 http::header::HeaderValue::from_str(value).expect("valid header value"),
             );
         }
         map
+    }
+
+    /// Build a minimal `SharedComponents` for tests (no tokenizer, no multimodal).
+    fn make_components() -> Arc<SharedComponents> {
+        use llm_tokenizer::TokenizerRegistry;
+        use reasoning_parser::ParserFactory as ReasoningParserFactory;
+        use tool_parser::ParserFactory as ToolParserFactory;
+        Arc::new(SharedComponents {
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            multimodal: None,
+        })
+    }
+
+    // PR 13 §13.4 test: Helper to build a test RoutingQueueEntry using RequestContext.
+    fn make_test_entry_generate(
+        version_tag: i64,
+        request_id: Option<i64>,
+        is_validate: bool,
+        text: &str,
+        result_tx: oneshot::Sender<Response>,
+    ) -> RoutingQueueEntry {
+        use openai_protocol::generate::GenerateRequest;
+        let gen_req: GenerateRequest =
+            serde_json::from_str(&format!(r#"{{"text":"{text}","model":"test-model"}}"#))
+                .expect("test GenerateRequest");
+        let ctx = RequestContext::for_generate(
+            Arc::new(gen_req),
+            None,
+            Some("test-model".to_string()),
+            make_components(),
+        );
+        RoutingQueueEntry {
+            ctx,
+            result_tx,
+            routing_meta: Some(RoutingMeta {
+                request_id,
+                prompt_id: None,
+                version_tag,
+                is_validate,
+                rollout_instance_hint: None,
+            }),
+        }
     }
 
     // PR 5 §5.4 test: All fields extracted from headers
@@ -469,8 +730,7 @@ mod tests {
             "version_tag": 999,
             "prompt_id": 50
         });
-        let meta = parse_psrl_request_meta(Some(&headers), Some(&body))
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(Some(&headers), Some(&body)).expect("should parse");
         // Header wins
         assert_eq!(meta.request_id, Some(1));
         assert_eq!(meta.version_tag, 10);
@@ -494,8 +754,7 @@ mod tests {
     #[test]
     fn test_parse_meta_version_tag_default() {
         let headers = headers_with(&[("x-request-id", "1")]);
-        let meta = parse_psrl_request_meta(Some(&headers), None)
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(Some(&headers), None).expect("should parse");
         assert_eq!(meta.version_tag, -1);
     }
 
@@ -503,21 +762,18 @@ mod tests {
     #[test]
     fn test_parse_meta_is_validate_default() {
         let headers = headers_with(&[("x-request-id", "1")]);
-        let meta = parse_psrl_request_meta(Some(&headers), None)
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(Some(&headers), None).expect("should parse");
         assert!(!meta.is_validate);
     }
 
     // PR 5 §5.4 test: Accepts "1", "true", "t", "yes", "y" (case-insensitive)
     #[test]
     fn test_parse_meta_is_validate_truthy() {
-        for truthy in &["1", "true", "True", "TRUE", "t", "T", "yes", "Yes", "y", "Y"] {
-            let headers = headers_with(&[
-                ("x-request-id", "1"),
-                ("x-is-validate", truthy),
-            ]);
-            let meta = parse_psrl_request_meta(Some(&headers), None)
-                .expect("should parse");
+        for truthy in &[
+            "1", "true", "True", "TRUE", "t", "T", "yes", "Yes", "y", "Y",
+        ] {
+            let headers = headers_with(&[("x-request-id", "1"), ("x-is-validate", truthy)]);
+            let meta = parse_psrl_request_meta(Some(&headers), None).expect("should parse");
             assert!(meta.is_validate, "Expected truthy for {truthy:?}");
         }
     }
@@ -525,13 +781,11 @@ mod tests {
     // PR 5 §5.4 test: Accepts "0", "false", "f", "no", "n" (case-insensitive)
     #[test]
     fn test_parse_meta_is_validate_falsy() {
-        for falsy in &["0", "false", "False", "FALSE", "f", "F", "no", "No", "n", "N"] {
-            let headers = headers_with(&[
-                ("x-request-id", "1"),
-                ("x-is-validate", falsy),
-            ]);
-            let meta = parse_psrl_request_meta(Some(&headers), None)
-                .expect("should parse");
+        for falsy in &[
+            "0", "false", "False", "FALSE", "f", "F", "no", "No", "n", "N",
+        ] {
+            let headers = headers_with(&[("x-request-id", "1"), ("x-is-validate", falsy)]);
+            let meta = parse_psrl_request_meta(Some(&headers), None).expect("should parse");
             assert!(!meta.is_validate, "Expected falsy for {falsy:?}");
         }
     }
@@ -544,8 +798,7 @@ mod tests {
             ("x-base-worker-id", "worker-abc"),
             ("x-target-dp-rank", "3"),
         ]);
-        let meta = parse_psrl_request_meta(Some(&headers), None)
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(Some(&headers), None).expect("should parse");
         assert_eq!(
             meta.rollout_instance_hint,
             Some(("worker-abc".to_string(), 3))
@@ -559,8 +812,7 @@ mod tests {
             "request_id": 1,
             "rollout_instance_id": ["worker-xyz", 2]
         });
-        let meta = parse_psrl_request_meta(None, Some(&body))
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(None, Some(&body)).expect("should parse");
         assert_eq!(
             meta.rollout_instance_hint,
             Some(("worker-xyz".to_string(), 2))
@@ -577,12 +829,8 @@ mod tests {
                 "dp_rank": 4
             }
         });
-        let meta = parse_psrl_request_meta(None, Some(&body))
-            .expect("should parse");
-        assert_eq!(
-            meta.rollout_instance_hint,
-            Some(("w-001".to_string(), 4))
-        );
+        let meta = parse_psrl_request_meta(None, Some(&body)).expect("should parse");
+        assert_eq!(meta.rollout_instance_hint, Some(("w-001".to_string(), 4)));
     }
 
     // PR 5 §5.4 test: Flat body keys for rollout hint
@@ -593,8 +841,7 @@ mod tests {
             "base_worker_id": "flat-worker",
             "target_dp_rank": 0
         });
-        let meta = parse_psrl_request_meta(None, Some(&body))
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(None, Some(&body)).expect("should parse");
         assert_eq!(
             meta.rollout_instance_hint,
             Some(("flat-worker".to_string(), 0))
@@ -611,8 +858,7 @@ mod tests {
                 "data_parallel_rank": 1
             }
         });
-        let meta = parse_psrl_request_meta(None, Some(&body))
-            .expect("should parse");
+        let meta = parse_psrl_request_meta(None, Some(&body)).expect("should parse");
         assert_eq!(
             meta.rollout_instance_hint,
             Some(("replica-7".to_string(), 1))
@@ -622,6 +868,7 @@ mod tests {
     // PR 5 §5.4 test: JSON integer parsed as i64
     #[test]
     fn test_parse_i64_from_body_int() {
+        use super::parse_i64_from_body;
         let body = json!({"key": 42});
         assert_eq!(parse_i64_from_body(Some(&body), "key"), Some(42));
     }
@@ -629,6 +876,7 @@ mod tests {
     // PR 5 §5.4 test: JSON string "42" parsed as i64
     #[test]
     fn test_parse_i64_from_body_string() {
+        use super::parse_i64_from_body;
         let body = json!({"key": "42"});
         assert_eq!(parse_i64_from_body(Some(&body), "key"), Some(42));
     }
@@ -636,22 +884,86 @@ mod tests {
     // PR 5 §5.4 test: Missing key → None
     #[test]
     fn test_parse_i64_from_body_missing() {
+        use super::parse_i64_from_body;
         let body = json!({"other": 1});
         assert_eq!(parse_i64_from_body(Some(&body), "key"), None);
         assert_eq!(parse_i64_from_body(None, "key"), None);
     }
 
-    // PR 5 §5.4 test: PartialRolloutState default construction
+    // PR 13 §13.4 test: input_len_from_ctx uses token_ids from PreparationOutput when available.
     #[test]
-    fn test_partial_rollout_state_new() {
-        let state = PartialRolloutState::new();
-        assert!(state.token_ids.is_empty());
-        assert_eq!(state.logprobs, serde_json::Value::Null);
+    fn test_input_len_from_ctx_uses_token_ids() {
+        use crate::routers::grpc::context::PreparationOutput;
+        use openai_protocol::generate::GenerateRequest;
 
-        // Default trait impl should produce the same
-        let default_state = PartialRolloutState::default();
-        assert!(default_state.token_ids.is_empty());
-        assert_eq!(default_state.logprobs, serde_json::Value::Null);
+        let gen_req: GenerateRequest =
+            serde_json::from_str(r#"{"text":"hello world","model":"test-model"}"#).unwrap();
+        let mut ctx = RequestContext::for_generate(
+            Arc::new(gen_req),
+            None,
+            Some("test-model".to_string()),
+            make_components(),
+        );
+        // Simulate preparation output with 5 token_ids.
+        ctx.state.preparation = Some(PreparationOutput {
+            original_text: Some("hello world".to_string()),
+            token_ids: vec![1, 2, 3, 4, 5],
+            processed_messages: None,
+            tool_constraints: None,
+            filtered_request: None,
+            harmony_mode: false,
+            selection_text: None,
+            harmony_messages: None,
+            harmony_stop_ids: None,
+        });
+        // Should use token_ids length (5), not char count.
+        assert_eq!(input_len_from_ctx(&ctx), 5);
+    }
+
+    // PR 13 §13.4 test: extract_text_from_request_type returns Generate text field.
+    #[test]
+    fn test_extract_text_generate() {
+        use openai_protocol::generate::GenerateRequest;
+        let gen_req: GenerateRequest =
+            serde_json::from_str(r#"{"text":"sample text","model":"test"}"#).unwrap();
+        let rt = RequestType::Generate(Arc::new(gen_req));
+        assert_eq!(
+            extract_text_from_request_type(&rt),
+            Some("sample text".to_string())
+        );
+    }
+
+    // PR 13 §13.4 test: parse_psrl_request_meta_from_context reads header fields.
+    #[test]
+    fn test_parse_psrl_meta_from_context_headers() {
+        use openai_protocol::generate::GenerateRequest;
+        let gen_req: GenerateRequest =
+            serde_json::from_str(r#"{"text":"test","model":"m"}"#).unwrap();
+        let headers = headers_with(&[("x-request-id", "77"), ("x-version-tag", "3")]);
+        let ctx = RequestContext::for_generate(
+            Arc::new(gen_req),
+            Some(headers),
+            Some("m".to_string()),
+            make_components(),
+        );
+        let meta = parse_psrl_request_meta_from_context(&ctx).expect("should parse");
+        assert_eq!(meta.request_id, Some(77));
+        assert_eq!(meta.version_tag, 3);
+    }
+
+    // PR 13 §13.4 test: parse_psrl_request_meta_from_context returns None when no PSRL fields.
+    #[test]
+    fn test_parse_psrl_meta_from_context_none() {
+        use openai_protocol::generate::GenerateRequest;
+        let gen_req: GenerateRequest =
+            serde_json::from_str(r#"{"text":"test","model":"m"}"#).unwrap();
+        let ctx = RequestContext::for_generate(
+            Arc::new(gen_req),
+            None,
+            Some("m".to_string()),
+            make_components(),
+        );
+        assert!(parse_psrl_request_meta_from_context(&ctx).is_none());
     }
 
     // ── PR 5 §5.2g: RoutingLoopRuntime tests ──
@@ -670,31 +982,15 @@ mod tests {
         let runtime = RoutingLoopRuntime::new(RequestSortIndicator::SmallId, true);
         let (tx, _rx) = oneshot::channel();
 
-        let entry = RoutingQueueEntry {
-            headers: None,
-            body: json!({"model": "test-model"}),
-            route: "/v1/chat/completions",
-            model_id: Some("test-model".to_string()),
-            is_stream: false,
-            text: "hello world".to_string(),
-            result_tx: tx,
-            partial_response: None,
-            routing_meta: Some(RoutingMeta {
-                request_id: Some(42),
-                prompt_id: Some(1),
-                version_tag: 2,
-                is_validate: false,
-                rollout_instance_hint: None,
-            }),
-        };
+        // PR 13 §13.4: entry uses RequestContext instead of PreparedRequest.
+        let entry = make_test_entry_generate(2, Some(42), false, "hello world", tx);
 
         let mut queue = runtime.request_queue.lock().await;
         queue.push(entry);
         assert_eq!(queue.len(), 1);
 
         let popped = queue.pop().expect("should pop");
-        assert_eq!(popped.model_id, Some("test-model".to_string()));
-        assert_eq!(popped.route, "/v1/chat/completions");
+        assert_eq!(popped.ctx.input.model_id, Some("test-model".to_string()));
         assert_eq!(
             popped.routing_meta.as_ref().map(|m| m.request_id),
             Some(Some(42))
@@ -704,36 +1000,17 @@ mod tests {
     #[test]
     fn test_routing_queue_entry_version_tag_priority() {
         let (tx1, _rx1) = oneshot::channel();
-        let entry = RoutingQueueEntry {
-            headers: None,
-            body: json!({}),
-            route: "/v1/generate",
-            model_id: None,
-            is_stream: false,
-            text: String::new(),
-            result_tx: tx1,
-            partial_response: None,
-            routing_meta: Some(RoutingMeta {
-                request_id: Some(1),
-                prompt_id: None,
-                version_tag: 5,
-                is_validate: false,
-                rollout_instance_hint: None,
-            }),
-        };
+        // PR 13 §13.4: entry uses RequestContext instead of PreparedRequest.
+        let entry = make_test_entry_generate(5, Some(1), false, "", tx1);
         assert_eq!(entry.get_version_tag(), 5);
 
         // Entry without routing_meta → version_tag = -1
         let (tx2, _rx2) = oneshot::channel();
+        use openai_protocol::generate::GenerateRequest;
+        let gen_req: GenerateRequest = serde_json::from_str(r#"{"text":"x"}"#).unwrap();
         let entry_no_meta = RoutingQueueEntry {
-            headers: None,
-            body: json!({}),
-            route: "/v1/generate",
-            model_id: None,
-            is_stream: false,
-            text: String::new(),
+            ctx: RequestContext::for_generate(Arc::new(gen_req), None, None, make_components()),
             result_tx: tx2,
-            partial_response: None,
             routing_meta: None,
         };
         assert_eq!(entry_no_meta.get_version_tag(), -1);
@@ -743,47 +1020,14 @@ mod tests {
     fn test_routing_queue_entry_validate_priority() {
         // Validate requests should have lower priority number (dispatched first)
         let (tx1, _rx1) = oneshot::channel();
-        let validate_entry = RoutingQueueEntry {
-            headers: None,
-            body: json!({}),
-            route: "/v1/generate",
-            model_id: None,
-            is_stream: false,
-            text: "long validate text".to_string(),
-            result_tx: tx1,
-            partial_response: None,
-            routing_meta: Some(RoutingMeta {
-                request_id: Some(1),
-                prompt_id: None,
-                version_tag: 1,
-                is_validate: true,
-                rollout_instance_hint: None,
-            }),
-        };
+        // PR 13 §13.4: entry uses RequestContext; text drives length-based priority.
+        let validate_entry = make_test_entry_generate(1, Some(1), true, "long validate text", tx1);
 
         let (tx2, _rx2) = oneshot::channel();
-        let normal_entry = RoutingQueueEntry {
-            headers: None,
-            body: json!({}),
-            route: "/v1/generate",
-            model_id: None,
-            is_stream: false,
-            text: "a".to_string(),
-            result_tx: tx2,
-            partial_response: None,
-            routing_meta: Some(RoutingMeta {
-                request_id: Some(2),
-                prompt_id: None,
-                version_tag: 1,
-                is_validate: false,
-                rollout_instance_hint: None,
-            }),
-        };
+        let normal_entry = make_test_entry_generate(1, Some(2), false, "a", tx2);
 
-        let validate_prio =
-            validate_entry.get_priority(RequestSortIndicator::ShortLength);
-        let normal_prio =
-            normal_entry.get_priority(RequestSortIndicator::ShortLength);
+        let validate_prio = validate_entry.get_priority(RequestSortIndicator::ShortLength);
+        let normal_prio = normal_entry.get_priority(RequestSortIndicator::ShortLength);
 
         // is_validate=true → p0=false(0), is_validate=false → p0=true(1)
         // So validate entry has lower p0 (higher scheduling priority)
@@ -815,44 +1059,13 @@ mod tests {
     async fn test_routing_loop_runtime_multi_priority_queue() {
         let runtime = RoutingLoopRuntime::new(RequestSortIndicator::SmallId, true);
 
-        // Push entries with different version tags
+        // Push entries with different version tags.
+        // PR 13 §13.4: entries use RequestContext instead of PreparedRequest.
         let (tx1, _rx1) = oneshot::channel();
-        let entry1 = RoutingQueueEntry {
-            headers: None,
-            body: json!({}),
-            route: "/v1/generate",
-            model_id: None,
-            is_stream: false,
-            text: String::new(),
-            result_tx: tx1,
-            partial_response: None,
-            routing_meta: Some(RoutingMeta {
-                request_id: Some(1),
-                prompt_id: None,
-                version_tag: 2,
-                is_validate: false,
-                rollout_instance_hint: None,
-            }),
-        };
+        let entry1 = make_test_entry_generate(2, Some(1), false, "", tx1);
 
         let (tx2, _rx2) = oneshot::channel();
-        let entry2 = RoutingQueueEntry {
-            headers: None,
-            body: json!({}),
-            route: "/v1/generate",
-            model_id: None,
-            is_stream: false,
-            text: String::new(),
-            result_tx: tx2,
-            partial_response: None,
-            routing_meta: Some(RoutingMeta {
-                request_id: Some(2),
-                prompt_id: None,
-                version_tag: 1,
-                is_validate: false,
-                rollout_instance_hint: None,
-            }),
-        };
+        let entry2 = make_test_entry_generate(1, Some(2), false, "", tx2);
 
         let mut queue = runtime.request_queue.lock().await;
         queue.push(entry1);

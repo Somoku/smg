@@ -163,6 +163,17 @@ impl RouterManager {
         *default_router = Some(id);
     }
 
+    // PR 10 §10.5: Expose the default router for routing loop task spawning.
+    /// Returns the current default router, if one is set.
+    pub fn get_default_router(&self) -> Option<Arc<dyn RouterTrait>> {
+        let default_id = self
+            .default_router
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        self.routers.get(&default_id).map(|r| r.value().clone())
+    }
+
     pub fn router_count(&self) -> usize {
         self.routers.len()
     }

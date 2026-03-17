@@ -117,6 +117,17 @@ impl HarmonyStreamingProcessor {
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }
+            // PR 12 §12.2: PreDrained is used by the PSRL dispatch path — not reachable
+            // in the regular Harmony streaming path (streaming requests are not PSRL).
+            context::ExecutionResult::PreDrained { .. } => {
+                error!("Harmony streaming: PreDrained execution result is not supported");
+                utils::send_error_sse(
+                    &tx,
+                    "PreDrained execution result not supported in streaming",
+                    "internal_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
         }
 
         // Return SSE response
@@ -490,6 +501,11 @@ impl HarmonyStreamingProcessor {
             }
             context::ExecutionResult::Embedding { .. } => {
                 Err("Embeddings not supported in Responses API streaming".to_string())
+            }
+            // PR 12 §12.2: PreDrained is used by the PSRL dispatch path — not reachable
+            // in Responses API streaming (streaming requests are not PSRL).
+            context::ExecutionResult::PreDrained { .. } => {
+                Err("PreDrained execution result not supported in Responses API streaming".to_string())
             }
         }
     }

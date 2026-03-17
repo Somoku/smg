@@ -35,8 +35,7 @@ pub mod openai;
 pub mod parse;
 pub mod persistence_utils;
 // PR 4 §4.2: Global priority-based request queue
-// Infrastructure for routing loop (PR 5/6). Will be consumed when those PRs land.
-#[expect(dead_code, reason = "Infrastructure for routing loop (Phase 2 PRs)")]
+// Now used by the routing loop (PR 10+).
 pub(crate) mod request_queue;
 pub mod router_manager;
 // PR 5 §5.3: Routing loop utilities (PSRL metadata parsing, PartialRolloutState)

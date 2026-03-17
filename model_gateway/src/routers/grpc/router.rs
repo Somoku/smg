@@ -24,20 +24,23 @@ use super::{
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     multimodal::MultimodalComponents,
     pipeline::RequestPipeline,
+    // Refactor Notes 1+2+3: RoutingLoopPipeline encapsulates routing-loop dispatch.
+    pipeline_routing_loop::RoutingLoopPipeline,
     regular::responses,
 };
 use crate::{
     app_context::AppContext,
-    config::types::RetryConfig,
+    config::types::{PsrlConfig, RetryConfig},
     core::{is_retryable_status, RetryExecutor, WorkerRegistry, UNKNOWN_MODEL_ID},
     observability::metrics::{metrics_labels, Metrics},
+    policies::PolicyRegistry,
     routers::RouterTrait,
 };
 
 /// gRPC router implementation for SGLang
 #[derive(Clone)]
 pub struct GrpcRouter {
-    worker_registry: Arc<WorkerRegistry>,
+    pub(super) worker_registry: Arc<WorkerRegistry>,
     pipeline: RequestPipeline,
     harmony_pipeline: RequestPipeline,
     embedding_pipeline: RequestPipeline,
@@ -46,6 +49,15 @@ pub struct GrpcRouter {
     responses_context: ResponsesContext,
     harmony_responses_context: ResponsesContext,
     retry_config: RetryConfig,
+    // Refactor Notes 1+2+3: RoutingLoopPipeline replaces the inline PSRL block.
+    /// When `Some`, all chat/generate requests are dispatched through the routing loop
+    /// unconditionally (even those without PSRL metadata).
+    // PR-A (Notes 1+2): shared Arc instance reused by router and ResponsesContext.
+    pub(super) routing_loop_pipeline: Option<Arc<RoutingLoopPipeline>>,
+    // PR 11 §11.1: Policy registry for PSRL worker selection.
+    pub(super) policy_registry: Arc<PolicyRegistry>,
+    // PR 11 §11.1: PSRL configuration (routing strategy, mig strategy).
+    pub(super) psrl_config: PsrlConfig,
 }
 
 impl GrpcRouter {
@@ -136,16 +148,43 @@ impl GrpcRouter {
         let responses_context = create_responses_context(&pipeline);
         let harmony_responses_context = create_responses_context(&harmony_pipeline);
 
+        // PR-A (Notes 1+2): Build one shared routing-loop pipeline and reuse the same Arc
+        // in both GrpcRouter and regular ResponsesContext.
+        // Harmony responses context does NOT receive this pipeline because Harmony uses
+        // a distinct response-processing path.
+        let routing_loop_pipeline: Option<Arc<RoutingLoopPipeline>> = ctx
+            .routing_loop_runtime
+            .as_ref()
+            .map(|runtime| {
+                Arc::new(RoutingLoopPipeline::new(
+                    Arc::clone(runtime),
+                    Arc::new(pipeline.clone()),
+                ))
+            });
+
+        // PR-A (Note 2): ResponsesContext receives an Arc clone of the same pipeline instance.
+        let responses_context = if let Some(rl_pipeline) = routing_loop_pipeline.as_ref() {
+            responses_context.with_routing_loop(Arc::clone(rl_pipeline))
+        } else {
+            responses_context
+        };
+
         Ok(GrpcRouter {
             worker_registry,
             pipeline,
             harmony_pipeline,
             embedding_pipeline,
             classify_pipeline,
-            shared_components,
+            shared_components: shared_components.clone(),
             responses_context,
             harmony_responses_context,
             retry_config: ctx.router_config.effective_retry_config(),
+            // PR-A (Notes 1+2): keep the same shared Arc instance used by ResponsesContext.
+            routing_loop_pipeline,
+            // PR 11 §11.1: Policy registry and PSRL config for worker selection.
+            policy_registry: _policy_registry,
+            // PR Python §1.4: Wire PSRL config from RouterConfig into GrpcRouter.
+            psrl_config: ctx.router_config.psrl.clone(),
         })
     }
 
@@ -171,6 +210,18 @@ impl GrpcRouter {
         } else {
             &self.pipeline
         };
+
+        // Refactor Notes 1+2+3: dispatch through RoutingLoopPipeline when routing loop is enabled.
+        // Note 2: dispatch is unconditional — no longer gated on parse_psrl_request_meta.
+        if let Some(rl_pipeline) = &self.routing_loop_pipeline {
+            let request = Arc::new(body.clone());
+            let headers_cloned = headers.cloned();
+            let model_id_cloned = model_id.map(|s| s.to_string());
+            let components = Arc::clone(&self.shared_components);
+            return rl_pipeline
+                .execute_chat(request, headers_cloned, model_id_cloned, components)
+                .await;
+        }
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
@@ -224,6 +275,18 @@ impl GrpcRouter {
             "Processing generate request for model: {}",
             model_id.unwrap_or(UNKNOWN_MODEL_ID)
         );
+
+        // Refactor Notes 1+2+3: dispatch through RoutingLoopPipeline when routing loop is enabled.
+        // Note 2: dispatch is unconditional — no longer gated on parse_psrl_request_meta.
+        if let Some(rl_pipeline) = &self.routing_loop_pipeline {
+            let request = Arc::new(body.clone());
+            let headers_cloned = headers.cloned();
+            let model_id_cloned = model_id.map(|s| s.to_string());
+            let components = Arc::clone(&self.shared_components);
+            return rl_pipeline
+                .execute_generate(request, headers_cloned, model_id_cloned, components)
+                .await;
+        }
 
         // Clone values needed for retry closure
         let request = Arc::new(body.clone());
@@ -367,6 +430,19 @@ impl GrpcRouter {
                 self.shared_components.clone(),
             )
             .await
+    }
+
+    // PR 10 §10.5: Accessors for routing loop task spawning.
+    /// Returns the main gRPC pipeline (regular, non-Harmony).
+    /// Used by `server.rs` when spawning the routing loop task.
+    pub(crate) fn get_pipeline(&self) -> Arc<RequestPipeline> {
+        Arc::new(self.pipeline.clone())
+    }
+
+    /// Returns the shared components (tokenizer, tool/reasoning parser, multimodal).
+    /// Used by `server.rs` when spawning the routing loop task.
+    pub(crate) fn get_shared_components(&self) -> Arc<SharedComponents> {
+        self.shared_components.clone()
     }
 }
 

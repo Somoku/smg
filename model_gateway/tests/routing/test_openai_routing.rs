@@ -802,7 +802,12 @@ async fn test_openai_router_chat_streaming_with_mock() {
 #[tokio::test]
 async fn test_openai_router_circuit_breaker() {
     let ctx = create_test_app_context().await;
-    register_external_worker(&ctx, "http://invalid-url-that-will-fail", None);
+    // Use a dropped loopback listener instead of a fake hostname so the test always
+    // gets a deterministic connection-refused failure, even on networks that rewrite DNS.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    register_external_worker(&ctx, &format!("http://{addr}"), None);
     let router = OpenAIRouter::new(&ctx).await.unwrap();
 
     let chat_request = create_minimal_chat_request();
@@ -810,10 +815,17 @@ async fn test_openai_router_circuit_breaker() {
     // First few requests should fail and record failures
     for _ in 0..3 {
         let response = router.route_chat(None, &chat_request, None).await;
-        // Should get either an error or circuit breaker response
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        // Should get either an upstream failure or circuit breaker response.
         assert!(
-            response.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+            status == StatusCode::BAD_GATEWAY
+                || status == StatusCode::INTERNAL_SERVER_ERROR
+                || status == StatusCode::SERVICE_UNAVAILABLE,
+            "unexpected status {status}: {body}"
         );
     }
 }

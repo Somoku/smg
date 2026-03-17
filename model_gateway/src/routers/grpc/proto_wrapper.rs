@@ -411,6 +411,75 @@ impl ProtoGenerateRequest {
         }
     }
 
+    // PR 18 (Gap 5): Apply partial-rollout loopback at the proto request layer.
+    // This enables Generate/Chat/Responses routes to share the same continuation logic.
+    pub fn apply_partial_rollout(&mut self, partial_token_ids: &[u32]) {
+        if partial_token_ids.is_empty() {
+            return;
+        }
+
+        self.append_partial_input_ids(partial_token_ids);
+        self.decrement_remaining_budget(partial_token_ids.len());
+    }
+
+    fn append_partial_input_ids(&mut self, partial_token_ids: &[u32]) {
+        match self {
+            Self::Sglang(req) => {
+                let tokenized = req.tokenized.get_or_insert_with(|| sglang::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: Vec::new(),
+                });
+                tokenized.input_ids.extend_from_slice(partial_token_ids);
+            }
+            Self::Vllm(req) => match req.input.as_mut() {
+                Some(vllm::generate_request::Input::Tokenized(tokenized)) => {
+                    tokenized.input_ids.extend_from_slice(partial_token_ids);
+                }
+                _ => {
+                    req.input = Some(vllm::generate_request::Input::Tokenized(
+                        vllm::TokenizedInput {
+                            original_text: String::new(),
+                            input_ids: partial_token_ids.to_vec(),
+                        },
+                    ));
+                }
+            },
+            Self::Trtllm(req) => {
+                let tokenized = req.tokenized.get_or_insert_with(|| trtllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_token_ids: Vec::new(),
+                    query_token_ids: Vec::new(),
+                });
+                tokenized
+                    .input_token_ids
+                    .extend_from_slice(partial_token_ids);
+            }
+        }
+    }
+
+    fn decrement_remaining_budget(&mut self, consumed_tokens: usize) {
+        let consumed = consumed_tokens.min(u32::MAX as usize) as u32;
+        match self {
+            Self::Sglang(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if let Some(max_new_tokens) = params.max_new_tokens {
+                        params.max_new_tokens = Some(max_new_tokens.saturating_sub(consumed));
+                    }
+                }
+            }
+            Self::Vllm(req) => {
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if let Some(max_tokens) = params.max_tokens {
+                        params.max_tokens = Some(max_tokens.saturating_sub(consumed));
+                    }
+                }
+            }
+            Self::Trtllm(req) => {
+                req.max_tokens = req.max_tokens.saturating_sub(consumed);
+            }
+        }
+    }
+
     /// Set KV transfer parameters for Mooncake PD disaggregation (vLLM only).
     /// These parameters tell the decode worker where to fetch KV cache from the prefill worker.
     pub fn set_kv_transfer_params(&mut self, remote_host: String, remote_port: u32) {
@@ -845,6 +914,108 @@ impl ProtoGenerateComplete {
                 .as_ref()
                 .map(|lp| convert_output_logprobs!(lp)),
             Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
+        }
+    }
+
+    // Issue 1: Prepend accumulated partial-rollout output logprobs from prior iterations
+    // before this (final) iteration's logprobs. Called by `merge_partial_into_drained`
+    // for the "stop"/"length" path.
+    /// Prepend prior loopback iterations' output logprobs before the final iteration's logprobs.
+    ///
+    /// `prior_logprobs` is the accumulated `ProtoPartialRolloutState.logprobs` collected
+    /// across all "abort" iterations. This method prepends them so the client receives a
+    /// complete logprob sequence matching the non-interrupted case.
+    ///
+    /// No-op if `prior_logprobs` is empty.
+    pub fn prepend_output_logprobs(&mut self, prior_logprobs: &[ProtoOutputLogProbs]) {
+        if prior_logprobs.is_empty() {
+            return;
+        }
+        match self {
+            Self::Vllm(c) => {
+                let mut tok_lp: Vec<f32> = Vec::new();
+                let mut tok_ids: Vec<u32> = Vec::new();
+                let mut top_lp: Vec<vllm::TopLogProbs> = Vec::new();
+                for lp in prior_logprobs {
+                    tok_lp.extend_from_slice(&lp.token_logprobs);
+                    tok_ids.extend_from_slice(&lp.token_ids);
+                    top_lp.extend(lp.top_logprobs.iter().map(|t| vllm::TopLogProbs {
+                        values: t.values.clone(),
+                        token_ids: t.token_ids.clone(),
+                    }));
+                }
+                if let Some(final_lp) = c.output_logprobs.as_ref() {
+                    tok_lp.extend_from_slice(&final_lp.token_logprobs);
+                    tok_ids.extend_from_slice(&final_lp.token_ids);
+                    top_lp.extend(final_lp.top_logprobs.iter().cloned());
+                }
+                if !tok_lp.is_empty() {
+                    c.output_logprobs = Some(vllm::OutputLogProbs {
+                        token_logprobs: tok_lp,
+                        token_ids: tok_ids,
+                        top_logprobs: top_lp,
+                    });
+                }
+            }
+            Self::Sglang(c) => {
+                // Identical field layout to vLLM — same logic with sglang types.
+                let mut tok_lp: Vec<f32> = Vec::new();
+                let mut tok_ids: Vec<u32> = Vec::new();
+                let mut top_lp: Vec<sglang::TopLogProbs> = Vec::new();
+                for lp in prior_logprobs {
+                    tok_lp.extend_from_slice(&lp.token_logprobs);
+                    tok_ids.extend_from_slice(&lp.token_ids);
+                    top_lp.extend(lp.top_logprobs.iter().map(|t| sglang::TopLogProbs {
+                        values: t.values.clone(),
+                        token_ids: t.token_ids.clone(),
+                    }));
+                }
+                if let Some(final_lp) = c.output_logprobs.as_ref() {
+                    tok_lp.extend_from_slice(&final_lp.token_logprobs);
+                    tok_ids.extend_from_slice(&final_lp.token_ids);
+                    top_lp.extend(final_lp.top_logprobs.iter().cloned());
+                }
+                if !tok_lp.is_empty() {
+                    c.output_logprobs = Some(sglang::OutputLogProbs {
+                        token_logprobs: tok_lp,
+                        token_ids: tok_ids,
+                        top_logprobs: top_lp,
+                    });
+                }
+            }
+            Self::Trtllm(c) => {
+                // TRT-LLM uses a flat Vec<TokenLogprob> (one entry per token).
+                // Reconstruct prior entries from unified ProtoOutputLogProbs parallel vecs,
+                // then append the final iteration's existing logprobs.
+                let mut merged: Vec<trtllm::TokenLogprob> = Vec::new();
+                for lp in prior_logprobs {
+                    let n = lp.token_logprobs.len();
+                    for i in 0..n {
+                        merged.push(trtllm::TokenLogprob {
+                            token_id: lp.token_ids.get(i).copied().unwrap_or(0),
+                            logprob: lp.token_logprobs[i],
+                            top_logprobs: lp
+                                .top_logprobs
+                                .get(i)
+                                .map(|t| {
+                                    t.token_ids
+                                        .iter()
+                                        .zip(t.values.iter())
+                                        .map(|(&tid, &lp_val)| trtllm::TopLogprob {
+                                            token_id: tid,
+                                            logprob: lp_val,
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        });
+                    }
+                }
+                // Append (not prepend) final iteration — merged already holds
+                // prior tokens in order; existing c.logprobs holds the last iteration.
+                merged.extend(std::mem::take(&mut c.logprobs));
+                c.logprobs = merged;
+            }
         }
     }
 

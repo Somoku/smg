@@ -5,6 +5,7 @@ use pyo3::prelude::*;
 use smg::*;
 use smg_auth as auth;
 
+// PR Python §1.1: Added three PSRL policy variants to PolicyType enum.
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
@@ -17,6 +18,10 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    // PR Python §1.1: PSRL-specific load-aware policy variants.
+    RequestNumBalance,
+    ThroughputOptimal,
+    ThroughputOptimalWithBudget,
 }
 
 #[pyclass(eq, from_py_object)]
@@ -453,6 +458,30 @@ struct Router {
     otlp_traces_endpoint: String,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
     schema_config: Option<String>,
+    // PR Python §1.2: PrefixHash tuning fields (fix existing hardcoding bug).
+    prefix_token_count: usize,
+    prefix_hash_load_factor: f64,
+    // PR Python §1.2: Load-aware policy tuning (shared by RequestNumBalance / ThroughputOptimal variants).
+    policy_balanced_concurrent_seqs_per_instance: usize,
+    policy_max_concurrent_seqs_per_instance: usize,
+    policy_cost_model_path: Option<String>,
+    policy_max_num_waiting_reqs_after_preemption: usize,
+    policy_delta_throughput_threshold: f64,
+    policy_max_prompt_length: usize,
+    policy_request_budget: usize,
+    // PR Python §1.2: Routing loop enable flag.
+    enable_routing_loop: bool,
+    // PR Python §1.2: PSRL configuration fields (flat, assembled into PsrlConfig in to_router_config).
+    psrl_check_interval_ms: u64,
+    psrl_ps_manager_ip: String,
+    psrl_ps_manager_grpc_port: u16,
+    psrl_request_sort_indicator: String,
+    psrl_candidate_sort_indicator: String,
+    enable_multi_priority_queue: bool,
+    psrl_enable_group_sampling_on_multi_instances: bool,
+    psrl_snapshot_staleness_threshold_in_ms: u64,
+    psrl_max_num_waiting_reqs_after_preemption: usize,
+    psrl_mig_enable: bool,
 }
 
 impl Router {
@@ -463,6 +492,42 @@ impl Router {
             }
         }
         core::ConnectionMode::Http
+    }
+
+    // PR Python §1.4: Helper to return policy name string for PsrlRoutingStrategy.method.
+    fn policy_name(policy: &PolicyType) -> &'static str {
+        match policy {
+            PolicyType::Random => "random",
+            PolicyType::RoundRobin => "round_robin",
+            PolicyType::CacheAware => "cache_aware",
+            PolicyType::PowerOfTwo => "power_of_two",
+            PolicyType::Bucket => "bucket",
+            PolicyType::Manual => "manual",
+            PolicyType::ConsistentHashing => "consistent_hashing",
+            PolicyType::PrefixHash => "prefix_hash",
+            PolicyType::RequestNumBalance => "request_num_balance",
+            PolicyType::ThroughputOptimal => "throughput_optimal",
+            PolicyType::ThroughputOptimalWithBudget => "throughput_optimal_with_budget",
+        }
+    }
+
+    // PR Python §1.4: Parse request sort indicator string into enum.
+    // Accepted values: "short_length" (default), "long_length", "small_id".
+    fn parse_request_sort_indicator(s: &str) -> config::RequestSortIndicator {
+        match s {
+            "long_length" => config::RequestSortIndicator::LongLength,
+            "small_id" => config::RequestSortIndicator::SmallId,
+            _ => config::RequestSortIndicator::ShortLength,
+        }
+    }
+
+    // PR Python §1.4: Parse candidate sort indicator string into enum.
+    // Accepted values: "version" (default), "reserve_capability".
+    fn parse_candidate_sort_indicator(s: &str) -> config::CandidateSortIndicator {
+        match s {
+            "reserve_capability" => config::CandidateSortIndicator::ReserveCapability,
+            _ => config::CandidateSortIndicator::Version,
+        }
     }
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
@@ -507,10 +572,42 @@ impl Router {
                     },
                 },
                 PolicyType::ConsistentHashing => ConfigPolicyConfig::ConsistentHashing,
+                // PR Python §1.4: Fix existing PrefixHash hardcoding — use user-supplied values.
                 PolicyType::PrefixHash => ConfigPolicyConfig::PrefixHash {
-                    prefix_token_count: 256,
-                    load_factor: 1.25,
+                    prefix_token_count: self.prefix_token_count,
+                    load_factor: self.prefix_hash_load_factor,
                 },
+                // PR Python §1.4: New PSRL load-aware policy variants.
+                PolicyType::RequestNumBalance => ConfigPolicyConfig::RequestNumBalance {
+                    balanced_concurrent_seqs_per_instance: self
+                        .policy_balanced_concurrent_seqs_per_instance,
+                    max_concurrent_seqs_per_instance: self.policy_max_concurrent_seqs_per_instance,
+                },
+                PolicyType::ThroughputOptimal => ConfigPolicyConfig::ThroughputOptimal {
+                    cost_model_path: self.policy_cost_model_path.clone(),
+                    max_num_waiting_reqs_after_preemption: self
+                        .policy_max_num_waiting_reqs_after_preemption,
+                    balanced_concurrent_seqs_per_instance: self
+                        .policy_balanced_concurrent_seqs_per_instance,
+                    max_concurrent_seqs_per_instance: self.policy_max_concurrent_seqs_per_instance,
+                    delta_throughput_threshold: self.policy_delta_throughput_threshold,
+                    max_prompt_length: self.policy_max_prompt_length,
+                    request_budget: self.policy_request_budget,
+                },
+                PolicyType::ThroughputOptimalWithBudget => {
+                    ConfigPolicyConfig::ThroughputOptimalWithBudget {
+                        cost_model_path: self.policy_cost_model_path.clone(),
+                        max_num_waiting_reqs_after_preemption: self
+                            .policy_max_num_waiting_reqs_after_preemption,
+                        balanced_concurrent_seqs_per_instance: self
+                            .policy_balanced_concurrent_seqs_per_instance,
+                        max_concurrent_seqs_per_instance: self
+                            .policy_max_concurrent_seqs_per_instance,
+                        delta_throughput_threshold: self.policy_delta_throughput_threshold,
+                        max_prompt_length: self.policy_max_prompt_length,
+                        request_budget: self.policy_request_budget,
+                    }
+                }
             })
         };
 
@@ -709,7 +806,44 @@ impl Router {
                 self.server_cert_path.as_ref(),
                 self.server_key_path.as_ref(),
             )
+            // PR Python §1.4: Wire enable_routing_loop via builder method.
+            .routing_loop(self.enable_routing_loop)
             .build()
+            // PR Python §1.4: Populate PsrlConfig after build (direct struct mutation pattern).
+            // Fields are dual-wired: into PolicyConfig for base load-balancing, and
+            // into PsrlRoutingStrategy for the routing loop's PSRL dispatch logic.
+            .map(|mut router_config| {
+                router_config.psrl = config::PsrlConfig {
+                    check_interval_ms: self.psrl_check_interval_ms,
+                    ps_manager_ip: self.psrl_ps_manager_ip.clone(),
+                    ps_manager_grpc_port: self.psrl_ps_manager_grpc_port,
+                    routing_strategy: config::PsrlRoutingStrategy {
+                        method: Self::policy_name(&self.policy).to_string(),
+                        request_sort_indicator: Self::parse_request_sort_indicator(
+                            &self.psrl_request_sort_indicator,
+                        ),
+                        candidate_sort_indicator: Self::parse_candidate_sort_indicator(
+                            &self.psrl_candidate_sort_indicator,
+                        ),
+                        enable_multi_priority_queue: self.enable_multi_priority_queue,
+                        enable_group_sampling_on_multi_instances: self
+                            .psrl_enable_group_sampling_on_multi_instances,
+                        cost_model_path: self.policy_cost_model_path.clone(),
+                        delta_throughput_threshold: self.policy_delta_throughput_threshold,
+                        request_budget: self.policy_request_budget,
+                        snapshot_staleness_threshold_in_ms: self
+                            .psrl_snapshot_staleness_threshold_in_ms,
+                        max_num_waiting_reqs_after_preemption: self
+                            .psrl_max_num_waiting_reqs_after_preemption,
+                        max_concurrent_seqs_per_instance: self
+                            .policy_max_concurrent_seqs_per_instance,
+                        balanced_concurrent_seqs_per_instance: self
+                            .policy_balanced_concurrent_seqs_per_instance,
+                    },
+                    enable_mig_strategy: self.psrl_mig_enable,
+                };
+                router_config
+            })
     }
 }
 
@@ -806,6 +940,30 @@ impl Router {
         otlp_traces_endpoint = String::from("localhost:4317"),
         control_plane_auth = None,
         schema_config = None,
+        // PR Python §1.3: PrefixHash tuning defaults.
+        prefix_token_count = 256,
+        prefix_hash_load_factor = 1.25,
+        // PR Python §1.3: Load-aware policy tuning defaults.
+        policy_balanced_concurrent_seqs_per_instance = 512,
+        policy_max_concurrent_seqs_per_instance = 1024,
+        policy_cost_model_path = None,
+        policy_max_num_waiting_reqs_after_preemption = 1000,
+        policy_delta_throughput_threshold = 0.5,
+        policy_max_prompt_length = 8192,
+        policy_request_budget = 1024,
+        // PR Python §1.3: Routing loop default.
+        enable_routing_loop = false,
+        // PR Python §1.3: PSRL config defaults.
+        psrl_check_interval_ms = 10,
+        psrl_ps_manager_ip = String::from("127.0.0.1"),
+        psrl_ps_manager_grpc_port = 50051,
+        psrl_request_sort_indicator = String::from("short_length"),
+        psrl_candidate_sort_indicator = String::from("version"),
+        enable_multi_priority_queue = false,
+        psrl_enable_group_sampling_on_multi_instances = false,
+        psrl_snapshot_staleness_threshold_in_ms = 1000,
+        psrl_max_num_waiting_reqs_after_preemption = 1000,
+        psrl_mig_enable = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -902,6 +1060,27 @@ impl Router {
         otlp_traces_endpoint: String,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
         schema_config: Option<String>,
+        // PR Python §1.5: New PSRL and policy-tuning parameters in new().
+        prefix_token_count: usize,
+        prefix_hash_load_factor: f64,
+        policy_balanced_concurrent_seqs_per_instance: usize,
+        policy_max_concurrent_seqs_per_instance: usize,
+        policy_cost_model_path: Option<String>,
+        policy_max_num_waiting_reqs_after_preemption: usize,
+        policy_delta_throughput_threshold: f64,
+        policy_max_prompt_length: usize,
+        policy_request_budget: usize,
+        enable_routing_loop: bool,
+        psrl_check_interval_ms: u64,
+        psrl_ps_manager_ip: String,
+        psrl_ps_manager_grpc_port: u16,
+        psrl_request_sort_indicator: String,
+        psrl_candidate_sort_indicator: String,
+        enable_multi_priority_queue: bool,
+        psrl_enable_group_sampling_on_multi_instances: bool,
+        psrl_snapshot_staleness_threshold_in_ms: u64,
+        psrl_max_num_waiting_reqs_after_preemption: usize,
+        psrl_mig_enable: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1008,6 +1187,27 @@ impl Router {
             otlp_traces_endpoint,
             control_plane_auth,
             schema_config,
+            // PR Python §1.5: New PSRL and policy-tuning fields in Router struct initialization.
+            prefix_token_count,
+            prefix_hash_load_factor,
+            policy_balanced_concurrent_seqs_per_instance,
+            policy_max_concurrent_seqs_per_instance,
+            policy_cost_model_path,
+            policy_max_num_waiting_reqs_after_preemption,
+            policy_delta_throughput_threshold,
+            policy_max_prompt_length,
+            policy_request_budget,
+            enable_routing_loop,
+            psrl_check_interval_ms,
+            psrl_ps_manager_ip,
+            psrl_ps_manager_grpc_port,
+            psrl_request_sort_indicator,
+            psrl_candidate_sort_indicator,
+            enable_multi_priority_queue,
+            psrl_enable_group_sampling_on_multi_instances,
+            psrl_snapshot_staleness_threshold_in_ms,
+            psrl_max_num_waiting_reqs_after_preemption,
+            psrl_mig_enable,
         })
     }
 

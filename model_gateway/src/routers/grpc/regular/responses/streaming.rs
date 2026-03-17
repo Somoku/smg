@@ -13,7 +13,7 @@ use std::{
 
 use axum::{
     body::Body,
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::Response,
 };
 use bytes::Bytes;
@@ -79,16 +79,10 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
 
-    // Get chat streaming response
-    let chat_response = ctx
-        .pipeline
-        .execute_chat(
-            chat_request,
-            params.headers,
-            params.model_id,
-            ctx.components.clone(),
-        )
-        .await;
+    // PR 17 (Gap 4): route streaming chat execution through routing loop when enabled.
+    let chat_response =
+        execute_chat_with_optional_routing_loop(ctx, chat_request, params.headers, params.model_id)
+            .await;
 
     // Extract body from chat response
     let (_parts, body) = chat_response.into_parts();
@@ -127,6 +121,24 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
 
     // Build SSE response with transformed stream
     build_sse_response(rx)
+}
+
+// PR 17 (Gap 4): centralize regular streaming chat execution through routing loop.
+async fn execute_chat_with_optional_routing_loop(
+    ctx: &ResponsesContext,
+    chat_request: Arc<ChatCompletionRequest>,
+    headers: Option<HeaderMap>,
+    model_id: Option<String>,
+) -> Response {
+    if let Some(routing_loop_pipeline) = ctx.routing_loop_pipeline.as_ref() {
+        routing_loop_pipeline
+            .execute_chat(chat_request, headers, model_id, ctx.components.clone())
+            .await
+    } else {
+        ctx.pipeline
+            .execute_chat(chat_request, headers, model_id, ctx.components.clone())
+            .await
+    }
 }
 
 /// Process chat SSE stream and transform to responses format
@@ -559,16 +571,14 @@ async fn execute_tool_loop_streaming_internal(
         // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
         prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
 
-        // Execute chat streaming
-        let response = ctx
-            .pipeline
-            .execute_chat(
-                Arc::new(chat_request),
-                params.headers.clone(),
-                params.model_id.clone(),
-                ctx.components.clone(),
-            )
-            .await;
+        // PR 17 (Gap 4): keep MCP-loop streaming iterations on routing-loop path too.
+        let response = execute_chat_with_optional_routing_loop(
+            ctx,
+            Arc::new(chat_request),
+            params.headers.clone(),
+            params.model_id.clone(),
+        )
+        .await;
 
         // Convert chat stream to Responses API events while accumulating for tool call detection
         // Stream text naturally - it only appears on final iteration (tool iterations have empty content)
@@ -1055,5 +1065,227 @@ impl ChatResponseAccumulator {
             }])
             .maybe_usage(self.usage)
             .build()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, sync::Arc};
+
+    use llm_tokenizer::{
+        chat_template::ChatTemplateParams,
+        traits::{Decoder, Encoder, Encoding, SpecialTokens, Tokenizer},
+        MockTokenizer, TokenizerRegistry,
+    };
+    use openai_protocol::chat::ChatCompletionRequest;
+    use reasoning_parser::ParserFactory as ReasoningParserFactory;
+    use smg_data_connector::{
+        MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    };
+    use smg_mcp::{McpConfig, McpOrchestrator};
+    use tool_parser::ParserFactory as ToolParserFactory;
+
+    use super::execute_chat_with_optional_routing_loop;
+    use crate::{
+        config::{PolicyConfig, RequestSortIndicator},
+        core::WorkerRegistry,
+        policies::PolicyRegistry,
+        routers::{
+            error::HEADER_X_SMG_ERROR_CODE,
+            grpc::{
+                common::responses::ResponsesContext, context::SharedComponents,
+                pipeline::RequestPipeline, pipeline_routing_loop::RoutingLoopPipeline,
+            },
+            routing_loop_utils::RoutingLoopRuntime,
+        },
+    };
+
+    #[derive(Default)]
+    struct TemplateMockTokenizer {
+        inner: MockTokenizer,
+    }
+
+    impl Encoder for TemplateMockTokenizer {
+        fn encode(&self, input: &str, add_special_tokens: bool) -> anyhow::Result<Encoding> {
+            self.inner.encode(input, add_special_tokens)
+        }
+
+        fn encode_batch(
+            &self,
+            inputs: &[&str],
+            add_special_tokens: bool,
+        ) -> anyhow::Result<Vec<Encoding>> {
+            self.inner.encode_batch(inputs, add_special_tokens)
+        }
+    }
+
+    impl Decoder for TemplateMockTokenizer {
+        fn decode(&self, token_ids: &[u32], skip_special_tokens: bool) -> anyhow::Result<String> {
+            self.inner.decode(token_ids, skip_special_tokens)
+        }
+    }
+
+    impl Tokenizer for TemplateMockTokenizer {
+        fn vocab_size(&self) -> usize {
+            self.inner.vocab_size()
+        }
+
+        fn get_special_tokens(&self) -> &SpecialTokens {
+            self.inner.get_special_tokens()
+        }
+
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            self.inner.token_to_id(token)
+        }
+
+        fn id_to_token(&self, id: u32) -> Option<String> {
+            self.inner.id_to_token(id)
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn apply_chat_template(
+            &self,
+            messages: &[serde_json::Value],
+            _params: ChatTemplateParams,
+        ) -> anyhow::Result<String> {
+            Ok(messages
+                .iter()
+                .filter_map(|msg| msg.get("content").and_then(|value| value.as_str()))
+                .collect::<Vec<_>>()
+                .join(" "))
+        }
+    }
+
+    fn make_shared_components() -> Arc<SharedComponents> {
+        Arc::new(SharedComponents {
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            multimodal: None,
+        })
+    }
+
+    fn make_pipeline() -> Arc<RequestPipeline> {
+        Arc::new(RequestPipeline::new_regular(
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            ToolParserFactory::default(),
+            ReasoningParserFactory::default(),
+            None,
+            None,
+        ))
+    }
+
+    async fn make_mcp_orchestrator() -> Arc<McpOrchestrator> {
+        let empty_config = McpConfig {
+            servers: vec![],
+            pool: Default::default(),
+            proxy: None,
+            warmup: vec![],
+            inventory: Default::default(),
+            policy: Default::default(),
+        };
+        Arc::new(
+            McpOrchestrator::new(empty_config)
+                .await
+                .expect("test MCP orchestrator should initialize"),
+        )
+    }
+
+    fn make_closed_routing_loop_pipeline(
+        standard_pipeline: Arc<RequestPipeline>,
+    ) -> Arc<RoutingLoopPipeline> {
+        let (runtime, rx) = RoutingLoopRuntime::new_with_channel(
+            RequestSortIndicator::SmallId,
+            false,
+            Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            0,
+            String::new(),
+            None,
+        );
+        // PR-A (Note 1): test helper returns Arc<RoutingLoopPipeline> to match ResponsesContext.
+        // Force routing-loop send failure so this test can verify the helper used RL path.
+        drop(rx);
+        Arc::new(RoutingLoopPipeline::new(runtime, standard_pipeline))
+    }
+
+    async fn make_responses_context(with_routing_loop: bool) -> ResponsesContext {
+        let components = make_shared_components();
+        let pipeline = make_pipeline();
+
+        let tokenizer_id = TokenizerRegistry::generate_id();
+        components
+            .tokenizer_registry
+            .load(&tokenizer_id, "mock-model", "mock://tokenizer", || async {
+                Ok(Arc::new(TemplateMockTokenizer::default()) as Arc<dyn Tokenizer>)
+            })
+            .await
+            .expect("mock tokenizer should register");
+
+        let base = ResponsesContext::new(
+            Arc::clone(&pipeline),
+            Arc::clone(&components),
+            Arc::new(MemoryResponseStorage::new()),
+            Arc::new(MemoryConversationStorage::new()),
+            Arc::new(MemoryConversationItemStorage::new()),
+            make_mcp_orchestrator().await,
+        );
+
+        if with_routing_loop {
+            base.with_routing_loop(make_closed_routing_loop_pipeline(pipeline))
+        } else {
+            base
+        }
+    }
+
+    fn make_chat_request() -> Arc<ChatCompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": "mock-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": true
+            }))
+            .expect("test chat request should deserialize"),
+        )
+    }
+
+    fn error_code(response: &axum::response::Response) -> Option<&str> {
+        response
+            .headers()
+            .get(HEADER_X_SMG_ERROR_CODE)
+            .and_then(|v| v.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_with_optional_routing_loop_prefers_rl_path() {
+        let ctx = make_responses_context(true).await;
+
+        let response = execute_chat_with_optional_routing_loop(
+            &ctx,
+            make_chat_request(),
+            None,
+            Some("mock-model".to_string()),
+        )
+        .await;
+
+        assert_eq!(error_code(&response), Some("routing_loop_send_failed"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_chat_with_optional_routing_loop_falls_back_without_rl() {
+        let ctx = make_responses_context(false).await;
+
+        let response = execute_chat_with_optional_routing_loop(
+            &ctx,
+            make_chat_request(),
+            None,
+            Some("mock-model".to_string()),
+        )
+        .await;
+
+        assert_ne!(error_code(&response), Some("routing_loop_send_failed"));
     }
 }

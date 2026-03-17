@@ -46,8 +46,7 @@ use crate::{
         worker::WorkerType,
         worker_manager::WorkerManager,
         worker_service::{
-            WorkerRoutingControlRequest, WorkerStatsUpdateRequest,
-            WorkerVersionTagUpdateRequest,
+            WorkerRoutingControlRequest, WorkerStatsUpdateRequest, WorkerVersionTagUpdateRequest,
         },
         Job,
     },
@@ -59,6 +58,7 @@ use crate::{
     },
     routers::{
         conversations,
+        grpc::{router::GrpcRouter, routing_loop::routing_loop},
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -67,6 +67,7 @@ use crate::{
         openai::realtime::{rest as realtime_rest, ws as realtime_ws},
         parse,
         router_manager::RouterManager,
+        routing_loop_utils::RoutingLoopRuntime,
         tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
@@ -751,10 +752,22 @@ pub fn build_app(
     let control_routes = if app_state.context.router_config.enable_routing_loop {
         use crate::routers::grpc::common::routing_loop_controller;
         control_routes
-            .route("/routing_loop/pause", post(routing_loop_controller::routing_loop_pause))
-            .route("/routing_loop/resume", post(routing_loop_controller::routing_loop_resume))
-            .route("/routing_loop/status", get(routing_loop_controller::routing_loop_status))
-            .route("/routing_loop/filter", get(routing_loop_controller::routing_loop_filter))
+            .route(
+                "/routing_loop/pause",
+                post(routing_loop_controller::routing_loop_pause),
+            )
+            .route(
+                "/routing_loop/resume",
+                post(routing_loop_controller::routing_loop_resume),
+            )
+            .route(
+                "/routing_loop/status",
+                get(routing_loop_controller::routing_loop_status),
+            )
+            .route(
+                "/routing_loop/filter",
+                get(routing_loop_controller::routing_loop_filter),
+            )
     } else {
         control_routes
     };
@@ -901,9 +914,65 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
+    let mut app_context = Arc::new(
         AppContext::from_config(config.router_config.clone(), config.request_timeout_secs).await?,
     );
+
+    // PR 10 §10.5: Initialize routing loop runtime if enabled.
+    // This must happen before router_manager creation so GrpcRouter::new()
+    // can read routing_loop_runtime from AppContext.
+    // The receiver rx is held until after router_manager to get the pipeline.
+    let routing_loop_rx = if config.router_config.enable_routing_loop {
+        use psrl_state::PSManagerStateClient;
+
+        // PR 14: Use PSRL config from RouterConfig instead of hardcoded default.
+        // This allows ps_manager_ip, ps_manager_grpc_port, check_interval_ms,
+        // and routing_strategy settings to be configured via YAML/JSON config.
+        let psrl_cfg = config.router_config.psrl.clone();
+        let ps_manager_addr = psrl_cfg.ps_manager_addr();
+
+        // Attempt to connect to PS Manager (non-fatal if unavailable)
+        let ps_client = PSManagerStateClient::connect(&ps_manager_addr)
+            .await
+            .ok()
+            .map(|c| {
+                info!(
+                    ps_manager_addr = %ps_manager_addr,
+                    "Connected to PS Manager"
+                );
+                Arc::new(c)
+            });
+        if ps_client.is_none() {
+            info!(
+                ps_manager_addr = %ps_manager_addr,
+                "PS Manager not available (routing loop will operate without PS Manager RPCs)"
+            );
+        }
+
+        let instance_to_version_after_sync = app_context.instance_to_version_after_sync.clone();
+        let (runtime, rx) = RoutingLoopRuntime::new_with_channel(
+            psrl_cfg.routing_strategy.request_sort_indicator,
+            psrl_cfg.routing_strategy.enable_multi_priority_queue,
+            instance_to_version_after_sync,
+            psrl_cfg.check_interval_ms,
+            ps_manager_addr,
+            ps_client,
+        );
+
+        // Set routing_loop_runtime on app_context before any Arc clones are made.
+        // Arc::get_mut succeeds because app_context has exactly one strong reference here.
+        if let Some(ctx_mut) = Arc::get_mut(&mut app_context) {
+            ctx_mut.routing_loop_runtime = Some(runtime);
+            info!("Routing loop runtime initialized");
+        } else {
+            error!("Failed to set routing_loop_runtime: Arc::get_mut failed");
+            return Err("Failed to initialize routing loop runtime".into());
+        }
+
+        Some(rx)
+    } else {
+        None
+    };
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1027,6 +1096,48 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
+
+    // PR 10 §10.5 / PR 11 §11.1: Spawn routing loop task if enabled.
+    // We now have the router_manager, so we can extract the GrpcRouter pipeline,
+    // shared components, and the router itself (needed for worker selection in PR 11).
+    if let Some(rx) = routing_loop_rx {
+        // Downcast the default router to GrpcRouter to extract pipeline + components + router.
+        let grpc_router = router
+            .as_any()
+            .downcast_ref::<RouterManager>()
+            .and_then(|rm| rm.get_default_router())
+            .and_then(|r| {
+                r.as_any().downcast_ref::<GrpcRouter>().map(|gr| {
+                    // PR 11 §11.1: Pass the router itself for select_worker_for_model().
+                    (
+                        gr.get_pipeline(),
+                        gr.get_shared_components(),
+                        Arc::new(gr.clone()),
+                    )
+                })
+            });
+
+        if let Some((pipeline, _components, grpc_router_arc)) = grpc_router {
+            if let Some(runtime) = app_context.routing_loop_runtime.clone() {
+                info!("Spawning PSRL routing loop task");
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "routing loop task runs for the lifetime of the server"
+                )]
+                spawn(routing_loop(
+                    // PR 13 §13.1: components removed — already in each RoutingQueueEntry.ctx.
+                    runtime,
+                    rx,
+                    pipeline,
+                    grpc_router_arc,
+                ));
+            }
+        } else {
+            warn!(
+                "Could not extract GrpcRouter from router_manager — routing loop task not spawned"
+            );
+        }
+    }
 
     // Health checker handle must outlive the server to keep the background task alive.
     // HealthChecker aborts its task on Drop, so binding it here keeps it alive until
