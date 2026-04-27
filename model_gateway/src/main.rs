@@ -200,6 +200,10 @@ struct CliArgs {
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     enable_igw: bool,
 
+    /// Connection mode for worker communication.
+    #[arg(long, value_parser = ["http", "grpc"], help_heading = "Worker Configuration")]
+    connection_mode: Option<String>,
+
     /// Enable minimum tokens scheduler for data parallel group
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     dp_minimum_tokens_scheduler: bool,
@@ -1165,7 +1169,11 @@ impl CliArgs {
                 all_urls.extend(worker_urls.clone());
             }
         }
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = match self.connection_mode.as_deref() {
+            Some("http") => ConnectionMode::Http,
+            Some("grpc") => ConnectionMode::Grpc,
+            _ => Self::determine_connection_mode(&all_urls),
+        };
 
         let history_backend = match self.history_backend.as_str() {
             "none" => HistoryBackend::None,

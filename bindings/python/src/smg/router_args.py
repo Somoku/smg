@@ -44,6 +44,7 @@ class RouterArgs:
     dp_aware: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
+    connection_mode: str | None = None # Connection mode: http or grpc (only effective in non-IGW mode)
     api_key: str | None = None
     log_dir: str | None = None
     log_level: str | None = None
@@ -403,6 +404,14 @@ class RouterArgs:
             f"--{prefix}enable-igw",
             action="store_true",
             help="Enable IGW (Inference-Gateway) mode for multi-model support",
+        )
+        routing_group.add_argument(
+            f"--{prefix}connection-mode",
+            choices=["http", "grpc"],
+            default=None,
+            help="Connection mode to workers: 'http' or 'grpc' "
+                 "(only effective in non-IGW mode, "
+                 "default: auto-detect from worker URLs, falls back to http)",
         )
 
         # PD-specific arguments
@@ -1186,6 +1195,17 @@ class RouterArgs:
         return cls(**args_dict)
 
     def _validate_router_args(self):
+        # Validate connection_mode
+        if self.connection_mode is not None and self.connection_mode not in ("http", "grpc"):
+            raise ValueError(
+                f"Invalid connection_mode '{self.connection_mode}'. Must be 'http' or 'grpc'."
+            )
+        if self.enable_igw and self.connection_mode == "grpc":
+            logger.warning(
+                "--connection-mode 'grpc' is ignored in IGW mode; "
+                "IGW mode always creates both HTTP and gRPC routers."
+            )
+
         # Validate configuration based on mode
         if self.pd_disaggregation:
             # Warn about policy usage in PD mode

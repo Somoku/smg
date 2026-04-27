@@ -823,6 +823,7 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
+        connection_mode = None,
         model_path = None,
         tokenizer_path = None,
         chat_template = None,
@@ -932,6 +933,7 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
+        connection_mode: Option<String>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
         chat_template: Option<String>,
@@ -977,7 +979,11 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = match connection_mode.as_deref() {
+            Some("http") => worker::ConnectionMode::Http,
+            Some("grpc") => worker::ConnectionMode::Grpc,
+            _ => Self::determine_connection_mode(&all_urls),
+        };
 
         Ok(Router {
             host,
