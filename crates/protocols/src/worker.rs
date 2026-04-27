@@ -538,6 +538,10 @@ pub struct WorkerSpec {
     /// Worker URL.
     pub url: String,
 
+    /// Worker unique identifier.
+    #[serde(default, skip_serializing)]
+    pub id: Option<String>,
+
     /// Models this worker can serve.
     #[serde(default, skip_serializing_if = "WorkerModels::is_wildcard")]
     pub models: WorkerModels,
@@ -637,6 +641,7 @@ impl WorkerSpec {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            id: None,
             models: WorkerModels::Wildcard,
             worker_type: WorkerType::default(),
             connection_mode: ConnectionMode::default(),

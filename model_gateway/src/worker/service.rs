@@ -254,7 +254,11 @@ impl WorkerService {
 
         // Reserve (or retrieve) a stable ID for the 202 response.
         // If this URL already has an active worker, reject with 409.
-        let worker_id = self.worker_registry.reserve_id_for_url(&worker_url);
+        let worker_id = if let Some(ref manual_id) = config.id {
+            WorkerId::from_string(manual_id.clone())
+        } else {
+            self.worker_registry.reserve_id_for_url(&worker_url)
+        };
         if self.worker_registry.get(&worker_id).is_some() {
             return Err(WorkerServiceError::Conflict {
                 url: worker_url,
