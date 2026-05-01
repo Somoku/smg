@@ -82,6 +82,24 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 
         debug!("Discovering DP info for {} (DP-aware)", config.url);
 
+        let dp_info = match connection_mode {
+            ConnectionMode::Http => {
+                get_dp_info(&config.url, config.api_key.as_deref())
+                    .await
+                    .map_err(|e| WorkflowError::StepFailed {
+                        step_id: StepId::new("discover_dp_info"),
+                        message: format!("Failed to get DP info: {e}"),
+                    })?
+            }
+            ConnectionMode::Grpc => {
+                // For gRPC workers, dp_size is present in discovered_labels
+                // after DiscoverMetadataStep
+                let dp_size = context.data.discovered_labels.dp_size;
+                let modle_id = context.data.discovered_labels.served_model_name;
+                DpInfo { dp_size, model_id }
+            }
+        };
+
         let dp_info = get_dp_info(&config.url, config.api_key.as_deref())
             .await
             .map_err(|e| WorkflowError::StepFailed {

@@ -359,9 +359,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_connector = kv_transfer_config.kv_connector or ""
             kv_role = kv_transfer_config.kv_role or ""
 
+        parallel_config = self.async_llm.vllm_config.parallel_config
+        data_parallel_size = parallel_config.data_parallel_size
+        tensor_parallel_size = parallel_config.tensor_parallel_size
+        pipeline_parallel_size = parallel_config.pipeline_parallel_size
+
         return vllm_engine_pb2.GetServerInfoResponse(
             kv_connector=kv_connector,
             kv_role=kv_role,
+            data_parallel_size=data_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
         )
 
     async def GetTokenizer(
