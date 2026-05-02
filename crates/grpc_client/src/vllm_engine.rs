@@ -870,6 +870,7 @@ mod tests {
             stream: false,
             kv_transfer_params: None,
             mm_inputs: None,
+            data_parallel_rank: 0,
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");
