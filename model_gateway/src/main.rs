@@ -237,6 +237,10 @@ struct CliArgs {
     #[arg(long, default_value_t = 10, help_heading = "Load Monitoring")]
     load_monitor_interval: u64,
 
+    /// Maximum accepted age for pushed engine stats snapshots in milliseconds (0 disables)
+    #[arg(long, default_value_t = 0, help_heading = "Load Monitoring")]
+    engine_stats_staleness_threshold_ms: u64,
+
     // ==================== Service Discovery (Kubernetes) ====================
     /// Enable Kubernetes service discovery
     #[arg(
@@ -1207,6 +1211,7 @@ impl CliArgs {
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
             .worker_startup_check_interval_secs(self.worker_startup_check_interval)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .engine_stats_staleness_threshold_ms(self.engine_stats_staleness_threshold_ms)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)

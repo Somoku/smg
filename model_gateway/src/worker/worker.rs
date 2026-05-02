@@ -11,6 +11,7 @@ use std::{
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use axum::body::Body;
+use chrono::Utc;
 // Re-export protocol types as the canonical types for the gateway
 pub use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerType};
 use openai_protocol::{
@@ -20,7 +21,10 @@ use openai_protocol::{
 };
 use tokio::{sync::OnceCell, time};
 
-use super::{CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID};
+use super::{
+    CircuitBreaker, EngineStats, EngineStatsUpdateOutcome, ResolvedResilience, WorkerError,
+    WorkerResult, UNKNOWN_MODEL_ID,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{common::header_utils::extract_routing_key, grpc::client::GrpcClient},
@@ -185,6 +189,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the current load (number of active requests)
     fn load(&self) -> usize;
+
+    /// Get the latest engine-reported scheduler stats.
+    /// Returns an all-zero snapshot until the worker pushes stats.
+    fn engine_stats(&self) -> EngineStats {
+        EngineStats::default()
+    }
+
+    /// Update engine stats with timestamp parsing, age, and monotonicity checks.
+    fn update_engine_stats(
+        &self,
+        _stats: EngineStats,
+        _snapshot_staleness_threshold_ms: u64,
+    ) -> EngineStatsUpdateOutcome {
+        EngineStatsUpdateOutcome::Rejected {
+            reason: "worker does not support stats updates".to_string(),
+        }
+    }
 
     /// Increment the load counter
     fn increment_load(&self);
@@ -569,6 +590,9 @@ pub struct WorkerRuntime {
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
+    engine_stats: ArcSwap<EngineStats>,
+    engine_stats_timestamp_ms: AtomicU64,
+    engine_stats_update_lock: parking_lot::Mutex<()>,
 }
 
 impl WorkerRuntime {
@@ -582,6 +606,9 @@ impl WorkerRuntime {
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
+            engine_stats: ArcSwap::from_pointee(EngineStats::default()),
+            engine_stats_timestamp_ms: AtomicU64::new(0),
+            engine_stats_update_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -675,6 +702,53 @@ impl WorkerRuntime {
 
     pub fn increment_processed(&self) {
         self.processed_counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── Engine stats ────────────────────────────────────────────────
+
+    pub fn engine_stats(&self) -> EngineStats {
+        self.engine_stats.load().as_ref().clone()
+    }
+
+    pub fn update_engine_stats(
+        &self,
+        stats: EngineStats,
+        snapshot_staleness_threshold_ms: u64,
+    ) -> EngineStatsUpdateOutcome {
+        let now = Utc::now();
+        let snapshot_ts_ms = stats.timestamp.timestamp_millis().max(0) as u64;
+
+        if snapshot_staleness_threshold_ms > 0 {
+            let age_ms = now
+                .signed_duration_since(stats.timestamp)
+                .num_milliseconds();
+            if age_ms > snapshot_staleness_threshold_ms as i64 {
+                return EngineStatsUpdateOutcome::Stale {
+                    reason: format!(
+                        "snapshot timestamp {snapshot_ts_ms}ms is older than threshold \
+                         ({snapshot_staleness_threshold_ms}ms, now={}ms)",
+                        now.timestamp_millis().max(0)
+                    ),
+                };
+            }
+        }
+
+        let _guard = self.engine_stats_update_lock.lock();
+        let current_snapshot_ms = self.engine_stats_timestamp_ms.load(Ordering::Acquire);
+        if current_snapshot_ms > 0 && snapshot_ts_ms < current_snapshot_ms {
+            return EngineStatsUpdateOutcome::Stale {
+                reason: format!(
+                    "incoming snapshot ({snapshot_ts_ms}ms) is older than current \
+                     ({current_snapshot_ms}ms)"
+                ),
+            };
+        }
+
+        self.engine_stats.store(Arc::new(stats));
+        self.engine_stats_timestamp_ms
+            .store(snapshot_ts_ms, Ordering::Release);
+
+        EngineStatsUpdateOutcome::Applied
     }
 }
 
@@ -841,6 +915,20 @@ impl Worker for BasicWorker {
 
     fn load(&self) -> usize {
         self.runtime.load().load()
+    }
+
+    fn engine_stats(&self) -> EngineStats {
+        self.runtime.load().engine_stats()
+    }
+
+    fn update_engine_stats(
+        &self,
+        stats: EngineStats,
+        snapshot_staleness_threshold_ms: u64,
+    ) -> EngineStatsUpdateOutcome {
+        self.runtime
+            .load()
+            .update_engine_stats(stats, snapshot_staleness_threshold_ms)
     }
 
     fn increment_load(&self) {

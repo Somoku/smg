@@ -82,30 +82,42 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverDPInfoStep {
 
         debug!("Discovering DP info for {} (DP-aware)", config.url);
 
+        let connection_mode = context
+            .data
+            .connection_mode
+            .ok_or_else(|| WorkflowError::ContextValueNotFound("connection_mode".to_string()))?;
+
         let dp_info = match connection_mode {
-            ConnectionMode::Http => {
-                get_dp_info(&config.url, config.api_key.as_deref())
-                    .await
-                    .map_err(|e| WorkflowError::StepFailed {
-                        step_id: StepId::new("discover_dp_info"),
-                        message: format!("Failed to get DP info: {e}"),
-                    })?
-            }
+            ConnectionMode::Http => get_dp_info(&config.url, config.api_key.as_deref())
+                .await
+                .map_err(|e| WorkflowError::StepFailed {
+                    step_id: StepId::new("discover_dp_info"),
+                    message: format!("Failed to get DP info: {e}"),
+                })?,
             ConnectionMode::Grpc => {
                 // For gRPC workers, dp_size is present in discovered_labels
                 // after DiscoverMetadataStep
-                let dp_size = context.data.discovered_labels.dp_size;
-                let modle_id = context.data.discovered_labels.served_model_name;
+                let dp_size = context
+                    .data
+                    .discovered_labels
+                    .get("dp_size")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .ok_or_else(|| WorkflowError::StepFailed {
+                        step_id: StepId::new("discover_dp_info"),
+                        message: "Missing or invalid dp_size in discovered labels".to_string(),
+                    })?;
+                let model_id = context
+                    .data
+                    .discovered_labels
+                    .get("served_model_name")
+                    .or_else(|| context.data.discovered_labels.get("model_id"))
+                    .map(String::as_str)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(UNKNOWN_MODEL_ID)
+                    .to_string();
                 DpInfo { dp_size, model_id }
             }
         };
-
-        let dp_info = get_dp_info(&config.url, config.api_key.as_deref())
-            .await
-            .map_err(|e| WorkflowError::StepFailed {
-                step_id: StepId::new("discover_dp_info"),
-                message: format!("Failed to get DP info: {e}"),
-            })?;
 
         debug!(
             "Discovered DP size {} for {} (model: {})",

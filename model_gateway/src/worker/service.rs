@@ -17,7 +17,11 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
-    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry},
+    worker::{
+        registry::WorkerId, worker::worker_to_info, EngineStatsUpdateOutcome, Worker,
+        WorkerRegistry, WorkerStatsUpdateRequest, WorkerStatsUpdateRequestItem,
+        WorkerStatsUpdateResult, WorkerStatsUpdateResultItem,
+    },
     workflow::{Job, JobQueue},
 };
 
@@ -433,5 +437,151 @@ impl WorkerService {
             .map_err(|e| WorkerServiceError::QueueSubmitFailed { message: e })?;
 
         Ok(UpdateWorkerResult { worker_id, url })
+    }
+
+    pub async fn update_worker_stats(
+        &self,
+        update: WorkerStatsUpdateRequest,
+    ) -> WorkerStatsUpdateResult {
+        let update_num = update.updates.len();
+        let mut results = Vec::with_capacity(update_num);
+        let staleness_threshold_ms = self.router_config.engine_stats_staleness_threshold_ms;
+
+        // Process each update
+        for item in update.updates {
+            match self.resolve_worker_for_stats(&item) {
+                Ok((worker_id, worker)) => {
+                    let url = worker.url().to_string();
+                    let dp_rank = item.dp_rank;
+                    let outcome = worker.update_engine_stats(item.stats, staleness_threshold_ms);
+                    results.push(Self::build_stats_update_result(
+                        &worker_id, url, dp_rank, outcome,
+                    ));
+                }
+                Err(err) => {
+                    results.push(WorkerStatsUpdateResultItem {
+                        status: "rejected".to_string(),
+                        worker_id: item.worker_id,
+                        url: String::new(),
+                        applied: false,
+                        dp_rank: item.dp_rank,
+                        stale_reason: Some(err.to_string()),
+                    });
+                }
+            }
+        }
+
+        // Count the results
+        let updated = results.iter().filter(|r| r.status == "updated").count();
+        let stale_ignored = results
+            .iter()
+            .filter(|r| r.status == "stale_ignored")
+            .count();
+        let rejected = results.iter().filter(|r| r.status == "rejected").count();
+
+        WorkerStatsUpdateResult {
+            total: update_num,
+            updated,
+            stale_ignored,
+            rejected,
+            results,
+        }
+    }
+
+    fn resolve_worker_for_stats(
+        &self,
+        item: &WorkerStatsUpdateRequestItem,
+    ) -> Result<(WorkerId, Arc<dyn Worker>), WorkerServiceError> {
+        let worker_id = Self::parse_worker_id(&item.worker_id)?;
+        let Some(dp_rank) = item.dp_rank else {
+            let worker = self.worker_registry.get(&worker_id).ok_or_else(|| {
+                WorkerServiceError::NotFound {
+                    worker_id: item.worker_id.clone(),
+                }
+            })?;
+            if worker.is_dp_aware() {
+                return Err(WorkerServiceError::BadRequest {
+                    message: format!(
+                        "worker_id '{}' points to a DP worker; include the base worker_id and dp_rank instead",
+                        item.worker_id
+                    ),
+                });
+            }
+            return Ok((worker_id, worker));
+        };
+
+        if self
+            .worker_registry
+            .get(&worker_id)
+            .is_some_and(|worker| worker.is_dp_aware())
+        {
+            return Err(WorkerServiceError::BadRequest {
+                message: format!(
+                    "worker_id '{}' points to a DP worker; use the base worker_id with dp_rank",
+                    item.worker_id
+                ),
+            });
+        }
+
+        let base_url = self
+            .worker_registry
+            .get_url_by_id(&worker_id)
+            .ok_or_else(|| WorkerServiceError::NotFound {
+                worker_id: item.worker_id.clone(),
+            })?;
+        let target_url = format!("{base_url}@{dp_rank}");
+        let target_id = self
+            .worker_registry
+            .get_id_by_url(&target_url)
+            .ok_or_else(|| WorkerServiceError::NotFound {
+                worker_id: format!("{}@{dp_rank}", item.worker_id),
+            })?;
+        let worker =
+            self.worker_registry
+                .get(&target_id)
+                .ok_or_else(|| WorkerServiceError::NotFound {
+                    worker_id: target_id.as_str().to_string(),
+                })?;
+        if worker.dp_rank() != Some(dp_rank) {
+            return Err(WorkerServiceError::BadRequest {
+                message: format!("worker at URL '{}' is not DP rank {dp_rank}", worker.url()),
+            });
+        }
+
+        Ok((target_id, worker))
+    }
+
+    fn build_stats_update_result(
+        worker_id: &WorkerId,
+        url: String,
+        dp_rank: Option<usize>,
+        outcome: EngineStatsUpdateOutcome,
+    ) -> WorkerStatsUpdateResultItem {
+        match outcome {
+            EngineStatsUpdateOutcome::Applied => WorkerStatsUpdateResultItem {
+                status: "updated".to_string(),
+                worker_id: worker_id.as_str().to_string(),
+                url,
+                applied: true,
+                dp_rank,
+                stale_reason: None,
+            },
+            EngineStatsUpdateOutcome::Stale { reason } => WorkerStatsUpdateResultItem {
+                status: "stale_ignored".to_string(),
+                worker_id: worker_id.as_str().to_string(),
+                url,
+                applied: false,
+                dp_rank,
+                stale_reason: Some(reason),
+            },
+            EngineStatsUpdateOutcome::Rejected { reason } => WorkerStatsUpdateResultItem {
+                status: "rejected".to_string(),
+                worker_id: worker_id.as_str().to_string(),
+                url,
+                applied: false,
+                dp_rank,
+                stale_reason: Some(reason),
+            },
+        }
     }
 }

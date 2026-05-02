@@ -198,6 +198,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn engine_stats_staleness_threshold_ms(mut self, threshold_ms: u64) -> Self {
+        self.config.engine_stats_staleness_threshold_ms = threshold_ms;
+        self
+    }
+
     // ==================== Rate Limiting ====================
 
     pub fn max_concurrent_requests(mut self, max: i32) -> Self {

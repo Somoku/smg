@@ -171,6 +171,14 @@ impl WorkerRegistry {
         self.url_to_id.get(url).and_then(|id| self.get(&id))
     }
 
+    /// Return the worker ID currently associated with a URL.
+    ///
+    /// This also sees pre-reserved IDs that do not have a live worker yet,
+    /// so callers that need a live worker should pair it with [`Self::get`].
+    pub fn get_id_by_url(&self, url: &str) -> Option<WorkerId> {
+        self.url_to_id.get(url).map(|entry| entry.clone())
+    }
+
     /// Reverse-lookup the URL for a given worker ID.
     ///
     /// Prefers the URL stored on the live worker object; falls back to

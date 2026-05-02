@@ -116,6 +116,9 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
+    /// Staleness threshold for engine stats updates
+    #[serde(default)]
+    pub engine_stats_staleness_threshold_ms: u64,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -650,6 +653,7 @@ impl Default for RouterConfig {
             queue_size: 100,
             queue_timeout_secs: 60,
             rate_limit_tokens_per_second: None,
+            engine_stats_staleness_threshold_ms: 0,
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
