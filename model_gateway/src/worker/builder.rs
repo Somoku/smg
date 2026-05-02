@@ -283,7 +283,12 @@ impl BasicWorkerBuilder {
 
         let resilience = self.resilience.unwrap_or_default();
 
-        let dyn_weight_version = metadata.spec.labels.get("weight_version").and_then(|value| value.parse::<u64>().ok()).unwrap_or(0);
+        let dyn_weight_version = metadata
+            .spec
+            .labels
+            .get("weight_version")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
 
         BasicWorker {
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(

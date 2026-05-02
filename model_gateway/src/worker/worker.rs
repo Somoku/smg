@@ -2,7 +2,7 @@ use std::{
     any::Any,
     fmt,
     sync::{
-        atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -233,11 +233,26 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Get the runtime weight version used for dispatch metadata.
     fn dyn_weight_version(&self) -> u64 {
-        dyn_weight_version_from_labels(&self.metadata().spec.labels)
+        self.metadata()
+            .spec
+            .labels
+            .get("weight_version")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
     }
 
     /// Update the runtime weight version.
     fn update_dyn_weight_version(&self, _weight_version: u64) -> bool {
+        false
+    }
+
+    /// Check if this worker is administratively paused from new routing decisions.
+    fn is_paused(&self) -> bool {
+        false
+    }
+
+    /// Set the administrative pause state for this worker.
+    fn set_paused(&self, _paused: bool) -> bool {
         false
     }
 
@@ -250,9 +265,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Record a request outcome against the circuit breaker.
     fn record_circuit_breaker_outcome(&self, success: bool);
 
-    /// Check if the worker is available (healthy + circuit closed/half-open)
+    /// Check if the worker is available (not paused + healthy + circuit closed/half-open)
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute()
+        !self.is_paused() && self.is_healthy() && self.circuit_breaker_can_execute()
     }
 
     /// Record the outcome of a request based on the HTTP status code.
@@ -604,6 +619,7 @@ pub struct WorkerRuntime {
     engine_stats_timestamp_ms: AtomicU64,
     engine_stats_update_lock: parking_lot::Mutex<()>,
     dyn_weight_version: AtomicU64,
+    paused: AtomicBool,
 }
 
 impl WorkerRuntime {
@@ -621,6 +637,7 @@ impl WorkerRuntime {
             engine_stats_timestamp_ms: AtomicU64::new(0),
             engine_stats_update_lock: parking_lot::Mutex::new(()),
             dyn_weight_version: AtomicU64::new(dyn_weight_version),
+            paused: AtomicBool::new(false),
         }
     }
 
@@ -770,6 +787,14 @@ impl WorkerRuntime {
     pub fn set_dyn_weight_version(&self, weight_version: u64) {
         self.dyn_weight_version
             .store(weight_version, Ordering::Release);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
     }
 }
 
@@ -948,6 +973,15 @@ impl Worker for BasicWorker {
 
     fn update_dyn_weight_version(&self, weight_version: u64) -> bool {
         self.runtime.load().set_dyn_weight_version(weight_version);
+        true
+    }
+
+    fn is_paused(&self) -> bool {
+        self.runtime.load().is_paused()
+    }
+
+    fn set_paused(&self, paused: bool) -> bool {
+        self.runtime.load().set_paused(paused);
         true
     }
 
@@ -1283,7 +1317,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 
 #[cfg(test)]
 mod tests {
-    use std::{thread, time::Duration};
+    use std::{collections::HashMap, thread, time::Duration};
 
     use openai_protocol::worker::HealthCheckConfig;
 
@@ -1366,7 +1400,7 @@ mod tests {
 
     #[test]
     fn test_worker_with_labels() {
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("env".to_string(), "prod".to_string());
         labels.insert("zone".to_string(), "us-west".to_string());
 
@@ -1406,6 +1440,32 @@ mod tests {
             .health_config(no_health_check())
             .build();
         assert_eq!(invalid.dyn_weight_version(), 0);
+    }
+
+    #[test]
+    fn test_worker_pause_defaults_to_false() {
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .health_config(no_health_check())
+            .build();
+
+        assert!(!worker.is_paused());
+        assert!(worker.is_available());
+    }
+
+    #[test]
+    fn test_worker_pause_excludes_from_availability_without_changing_health() {
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .health_config(no_health_check())
+            .build();
+
+        assert!(worker.set_paused(true));
+        assert!(worker.is_paused());
+        assert!(worker.is_healthy());
+        assert!(!worker.is_available());
+
+        assert!(worker.set_paused(false));
+        assert!(!worker.is_paused());
+        assert!(worker.is_available());
     }
 
     #[test]

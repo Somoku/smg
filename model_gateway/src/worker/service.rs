@@ -4,7 +4,7 @@
 //! and business logic for worker management. The service orchestrates
 //! WorkerRegistry and JobQueue operations.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use axum::{
     http::StatusCode,
@@ -19,8 +19,9 @@ use crate::{
     config::RouterConfig,
     worker::{
         registry::WorkerId, worker::worker_to_info, EngineStatsUpdateOutcome, Worker,
-        WorkerRegistry, WorkerStatsUpdateRequest, WorkerStatsUpdateResult,
-        WorkerStatsUpdateResultItem,
+        WorkerRegistry, WorkerRoutingControlRequest, WorkerRoutingControlResult,
+        WorkerRoutingControlResultItem, WorkerRoutingControlTargetRequest,
+        WorkerStatsUpdateRequest, WorkerStatsUpdateResult, WorkerStatsUpdateResultItem,
         WorkerWeightVersionUpdateRequest, WorkerWeightVersionUpdateResult,
         WorkerWeightVersionUpdateResultItem,
     },
@@ -445,8 +446,8 @@ impl WorkerService {
         &self,
         update: WorkerStatsUpdateRequest,
     ) -> WorkerStatsUpdateResult {
-        let update_num = update.updates.len();
-        let mut results = Vec::with_capacity(update_num);
+        let total = update.updates.len();
+        let mut results = Vec::with_capacity(total);
         let staleness_threshold_ms = self.router_config.engine_stats_staleness_threshold_ms;
 
         // Process each update
@@ -482,7 +483,7 @@ impl WorkerService {
         let rejected = results.iter().filter(|r| r.status == "rejected").count();
 
         WorkerStatsUpdateResult {
-            total: update_num,
+            total,
             updated,
             stale_ignored,
             rejected,
@@ -494,8 +495,8 @@ impl WorkerService {
         &self,
         update: WorkerWeightVersionUpdateRequest,
     ) -> WorkerWeightVersionUpdateResult {
-        let update_num = update.updates.len();
-        let mut results = Vec::with_capacity(update_num);
+        let total = update.updates.len();
+        let mut results = Vec::with_capacity(total);
 
         // Process each update
         for item in update.updates {
@@ -543,10 +544,166 @@ impl WorkerService {
         let rejected = results.iter().filter(|r| r.status == "rejected").count();
 
         WorkerWeightVersionUpdateResult {
-            update_num,
+            total,
             updated,
             rejected,
             results,
+        }
+    }
+
+    pub fn pause_workers(&self, update: WorkerRoutingControlRequest) -> WorkerRoutingControlResult {
+        self.apply_worker_routing_control(update, true)
+    }
+
+    pub fn resume_workers(
+        &self,
+        update: WorkerRoutingControlRequest,
+    ) -> WorkerRoutingControlResult {
+        self.apply_worker_routing_control(update, false)
+    }
+
+    fn apply_worker_routing_control(
+        &self,
+        update: WorkerRoutingControlRequest,
+        paused: bool,
+    ) -> WorkerRoutingControlResult {
+        let mut results = Vec::new();
+        let mut seen_worker_ids = HashSet::new();
+
+        for target in update {
+            let base_worker_id = target.base_worker_id.clone();
+            let requested_ranks = target
+                .dp_rank
+                .as_ref()
+                .and_then(|input| input.to_ranks().ok());
+
+            match self.resolve_routing_control_target(&target) {
+                Ok(workers) => {
+                    for (worker_id, worker) in workers {
+                        if !seen_worker_ids.insert(worker_id.as_str().to_string()) {
+                            continue;
+                        }
+
+                        let updated = worker.set_paused(paused);
+                        results.push(WorkerRoutingControlResultItem {
+                            status: if updated { "updated" } else { "rejected" }.to_string(),
+                            worker_id: worker_id.as_str().to_string(),
+                            url: worker.url().to_string(),
+                            paused: worker.is_paused(),
+                            base_worker_id: base_worker_id.clone(),
+                            dp_rank: worker.dp_rank().or_else(|| {
+                                requested_ranks
+                                    .as_ref()
+                                    .and_then(|ranks| (ranks.len() == 1).then_some(ranks[0]))
+                            }),
+                            reason: (!updated)
+                                .then(|| "worker does not support routing pause state".to_string()),
+                        });
+                    }
+                }
+                Err(err) => {
+                    results.push(WorkerRoutingControlResultItem {
+                        status: "rejected".to_string(),
+                        worker_id: target
+                            .worker_id
+                            .or_else(|| target.base_worker_id.clone())
+                            .unwrap_or_default(),
+                        url: String::new(),
+                        paused,
+                        base_worker_id: target.base_worker_id,
+                        dp_rank: requested_ranks
+                            .as_ref()
+                            .and_then(|ranks| (ranks.len() == 1).then_some(ranks[0])),
+                        reason: Some(err.to_string()),
+                    });
+                }
+            }
+        }
+
+        let updated = results.iter().filter(|r| r.status == "updated").count();
+        let rejected = results.iter().filter(|r| r.status == "rejected").count();
+
+        WorkerRoutingControlResult {
+            action: if paused { "paused" } else { "resumed" }.to_string(),
+            total: results.len(),
+            updated,
+            rejected,
+            results,
+        }
+    }
+
+    fn resolve_routing_control_target(
+        &self,
+        target: &WorkerRoutingControlTargetRequest,
+    ) -> Result<Vec<(WorkerId, Arc<dyn Worker>)>, WorkerServiceError> {
+        match (
+            target.worker_id.as_deref(),
+            target.base_worker_id.as_deref(),
+            target.dp_rank.as_ref(),
+        ) {
+            (Some(worker_id_raw), None, None) => {
+                let worker_id = Self::parse_worker_id(worker_id_raw)?;
+                let worker = self.worker_registry.get(&worker_id).ok_or_else(|| {
+                    WorkerServiceError::NotFound {
+                        worker_id: worker_id_raw.to_string(),
+                    }
+                })?;
+                Ok(vec![(worker_id, worker)])
+            }
+            (Some(base_worker_id_raw), None, Some(dp_rank_input)) => {
+                let ranks = dp_rank_input
+                    .to_ranks()
+                    .map_err(|message| WorkerServiceError::BadRequest { message })?;
+                ranks
+                    .into_iter()
+                    .map(|rank| self.resolve_worker_by_id_and_dp(base_worker_id_raw, Some(rank)))
+                    .collect()
+            }
+            (None, Some(base_worker_id_raw), None) => {
+                let base_worker_id = Self::parse_worker_id(base_worker_id_raw)?;
+                let base_url = self
+                    .worker_registry
+                    .get_url_by_id(&base_worker_id)
+                    .ok_or_else(|| WorkerServiceError::NotFound {
+                        worker_id: base_worker_id_raw.to_string(),
+                    })?;
+                let prefix = format!("{base_url}@");
+
+                let mut workers: Vec<_> = self
+                    .worker_registry
+                    .get_all_with_ids()
+                    .into_iter()
+                    .filter(|(_, worker)| worker.url().starts_with(&prefix))
+                    .collect();
+
+                if workers.is_empty() {
+                    if let Some(worker) = self.worker_registry.get_by_url(&base_url) {
+                        workers.push((base_worker_id, worker));
+                    }
+                }
+
+                if workers.is_empty() {
+                    return Err(WorkerServiceError::NotFound {
+                        worker_id: base_worker_id_raw.to_string(),
+                    });
+                }
+
+                Ok(workers)
+            }
+            (None, Some(base_worker_id_raw), Some(dp_rank_input)) => {
+                let ranks = dp_rank_input
+                    .to_ranks()
+                    .map_err(|message| WorkerServiceError::BadRequest { message })?;
+                ranks
+                    .into_iter()
+                    .map(|rank| self.resolve_worker_by_id_and_dp(base_worker_id_raw, Some(rank)))
+                    .collect()
+            }
+            _ => Err(WorkerServiceError::BadRequest {
+                message: "target must specify one mode: worker_id, worker_id with dp_rank, \
+                     base_worker_id, or base_worker_id with dp_rank"
+                    .to_string(),
+            }),
         }
     }
 

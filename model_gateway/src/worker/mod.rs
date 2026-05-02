@@ -12,6 +12,7 @@ pub mod metrics_aggregator;
 pub mod monitor;
 pub mod registry;
 pub mod resilience;
+pub mod routing_control;
 pub mod service;
 pub mod stats;
 pub mod weight_version;
@@ -42,6 +43,10 @@ pub use openai_protocol::{
 };
 pub use registry::WorkerRegistry;
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
+pub use routing_control::{
+    DpRankInput, WorkerRoutingControlRequest, WorkerRoutingControlResult,
+    WorkerRoutingControlResultItem, WorkerRoutingControlTargetRequest,
+};
 pub use service::WorkerService;
 pub use stats::{
     EngineSchedulerStats, EngineStats, EngineStatsUpdateOutcome, WorkerStatsUpdateRequest,
@@ -50,7 +55,7 @@ pub use stats::{
 pub use weight_version::{
     WorkerWeightVersionUpdateRequest, WorkerWeightVersionUpdateRequestItem,
     WorkerWeightVersionUpdateResult, WorkerWeightVersionUpdateResultItem,
-}
+};
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
     DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,

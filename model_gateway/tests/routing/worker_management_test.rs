@@ -92,10 +92,41 @@ mod worker_management_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    async fn post_worker_routing_control(
+        app: axum::Router,
+        uri: &str,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     fn ready_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    fn ready_dp_worker(base_url: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(base_url)
+                .worker_type(WorkerType::Regular)
+                .dp_config(rank, size)
                 .health_config(HealthCheckConfig {
                     disable_health_check: true,
                     ..Default::default()
@@ -400,6 +431,206 @@ mod worker_management_tests {
 
         assert_eq!(body["updated"], 0);
         assert_eq!(body["rejected"], 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pause_workers_sets_pause_state_and_excludes_from_availability() {
+        let config = TestRouterConfig::round_robin(3909);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let worker = ready_worker("http://worker-pause:8080");
+        let worker_id = ctx
+            .app_context
+            .worker_registry
+            .register(worker.clone())
+            .unwrap();
+
+        let body = post_worker_routing_control(
+            app,
+            "/workers/pause",
+            json!([{ "worker_id": worker_id.as_str() }]),
+        )
+        .await;
+
+        assert_eq!(body["action"], "paused");
+        assert_eq!(body["updated"], 1);
+        assert_eq!(body["rejected"], 0);
+        assert_eq!(body["results"][0]["paused"], true);
+        assert!(worker.is_paused());
+        assert!(worker.is_healthy());
+        assert!(!worker.is_available());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_resume_workers_clears_pause_state() {
+        let config = TestRouterConfig::round_robin(3910);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let worker = ready_worker("http://worker-resume:8080");
+        let worker_id = ctx
+            .app_context
+            .worker_registry
+            .register(worker.clone())
+            .unwrap();
+
+        post_worker_routing_control(
+            app.clone(),
+            "/workers/pause",
+            json!([{ "worker_id": worker_id.as_str() }]),
+        )
+        .await;
+        let body = post_worker_routing_control(
+            app,
+            "/workers/resume",
+            json!([{ "worker_id": worker_id.as_str() }]),
+        )
+        .await;
+
+        assert_eq!(body["action"], "resumed");
+        assert_eq!(body["updated"], 1);
+        assert_eq!(body["results"][0]["paused"], false);
+        assert!(!worker.is_paused());
+        assert!(worker.is_available());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pause_workers_deduplicates_repeated_targets() {
+        let config = TestRouterConfig::round_robin(3911);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let worker = ready_worker("http://worker-pause-dedup:8080");
+        let worker_id = ctx.app_context.worker_registry.register(worker).unwrap();
+
+        let body = post_worker_routing_control(
+            app,
+            "/workers/pause",
+            json!([
+                { "worker_id": worker_id.as_str() },
+                { "worker_id": worker_id.as_str() }
+            ]),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 1);
+        assert_eq!(body["rejected"], 0);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pause_workers_rejects_missing_worker() {
+        let config = TestRouterConfig::round_robin(3912);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let body = post_worker_routing_control(
+            app,
+            "/workers/pause",
+            json!([{ "worker_id": "00000000-0000-0000-0000-000000000001" }]),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 0);
+        assert_eq!(body["rejected"], 1);
+        assert_eq!(body["results"][0]["status"], "rejected");
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pause_workers_can_target_all_dp_workers_by_base_id() {
+        let config = TestRouterConfig::round_robin(3913);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let base = ready_worker("http://worker-pause-dp:8080");
+        let base_id = ctx
+            .app_context
+            .worker_registry
+            .register(base.clone())
+            .unwrap();
+        let dp0 = ready_dp_worker("http://worker-pause-dp:8080", 0, 2);
+        let dp1 = ready_dp_worker("http://worker-pause-dp:8080", 1, 2);
+        let dp0_id = ctx
+            .app_context
+            .worker_registry
+            .register(dp0.clone())
+            .unwrap();
+        let dp1_id = ctx
+            .app_context
+            .worker_registry
+            .register(dp1.clone())
+            .unwrap();
+
+        let body = post_worker_routing_control(
+            app,
+            "/workers/pause",
+            json!([{ "base_worker_id": base_id.as_str() }]),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 2);
+        assert!(ctx
+            .app_context
+            .worker_registry
+            .get(&dp0_id)
+            .unwrap()
+            .is_paused());
+        assert!(ctx
+            .app_context
+            .worker_registry
+            .get(&dp1_id)
+            .unwrap()
+            .is_paused());
+        assert!(!base.is_paused());
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pause_workers_can_target_selected_dp_ranks() {
+        let config = TestRouterConfig::round_robin(3914);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let base = ready_worker("http://worker-pause-selected-dp:8080");
+        let base_id = ctx.app_context.worker_registry.register(base).unwrap();
+        let dp0 = ready_dp_worker("http://worker-pause-selected-dp:8080", 0, 3);
+        let dp1 = ready_dp_worker("http://worker-pause-selected-dp:8080", 1, 3);
+        let dp2 = ready_dp_worker("http://worker-pause-selected-dp:8080", 2, 3);
+        ctx.app_context
+            .worker_registry
+            .register(dp0.clone())
+            .unwrap();
+        ctx.app_context
+            .worker_registry
+            .register(dp1.clone())
+            .unwrap();
+        ctx.app_context
+            .worker_registry
+            .register(dp2.clone())
+            .unwrap();
+
+        let body = post_worker_routing_control(
+            app,
+            "/workers/pause",
+            json!([{ "base_worker_id": base_id.as_str(), "dp_rank": [2, 0, 2] }]),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 2);
+        assert!(dp0.is_paused());
+        assert!(!dp1.is_paused());
+        assert!(dp2.is_paused());
 
         ctx.shutdown().await;
     }
