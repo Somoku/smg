@@ -290,6 +290,7 @@ impl VllmEngineClient {
             stream: body.stream,
             kv_transfer_params: None,
             mm_inputs,
+            data_parallel_rank: 0,
         };
 
         Ok(grpc_request)
@@ -322,6 +323,7 @@ impl VllmEngineClient {
             stream: body.stream,
             kv_transfer_params: None,
             mm_inputs: None,
+            data_parallel_rank: 0,
         };
 
         Ok(grpc_request)
@@ -358,6 +360,7 @@ impl VllmEngineClient {
             stream: body.stream.unwrap_or(false),
             kv_transfer_params: None,
             mm_inputs: None,
+            data_parallel_rank: 0,
         };
 
         Ok(grpc_request)
@@ -562,6 +565,7 @@ impl VllmEngineClient {
             stream: body.stream.unwrap_or(false),
             kv_transfer_params: None,
             mm_inputs: multimodal_inputs,
+            data_parallel_rank: 0,
         };
 
         Ok(grpc_request)
@@ -624,6 +628,7 @@ impl VllmEngineClient {
             stream: body.stream,
             kv_transfer_params: None,
             mm_inputs: None,
+            data_parallel_rank: 0,
         };
 
         Ok(grpc_request)
