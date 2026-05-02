@@ -43,7 +43,7 @@ mod worker_management_tests {
         if let Some(dp_rank) = dp_rank {
             update["dp_rank"] = json!(dp_rank);
         }
-        json!({ "updates": [update] })
+        json!([update])
     }
 
     async fn post_worker_stats(app: axum::Router, payload: serde_json::Value) -> serde_json::Value {
@@ -72,7 +72,7 @@ mod worker_management_tests {
         if let Some(dp_rank) = dp_rank {
             update["dp_rank"] = json!(dp_rank);
         }
-        json!({ "updates": [update] })
+        json!([update])
     }
 
     async fn post_worker_weight_version(

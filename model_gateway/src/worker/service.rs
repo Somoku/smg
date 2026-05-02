@@ -446,12 +446,12 @@ impl WorkerService {
         &self,
         update: WorkerStatsUpdateRequest,
     ) -> WorkerStatsUpdateResult {
-        let total = update.updates.len();
+        let total = update.len();
         let mut results = Vec::with_capacity(total);
         let staleness_threshold_ms = self.router_config.engine_stats_staleness_threshold_ms;
 
         // Process each update
-        for item in update.updates {
+        for item in update {
             match self.resolve_worker_by_id_and_dp(&item.worker_id, item.dp_rank) {
                 Ok((worker_id, worker)) => {
                     let url = worker.url().to_string();
@@ -495,11 +495,11 @@ impl WorkerService {
         &self,
         update: WorkerWeightVersionUpdateRequest,
     ) -> WorkerWeightVersionUpdateResult {
-        let total = update.updates.len();
+        let total = update.len();
         let mut results = Vec::with_capacity(total);
 
         // Process each update
-        for item in update.updates {
+        for item in update {
             let weight_version = item.weight_version;
             match self.resolve_worker_by_id_and_dp(&item.worker_id, item.dp_rank) {
                 Ok((worker_id, worker)) => {

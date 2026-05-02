@@ -4,11 +4,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Batch request body for `POST /workers/update_weight_version`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkerWeightVersionUpdateRequest {
-    pub updates: Vec<WorkerWeightVersionUpdateRequestItem>,
-}
+/// Request body for `POST /workers/update_weight_version`.
+pub type WorkerWeightVersionUpdateRequest = Vec<WorkerWeightVersionUpdateRequestItem>;
 
 /// Single runtime weight version update targeting a worker.
 #[derive(Debug, Clone, Deserialize)]

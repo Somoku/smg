@@ -92,10 +92,8 @@ pub enum EngineStatsUpdateOutcome {
     Rejected { reason: String },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkerStatsUpdateRequest {
-    pub updates: Vec<WorkerStatsUpdateRequestItem>,
-}
+/// Request body for `POST /workers/update_stats`.
+pub type WorkerStatsUpdateRequest = Vec<WorkerStatsUpdateRequestItem>;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkerStatsUpdateRequestItem {
