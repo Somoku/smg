@@ -231,6 +231,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
+    /// Get the runtime weight version used for dispatch metadata.
+    fn dyn_weight_version(&self) -> u64 {
+        dyn_weight_version_from_labels(&self.metadata().spec.labels)
+    }
+
+    /// Update the runtime weight version.
+    fn update_dyn_weight_version(&self, _weight_version: u64) -> bool {
+        false
+    }
+
     /// Get the current circuit breaker state for observability/debugging.
     fn circuit_breaker_state(&self) -> super::circuit_breaker::CircuitState;
 
@@ -593,10 +603,11 @@ pub struct WorkerRuntime {
     engine_stats: ArcSwap<EngineStats>,
     engine_stats_timestamp_ms: AtomicU64,
     engine_stats_update_lock: parking_lot::Mutex<()>,
+    dyn_weight_version: AtomicU64,
 }
 
 impl WorkerRuntime {
-    pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
+    pub fn new(url: &str, initial_status: WorkerStatus, dyn_weight_version: u64) -> Self {
         Self {
             status: AtomicU8::new(initial_status as u8),
             consecutive_failures: AtomicUsize::new(0),
@@ -609,6 +620,7 @@ impl WorkerRuntime {
             engine_stats: ArcSwap::from_pointee(EngineStats::default()),
             engine_stats_timestamp_ms: AtomicU64::new(0),
             engine_stats_update_lock: parking_lot::Mutex::new(()),
+            dyn_weight_version: AtomicU64::new(dyn_weight_version),
         }
     }
 
@@ -749,6 +761,15 @@ impl WorkerRuntime {
             .store(snapshot_ts_ms, Ordering::Release);
 
         EngineStatsUpdateOutcome::Applied
+    }
+
+    pub fn dyn_weight_version(&self) -> u64 {
+        self.dyn_weight_version.load(Ordering::Acquire)
+    }
+
+    pub fn set_dyn_weight_version(&self, weight_version: u64) {
+        self.dyn_weight_version
+            .store(weight_version, Ordering::Release);
     }
 }
 
@@ -919,6 +940,15 @@ impl Worker for BasicWorker {
 
     fn engine_stats(&self) -> EngineStats {
         self.runtime.load().engine_stats()
+    }
+
+    fn dyn_weight_version(&self) -> u64 {
+        self.runtime.load().dyn_weight_version()
+    }
+
+    fn update_dyn_weight_version(&self, weight_version: u64) -> bool {
+        self.runtime.load().set_dyn_weight_version(weight_version);
+        true
     }
 
     fn update_engine_stats(
@@ -1347,6 +1377,35 @@ mod tests {
             .build();
 
         assert_eq!(worker.metadata().spec.labels, labels);
+    }
+
+    #[test]
+    fn test_dyn_weight_version_initializes_from_numeric_label() {
+        let mut labels = HashMap::new();
+        labels.insert("weight_version".to_string(), "42".to_string());
+
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .labels(labels)
+            .health_config(no_health_check())
+            .build();
+
+        assert_eq!(worker.dyn_weight_version(), 42);
+    }
+
+    #[test]
+    fn test_dyn_weight_version_defaults_to_zero_for_missing_or_invalid_label() {
+        let missing = BasicWorkerBuilder::new("http://missing:8080")
+            .health_config(no_health_check())
+            .build();
+        assert_eq!(missing.dyn_weight_version(), 0);
+
+        let mut labels = HashMap::new();
+        labels.insert("weight_version".to_string(), "not-a-u64".to_string());
+        let invalid = BasicWorkerBuilder::new("http://invalid:8080")
+            .labels(labels)
+            .health_config(no_health_check())
+            .build();
+        assert_eq!(invalid.dyn_weight_version(), 0);
     }
 
     #[test]

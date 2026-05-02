@@ -74,7 +74,7 @@ use crate::{
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
         worker::WorkerType,
-        WorkerStatsUpdateRequest,
+        WorkerStatsUpdateRequest, WorkerWeightVersionUpdateRequest,
     },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -740,6 +740,17 @@ async fn update_worker_stats(
         .into_response()
 }
 
+async fn update_worker_weight_version(
+    State(state): State<Arc<AppState>>,
+    Json(update): Json<WorkerWeightVersionUpdateRequest>,
+) -> Response {
+    state
+        .context
+        .worker_service
+        .update_worker_weight_version(update)
+        .into_response()
+}
+
 async fn replace_worker(
     State(state): State<Arc<AppState>>,
     Path(worker_id_raw): Path<String>,
@@ -1118,7 +1129,11 @@ pub fn build_app(
                 .patch(update_worker)
                 .delete(delete_worker),
         )
-        .route("/workers/update_stats", post(update_worker_stats));
+        .route("/workers/update_stats", post(update_worker_stats))
+        .route(
+            "/workers/update_weight_version",
+            post(update_worker_weight_version),
+        );
 
     // Apply authentication middleware to control plane routes
     let apply_control_plane_auth = |routes: Router<Arc<AppState>>| {

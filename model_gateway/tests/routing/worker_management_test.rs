@@ -60,6 +60,38 @@ mod worker_management_tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn weight_version_update_payload(
+        worker_id: &str,
+        dp_rank: Option<usize>,
+        weight_version: u64,
+    ) -> serde_json::Value {
+        let mut update = json!({
+            "worker_id": worker_id,
+            "weight_version": weight_version
+        });
+        if let Some(dp_rank) = dp_rank {
+            update["dp_rank"] = json!(dp_rank);
+        }
+        json!({ "updates": [update] })
+    }
+
+    async fn post_worker_weight_version(
+        app: axum::Router,
+        payload: serde_json::Value,
+    ) -> serde_json::Value {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/workers/update_weight_version")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
     fn ready_worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
@@ -284,6 +316,90 @@ mod worker_management_tests {
         )
         .await;
         assert_eq!(stale["stale_ignored"], 1);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_weight_version_updates_runtime_value() {
+        let config = TestRouterConfig::round_robin(3906);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let worker = ready_worker("http://worker-weight-version:8080");
+        let worker_id = ctx
+            .app_context
+            .worker_registry
+            .register(worker.clone())
+            .unwrap();
+
+        let body = post_worker_weight_version(
+            app,
+            weight_version_update_payload(worker_id.as_str(), None, 42),
+        )
+        .await;
+
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["updated"], 1);
+        assert_eq!(body["rejected"], 0);
+        assert_eq!(worker.dyn_weight_version(), 42);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_weight_version_resolves_base_id_and_dp_rank() {
+        let config = TestRouterConfig::round_robin(3907);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let base_id = ctx
+            .app_context
+            .worker_registry
+            .reserve_id_for_url("http://worker-weight-version-dp:8080");
+        let dp_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-weight-version-dp:8080")
+                .dp_config(1, 2)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let dp_worker_id = ctx
+            .app_context
+            .worker_registry
+            .register(dp_worker.clone())
+            .unwrap();
+
+        let body = post_worker_weight_version(
+            app,
+            weight_version_update_payload(base_id.as_str(), Some(1), 7),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 1);
+        assert_eq!(body["results"][0]["worker_id"], dp_worker_id.as_str());
+        assert_eq!(dp_worker.dyn_weight_version(), 7);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_weight_version_rejects_missing_worker() {
+        let config = TestRouterConfig::round_robin(3908);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let body = post_worker_weight_version(
+            app,
+            weight_version_update_payload("00000000-0000-0000-0000-000000000001", None, 1),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 0);
+        assert_eq!(body["rejected"], 1);
 
         ctx.shutdown().await;
     }

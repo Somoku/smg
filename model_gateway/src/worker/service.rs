@@ -19,8 +19,10 @@ use crate::{
     config::RouterConfig,
     worker::{
         registry::WorkerId, worker::worker_to_info, EngineStatsUpdateOutcome, Worker,
-        WorkerRegistry, WorkerStatsUpdateRequest, WorkerStatsUpdateRequestItem,
-        WorkerStatsUpdateResult, WorkerStatsUpdateResultItem,
+        WorkerRegistry, WorkerStatsUpdateRequest, WorkerStatsUpdateResult,
+        WorkerStatsUpdateResultItem,
+        WorkerWeightVersionUpdateRequest, WorkerWeightVersionUpdateResult,
+        WorkerWeightVersionUpdateResultItem,
     },
     workflow::{Job, JobQueue},
 };
@@ -449,7 +451,7 @@ impl WorkerService {
 
         // Process each update
         for item in update.updates {
-            match self.resolve_worker_for_stats(&item) {
+            match self.resolve_worker_by_id_and_dp(&item.worker_id, item.dp_rank) {
                 Ok((worker_id, worker)) => {
                     let url = worker.url().to_string();
                     let dp_rank = item.dp_rank;
@@ -488,22 +490,83 @@ impl WorkerService {
         }
     }
 
-    fn resolve_worker_for_stats(
+    pub fn update_worker_weight_version(
         &self,
-        item: &WorkerStatsUpdateRequestItem,
+        update: WorkerWeightVersionUpdateRequest,
+    ) -> WorkerWeightVersionUpdateResult {
+        let update_num = update.updates.len();
+        let mut results = Vec::with_capacity(update_num);
+
+        // Process each update
+        for item in update.updates {
+            let weight_version = item.weight_version;
+            match self.resolve_worker_by_id_and_dp(&item.worker_id, item.dp_rank) {
+                Ok((worker_id, worker)) => {
+                    if worker.update_dyn_weight_version(weight_version) {
+                        results.push(WorkerWeightVersionUpdateResultItem {
+                            status: "updated".to_string(),
+                            worker_id: worker_id.as_str().to_string(),
+                            url: worker.url().to_string(),
+                            weight_version,
+                            dp_rank: item.dp_rank,
+                            reason: None,
+                        });
+                    } else {
+                        results.push(WorkerWeightVersionUpdateResultItem {
+                            status: "rejected".to_string(),
+                            worker_id: worker_id.as_str().to_string(),
+                            url: worker.url().to_string(),
+                            weight_version,
+                            dp_rank: item.dp_rank,
+                            reason: Some(
+                                "worker does not support dynamic weight version updates"
+                                    .to_string(),
+                            ),
+                        });
+                    }
+                }
+                Err(err) => {
+                    results.push(WorkerWeightVersionUpdateResultItem {
+                        status: "rejected".to_string(),
+                        worker_id: item.worker_id,
+                        url: String::new(),
+                        weight_version,
+                        dp_rank: item.dp_rank,
+                        reason: Some(err.to_string()),
+                    });
+                }
+            }
+        }
+
+        // Count the number of updated and rejected results
+        let updated = results.iter().filter(|r| r.status == "updated").count();
+        let rejected = results.iter().filter(|r| r.status == "rejected").count();
+
+        WorkerWeightVersionUpdateResult {
+            update_num,
+            updated,
+            rejected,
+            results,
+        }
+    }
+
+    fn resolve_worker_by_id_and_dp(
+        &self,
+        worker_id_raw: &str,
+        dp_rank: Option<usize>,
     ) -> Result<(WorkerId, Arc<dyn Worker>), WorkerServiceError> {
-        let worker_id = Self::parse_worker_id(&item.worker_id)?;
-        let Some(dp_rank) = item.dp_rank else {
+        let worker_id = Self::parse_worker_id(worker_id_raw)?;
+        let Some(dp_rank) = dp_rank else {
             let worker = self.worker_registry.get(&worker_id).ok_or_else(|| {
                 WorkerServiceError::NotFound {
-                    worker_id: item.worker_id.clone(),
+                    worker_id: worker_id_raw.to_string(),
                 }
             })?;
             if worker.is_dp_aware() {
                 return Err(WorkerServiceError::BadRequest {
                     message: format!(
                         "worker_id '{}' points to a DP worker; include the base worker_id and dp_rank instead",
-                        item.worker_id
+                        worker_id_raw
                     ),
                 });
             }
@@ -518,7 +581,7 @@ impl WorkerService {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
                     "worker_id '{}' points to a DP worker; use the base worker_id with dp_rank",
-                    item.worker_id
+                    worker_id_raw
                 ),
             });
         }
@@ -527,14 +590,14 @@ impl WorkerService {
             .worker_registry
             .get_url_by_id(&worker_id)
             .ok_or_else(|| WorkerServiceError::NotFound {
-                worker_id: item.worker_id.clone(),
+                worker_id: worker_id_raw.to_string(),
             })?;
         let target_url = format!("{base_url}@{dp_rank}");
         let target_id = self
             .worker_registry
             .get_id_by_url(&target_url)
             .ok_or_else(|| WorkerServiceError::NotFound {
-                worker_id: format!("{}@{dp_rank}", item.worker_id),
+                worker_id: format!("{worker_id_raw}@{dp_rank}"),
             })?;
         let worker =
             self.worker_registry
