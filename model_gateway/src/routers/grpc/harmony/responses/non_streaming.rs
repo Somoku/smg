@@ -5,7 +5,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::response::Response;
+use axum::{http::HeaderMap, response::Response};
 use openai_protocol::{
     common::{ToolCall, Usage},
     responses::{
@@ -54,6 +54,7 @@ use crate::{
 pub(crate) async fn serve_harmony_responses(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
+    headers: Option<HeaderMap>,
     tenant_request_meta: TenantRequestMeta,
 ) -> Result<ResponsesResponse, Response> {
     // Clone request for persistence
@@ -70,13 +71,14 @@ pub(crate) async fn serve_harmony_responses(
         execute_with_mcp_loop(
             ctx,
             current_request,
+            headers.clone(),
             tenant_request_meta.clone(),
             mcp_servers,
         )
         .await?
     } else {
         // No MCP tools - execute pipeline once (may have function tools or no tools)
-        execute_without_mcp_loop(ctx, current_request, tenant_request_meta).await?
+        execute_without_mcp_loop(ctx, current_request, headers, tenant_request_meta).await?
     };
 
     // Persist response to storage if store=true
@@ -99,6 +101,7 @@ pub(crate) async fn serve_harmony_responses(
 async fn execute_with_mcp_loop(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
+    headers: Option<HeaderMap>,
     tenant_request_meta: TenantRequestMeta,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Result<ResponsesResponse, Response> {
@@ -170,7 +173,12 @@ async fn execute_with_mcp_loop(
         // Execute through full pipeline
         let iteration_result = ctx
             .pipeline
-            .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta.clone()))
+            .execute_harmony_responses(
+                &current_request,
+                headers.clone(),
+                ctx,
+                Some(tenant_request_meta.clone()),
+            )
             .await?;
 
         match iteration_result {
@@ -363,6 +371,7 @@ async fn execute_with_mcp_loop(
 async fn execute_without_mcp_loop(
     ctx: &ResponsesContext,
     current_request: ResponsesRequest,
+    headers: Option<HeaderMap>,
     tenant_request_meta: TenantRequestMeta,
 ) -> Result<ResponsesResponse, Response> {
     debug!("Executing Harmony Responses without MCP loop");
@@ -370,7 +379,7 @@ async fn execute_without_mcp_loop(
     // Execute pipeline once
     let iteration_result = ctx
         .pipeline
-        .execute_harmony_responses(&current_request, ctx, Some(tenant_request_meta))
+        .execute_harmony_responses(&current_request, headers, ctx, Some(tenant_request_meta))
         .await?;
 
     match iteration_result {

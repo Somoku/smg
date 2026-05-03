@@ -6,8 +6,8 @@ use smg::{
     config::{
         CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
         HistoryBackend, ManualAssignmentMode, MetricsConfig, OracleConfig, PolicyConfig,
-        PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingMode, SchemaConfig,
-        TokenizerCacheConfig, TraceConfig,
+        PostgresConfig, RedisConfig, RequestSortKey, RetryConfig, RouterConfig, RoutingMode,
+        SchemaConfig, TokenizerCacheConfig, TraceConfig,
     },
     observability::{
         metrics::PrometheusConfig,
@@ -362,6 +362,35 @@ struct CliArgs {
     /// Token bucket refill rate (tokens per second)
     #[arg(long, help_heading = "Rate Limiting")]
     rate_limit_tokens_per_second: Option<i32>,
+
+    // ==================== Routing Loop ====================
+    /// Enable routing loop for gRPC chat/generate/completion/messages requests
+    #[arg(long, default_value_t = false, help_heading = "Routing Loop")]
+    enable_routing_loop: bool,
+
+    /// Idle check interval in milliseconds for the routing loop
+    #[arg(long, default_value_t = 10, help_heading = "Routing Loop")]
+    routing_loop_check_interval_ms: u64,
+
+    /// Request sort key after validation and version priority
+    #[arg(long, default_value = "short_length", value_parser = ["short_length", "long_length", "small_id"], help_heading = "Routing Loop")]
+    routing_loop_request_sort_key: String,
+
+    /// Use version-partitioned priority queues; lower versions suppress higher versions
+    #[arg(long, default_value_t = false, help_heading = "Routing Loop")]
+    routing_loop_multi_priority_queue: bool,
+
+    /// Maximum requests drained from the routing-loop ingress channel per pass
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Loop")]
+    routing_loop_receive_batch_size: usize,
+
+    /// Maximum queued requests dispatched from the routing loop per pass
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Loop")]
+    routing_loop_dispatch_batch_size: usize,
+
+    /// Maximum in-flight dispatch tasks created by the routing loop
+    #[arg(long, default_value_t = 4096, help_heading = "Routing Loop")]
+    routing_loop_max_running_dispatch_tasks: usize,
 
     // ==================== Retry Configuration ====================
     /// Maximum number of retry attempts
@@ -1200,6 +1229,12 @@ impl CliArgs {
             .skills_enabled
             .unwrap_or_else(|| self.skills_config_path.is_some());
 
+        let request_sort_key = match self.routing_loop_request_sort_key.as_str() {
+            "long_length" => RequestSortKey::LongLength,
+            "small_id" => RequestSortKey::SmallId,
+            _ => RequestSortKey::ShortLength,
+        };
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1215,6 +1250,13 @@ impl CliArgs {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .enable_routing_loop(self.enable_routing_loop)
+            .routing_loop_check_interval_ms(self.routing_loop_check_interval_ms)
+            .routing_loop_request_sort_key(request_sort_key)
+            .routing_loop_multi_priority_queue(self.routing_loop_multi_priority_queue)
+            .routing_loop_receive_batch_size(self.routing_loop_receive_batch_size)
+            .routing_loop_dispatch_batch_size(self.routing_loop_dispatch_batch_size)
+            .routing_loop_max_running_dispatch_tasks(self.routing_loop_max_running_dispatch_tasks)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(RetryConfig {
                 max_retries: self.retry_max_retries,

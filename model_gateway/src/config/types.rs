@@ -10,6 +10,43 @@ pub use smg_data_connector::{
 use super::{validation::ConfigValidator, ConfigResult, SkillsConfig};
 use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
 
+/// Sort key used by the routing loop after validation/version priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestSortKey {
+    #[default]
+    ShortLength,
+    LongLength,
+    SmallId,
+}
+
+/// Runtime knobs for the routing loop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RoutingLoopConfig {
+    pub enabled: bool,
+    pub check_interval_ms: u64,
+    pub request_sort_key: RequestSortKey,
+    pub enable_multi_priority_queue: bool,
+    pub receive_batch_size: usize,
+    pub dispatch_batch_size: usize,
+    pub max_running_dispatch_tasks: usize,
+}
+
+impl Default for RoutingLoopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            check_interval_ms: 10,
+            request_sort_key: RequestSortKey::ShortLength,
+            enable_multi_priority_queue: false,
+            receive_batch_size: 1024,
+            dispatch_batch_size: 1024,
+            max_running_dispatch_tasks: 4096,
+        }
+    }
+}
+
 /// Runtime feature flags for memory behavior.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -114,6 +151,8 @@ pub struct RouterConfig {
     pub max_concurrent_requests: i32,
     pub queue_size: usize,
     pub queue_timeout_secs: u64,
+    #[serde(default)]
+    pub routing_loop: RoutingLoopConfig,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Staleness threshold for engine stats updates
@@ -652,6 +691,7 @@ impl Default for RouterConfig {
             max_concurrent_requests: -1,
             queue_size: 100,
             queue_timeout_secs: 60,
+            routing_loop: RoutingLoopConfig::default(),
             rate_limit_tokens_per_second: None,
             engine_stats_staleness_threshold_ms: 0,
             cors_allowed_origins: vec![],
@@ -699,6 +739,10 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
+    }
+
+    pub fn is_routing_loop_enabled(&self) -> bool {
+        self.routing_loop.enabled
     }
 
     /// Get the routing mode type as a string

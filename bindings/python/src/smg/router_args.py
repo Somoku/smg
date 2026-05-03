@@ -80,6 +80,14 @@ class RouterArgs:
     queue_timeout_secs: int = 60
     # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
     rate_limit_tokens_per_second: int | None = None
+    # Routing loop configuration
+    enable_routing_loop: bool = False
+    routing_loop_check_interval_ms: int = 10
+    routing_loop_request_sort_key: str = "short_length"
+    routing_loop_multi_priority_queue: bool = False
+    routing_loop_receive_batch_size: int = 1024
+    routing_loop_dispatch_batch_size: int = 1024
+    routing_loop_max_running_dispatch_tasks: int = 4096
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -204,6 +212,9 @@ class RouterArgs:
         )
         rate_limit_group = parser.add_argument_group(
             "Rate Limiting", "Concurrent request and queue limits"
+        )
+        routing_loop_group = parser.add_argument_group(
+            "Routing Loop", "Priority request routing loop configuration"
         )
         retry_group = parser.add_argument_group(
             "Retry Configuration", "Automatic retry behavior for failed requests"
@@ -643,6 +654,50 @@ class RouterArgs:
                 "Token bucket refill rate (tokens per second)."
                 " If not set, defaults to max_concurrent_requests"
             ),
+        )
+
+        routing_loop_group.add_argument(
+            f"--{prefix}enable-routing-loop",
+            action="store_true",
+            default=RouterArgs.enable_routing_loop,
+            help="Enable routing loop for gRPC request pipelines",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}routing-loop-check-interval-ms",
+            type=int,
+            default=RouterArgs.routing_loop_check_interval_ms,
+            help="Idle check interval in milliseconds for the routing loop",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}routing-loop-request-sort-key",
+            type=str,
+            choices=["short_length", "long_length", "small_id"],
+            default=RouterArgs.routing_loop_request_sort_key,
+            help="Request sort key after validation and version priority",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}routing-loop-multi-priority-queue",
+            action="store_true",
+            default=RouterArgs.routing_loop_multi_priority_queue,
+            help="Use version-partitioned priority queues",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}routing-loop-receive-batch-size",
+            type=int,
+            default=RouterArgs.routing_loop_receive_batch_size,
+            help="Maximum requests drained from routing-loop ingress per pass",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}routing-loop-dispatch-batch-size",
+            type=int,
+            default=RouterArgs.routing_loop_dispatch_batch_size,
+            help="Maximum queued requests dispatched by the routing loop per pass",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}routing-loop-max-running-dispatch-tasks",
+            type=int,
+            default=RouterArgs.routing_loop_max_running_dispatch_tasks,
+            help="Maximum in-flight dispatch tasks created by the routing loop",
         )
 
         # Retry configuration
@@ -1205,6 +1260,24 @@ class RouterArgs:
                 "--connection-mode 'grpc' is ignored in IGW mode; "
                 "IGW mode always creates both HTTP and gRPC routers."
             )
+        if self.routing_loop_request_sort_key not in (
+            "short_length",
+            "long_length",
+            "small_id",
+        ):
+            raise ValueError(
+                "Invalid routing_loop_request_sort_key "
+                f"'{self.routing_loop_request_sort_key}'. Must be one of "
+                "'short_length', 'long_length', or 'small_id'."
+            )
+        for field_name in (
+            "routing_loop_check_interval_ms",
+            "routing_loop_receive_batch_size",
+            "routing_loop_dispatch_batch_size",
+            "routing_loop_max_running_dispatch_tasks",
+        ):
+            if getattr(self, field_name) < 1:
+                raise ValueError(f"{field_name} must be >= 1")
 
         # Validate configuration based on mode
         if self.pd_disaggregation:

@@ -23,7 +23,8 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
-        grpc::multimodal::MultimodalConfigRegistry, openai::realtime::RealtimeRegistry,
+        grpc::{multimodal::MultimodalConfigRegistry, routing_loop::runtime::RoutingLoopRuntime},
+        openai::realtime::RealtimeRegistry,
         router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
@@ -78,6 +79,7 @@ pub struct AppContext {
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    pub routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -115,6 +117,7 @@ pub struct AppContextBuilder {
     skill_service: Option<Arc<SkillService>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
+    routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -170,6 +173,7 @@ impl AppContextBuilder {
             skill_service: None,
             wasm_manager: None,
             kv_event_monitor: None,
+            routing_loop_runtime: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -294,6 +298,11 @@ impl AppContextBuilder {
         self
     }
 
+    pub fn routing_loop_runtime(mut self, runtime: Option<Arc<RoutingLoopRuntime>>) -> Self {
+        self.routing_loop_runtime = runtime;
+        self
+    }
+
     pub fn webrtc_bind_addr(mut self, addr: Option<std::net::IpAddr>) -> Self {
         self.webrtc_bind_addr = addr;
         self
@@ -401,6 +410,7 @@ impl AppContextBuilder {
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
+            routing_loop_runtime: self.routing_loop_runtime,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,

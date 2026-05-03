@@ -45,6 +45,10 @@ use super::{
         },
         streaming,
     },
+    routing_loop::{
+        metadata::parse_routing_request_meta_from_context,
+        runtime::{RoutingLoopCompletion, RoutingLoopRuntime, RoutingQueueEntry},
+    },
     utils::error_type_from_status,
 };
 use crate::{
@@ -64,6 +68,7 @@ pub(crate) struct RequestPipeline {
     stages: Arc<Vec<Box<dyn PipelineStage>>>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
+    routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
 }
 
 impl RequestPipeline {
@@ -107,6 +112,299 @@ impl RequestPipeline {
             metrics_labels::ERROR_INTERNAL,
         );
         error::internal_error("no_response_produced", "No response produced")
+    }
+
+    pub(crate) async fn execute_preparation_only(
+        &self,
+        mut ctx: RequestContext,
+    ) -> Result<RequestContext, Response> {
+        for stage in self.stages.iter().take(1) {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => return Err(response),
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        "Stage {} failed with status {}",
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+        Ok(ctx)
+    }
+
+    pub(crate) async fn execute_after_preparation(&self, mut ctx: RequestContext) -> Response {
+        let request_type = ctx.input.request_type.to_string();
+
+        for stage in self.stages.iter().skip(1) {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => return response,
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        request_type = %request_type,
+                        "Stage {} failed with status {}",
+                        stage.name(),
+                        response.status()
+                    );
+                    return response;
+                }
+            }
+        }
+
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Completion(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Embedding(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Classify(response)) => axum::Json(response).into_response(),
+            Some(FinalResponse::Messages(response)) => axum::Json(response).into_response(),
+            None => {
+                error!(
+                    request_type = %request_type,
+                    "No final response produced after routing-loop dispatch"
+                );
+                error::internal_error("no_response_produced", "No response produced")
+            }
+        }
+    }
+
+    pub(crate) async fn execute_chat_for_responses_after_preparation(
+        &self,
+        mut ctx: RequestContext,
+    ) -> Result<ChatCompletionResponse, Response> {
+        for (idx, stage) in self.stages.iter().enumerate().skip(1) {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(_response)) => {
+                    error!(
+                        function = "execute_chat_for_responses_after_preparation",
+                        "Streaming attempted in responses context"
+                    );
+                    return Err(error::bad_request(
+                        "streaming_not_supported",
+                        "Streaming is not supported in this context".to_string(),
+                    ));
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+
+        match ctx.state.response.final_response {
+            Some(FinalResponse::Chat(response)) => Ok(response),
+            Some(FinalResponse::Generate(_))
+            | Some(FinalResponse::Completion(_))
+            | Some(FinalResponse::Embedding(_))
+            | Some(FinalResponse::Classify(_))
+            | Some(FinalResponse::Messages(_)) => {
+                error!(
+                    function = "execute_chat_for_responses_after_preparation",
+                    "Wrong response type: expected Chat, got another response type"
+                );
+                Err(error::internal_error(
+                    "wrong_response_type",
+                    "Internal error: wrong response type",
+                ))
+            }
+            None => {
+                error!(
+                    function = "execute_chat_for_responses_after_preparation",
+                    "No response produced by pipeline"
+                );
+                Err(error::internal_error(
+                    "no_response_produced",
+                    "No response produced",
+                ))
+            }
+        }
+    }
+
+    pub(crate) async fn execute_harmony_responses_after_preparation(
+        &self,
+        mut ctx: RequestContext,
+    ) -> Result<harmony::ResponsesIterationResult, Response> {
+        for (idx, stage) in self.stages.iter().enumerate().skip(1) {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    error!(
+                        "Stage {} ({}) returned unexpected response during Responses iteration",
+                        idx + 1,
+                        stage.name()
+                    );
+                    return Err(response);
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+
+        ctx.state
+            .response
+            .responses_iteration_result
+            .take()
+            .ok_or_else(|| {
+                error!(
+                    function = "execute_harmony_responses_after_preparation",
+                    "No ResponsesIterationResult produced by pipeline"
+                );
+                error::internal_error(
+                    "no_responses_iteration_result",
+                    "No ResponsesIterationResult produced by pipeline",
+                )
+            })
+    }
+
+    pub(crate) async fn execute_harmony_responses_streaming_after_preparation(
+        &self,
+        mut ctx: RequestContext,
+    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
+        for (idx, stage) in self.stages.iter().enumerate().skip(1) {
+            match stage.execute(&mut ctx).await {
+                Ok(Some(response)) => {
+                    error!(
+                        "Stage {} ({}) returned unexpected response during streaming Responses",
+                        idx + 1,
+                        stage.name()
+                    );
+                    return Err(response);
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        "Stage {} ({}) failed with status {}",
+                        idx + 1,
+                        stage.name(),
+                        response.status()
+                    );
+                    return Err(response);
+                }
+            }
+        }
+
+        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
+            error!(
+                function = "execute_harmony_responses_streaming_after_preparation",
+                "No ExecutionResult produced by pipeline"
+            );
+            error::internal_error(
+                "no_execution_result_produced",
+                "No ExecutionResult produced by pipeline",
+            )
+        })?;
+
+        let load_guards = ctx.state.load_guards.take();
+        Ok((execution_result, load_guards))
+    }
+
+    pub(crate) fn with_routing_loop(mut self, runtime: Option<Arc<RoutingLoopRuntime>>) -> Self {
+        self.routing_loop_runtime = runtime;
+        self
+    }
+
+    fn clone_for_routing_dispatch(&self) -> Self {
+        let mut pipeline = self.clone();
+        pipeline.routing_loop_runtime = None;
+        pipeline
+    }
+
+    async fn execute_via_routing_loop(
+        &self,
+        ctx: RequestContext,
+        model: &str,
+        endpoint: &'static str,
+        start: Instant,
+    ) -> Response {
+        let ctx = match self.execute_preparation_only(ctx).await {
+            Ok(ctx) => ctx,
+            Err(response) => {
+                Metrics::record_router_error(
+                    metrics_labels::ROUTER_GRPC,
+                    self.backend_type,
+                    metrics_labels::CONNECTION_GRPC,
+                    model,
+                    endpoint,
+                    error_type_from_status(response.status()),
+                );
+                return response;
+            }
+        };
+
+        let Some(runtime) = self.routing_loop_runtime.as_ref() else {
+            error!("routing loop requested but runtime is unavailable");
+            return error::internal_error(
+                "routing_loop_unavailable",
+                "Routing loop runtime is unavailable",
+            );
+        };
+
+        let routing_meta = parse_routing_request_meta_from_context(&ctx);
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let entry = RoutingQueueEntry {
+            ctx,
+            pipeline: self.clone_for_routing_dispatch(),
+            completion: RoutingLoopCompletion::Http(result_tx),
+            routing_meta,
+        };
+
+        let response = match runtime.enqueue(entry) {
+            Ok(()) => match result_rx.await {
+                Ok(response) => response,
+                Err(err) => {
+                    error!(error = %err, "routing loop dropped request response channel");
+                    error::internal_error(
+                        "routing_loop_response_channel_closed",
+                        "Routing loop response channel closed",
+                    )
+                }
+            },
+            Err(_) => {
+                error!("routing loop enqueue channel is closed");
+                error::internal_error(
+                    "routing_loop_enqueue_failed",
+                    "Routing loop enqueue channel is closed",
+                )
+            }
+        };
+
+        if response.status().is_success() {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_GRPC,
+                self.backend_type,
+                metrics_labels::CONNECTION_GRPC,
+                model,
+                endpoint,
+                start.elapsed(),
+            );
+        } else {
+            Metrics::record_router_error(
+                metrics_labels::ROUTER_GRPC,
+                self.backend_type,
+                metrics_labels::CONNECTION_GRPC,
+                model,
+                endpoint,
+                error_type_from_status(response.status()),
+            );
+        }
+
+        response
     }
 
     /// Create a regular (single-worker) pipeline
@@ -153,6 +451,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_REGULAR,
+            routing_loop_runtime: None,
         }
     }
 
@@ -182,6 +481,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_REGULAR,
+            routing_loop_runtime: None,
         }
     }
 
@@ -212,6 +512,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_PD,
+            routing_loop_runtime: None,
         }
     }
 
@@ -259,6 +560,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_PD,
+            routing_loop_runtime: None,
         }
     }
 
@@ -284,6 +586,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_REGULAR, // Embeddings are regular for now
+            routing_loop_runtime: None,
         }
     }
 
@@ -312,6 +615,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_REGULAR,
+            routing_loop_runtime: None,
         }
     }
 
@@ -363,6 +667,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_REGULAR,
+            routing_loop_runtime: None,
         }
     }
 
@@ -410,6 +715,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_PD,
+            routing_loop_runtime: None,
         }
     }
 
@@ -457,6 +763,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_REGULAR,
+            routing_loop_runtime: None,
         }
     }
 
@@ -500,6 +807,7 @@ impl RequestPipeline {
         Self {
             stages: Arc::new(stages),
             backend_type: metrics_labels::BACKEND_PD,
+            routing_loop_runtime: None,
         }
     }
 
@@ -529,6 +837,17 @@ impl RequestPipeline {
 
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+
+        if self.routing_loop_runtime.is_some() {
+            return self
+                .execute_via_routing_loop(
+                    ctx,
+                    &request_for_metrics.model,
+                    metrics_labels::ENDPOINT_CHAT,
+                    start,
+                )
+                .await;
+        }
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -622,6 +941,12 @@ impl RequestPipeline {
         let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
+        if self.routing_loop_runtime.is_some() {
+            return self
+                .execute_via_routing_loop(ctx, &model_id, metrics_labels::ENDPOINT_GENERATE, start)
+                .await;
+        }
+
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
@@ -712,6 +1037,12 @@ impl RequestPipeline {
 
         let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+
+        if self.routing_loop_runtime.is_some() {
+            return self
+                .execute_via_routing_loop(ctx, &model, metrics_labels::ENDPOINT_COMPLETIONS, start)
+                .await;
+        }
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -806,6 +1137,17 @@ impl RequestPipeline {
 
         let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
         ctx.input.tenant_request_meta = tenant_request_meta;
+
+        if self.routing_loop_runtime.is_some() {
+            return self
+                .execute_via_routing_loop(
+                    ctx,
+                    &model_id,
+                    metrics_labels::ENDPOINT_EMBEDDINGS,
+                    start,
+                )
+                .await;
+        }
 
         for stage in self.stages.iter() {
             debug!("execute_embeddings: Executing stage: {}", stage.name());
@@ -909,6 +1251,12 @@ impl RequestPipeline {
         let mut ctx = RequestContext::for_classify(request, headers, model_id.clone(), components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
+        if self.routing_loop_runtime.is_some() {
+            return self
+                .execute_via_routing_loop(ctx, &model_id, metrics_labels::ENDPOINT_CLASSIFY, start)
+                .await;
+        }
+
         for stage in self.stages.iter() {
             debug!("execute_classify: Executing stage: {}", stage.name());
             match stage.execute(&mut ctx).await {
@@ -1008,6 +1356,17 @@ impl RequestPipeline {
         let mut ctx = RequestContext::for_messages(request.clone(), headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
+        if self.routing_loop_runtime.is_some() {
+            return self
+                .execute_via_routing_loop(
+                    ctx,
+                    &request.model,
+                    metrics_labels::ENDPOINT_MESSAGES,
+                    start,
+                )
+                .await;
+        }
+
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
@@ -1092,6 +1451,32 @@ impl RequestPipeline {
         let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
 
+        if let Some(runtime) = self.routing_loop_runtime.as_ref() {
+            let ctx = self.execute_preparation_only(ctx).await?;
+            let routing_meta = parse_routing_request_meta_from_context(&ctx);
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let entry = RoutingQueueEntry {
+                ctx,
+                pipeline: self.clone_for_routing_dispatch(),
+                completion: RoutingLoopCompletion::ChatForResponses(result_tx),
+                routing_meta,
+            };
+            runtime.enqueue(entry).map_err(|_| {
+                error!("routing loop enqueue channel is closed");
+                error::internal_error(
+                    "routing_loop_enqueue_failed",
+                    "Routing loop enqueue channel is closed",
+                )
+            })?;
+            return result_rx.await.map_err(|err| {
+                error!(error = %err, "routing loop dropped responses chat channel");
+                error::internal_error(
+                    "routing_loop_response_channel_closed",
+                    "Routing loop response channel closed",
+                )
+            })?;
+        }
+
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
                 Ok(Some(_response)) => {
@@ -1168,17 +1553,44 @@ impl RequestPipeline {
     pub async fn execute_harmony_responses(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
+        headers: Option<http::HeaderMap>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<harmony::ResponsesIterationResult, Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
-            None,                  // No headers needed for internal pipeline execution
+            headers,
             request.model.clone(), // Model ID from request
             harmony_ctx.components.clone(),
         );
         ctx.input.tenant_request_meta = tenant_request_meta;
+
+        if let Some(runtime) = self.routing_loop_runtime.as_ref() {
+            let ctx = self.execute_preparation_only(ctx).await?;
+            let routing_meta = parse_routing_request_meta_from_context(&ctx);
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let entry = RoutingQueueEntry {
+                ctx,
+                pipeline: self.clone_for_routing_dispatch(),
+                completion: RoutingLoopCompletion::HarmonyResponses(result_tx),
+                routing_meta,
+            };
+            runtime.enqueue(entry).map_err(|_| {
+                error!("routing loop enqueue channel is closed");
+                error::internal_error(
+                    "routing_loop_enqueue_failed",
+                    "Routing loop enqueue channel is closed",
+                )
+            })?;
+            return result_rx.await.map_err(|err| {
+                error!(error = %err, "routing loop dropped Harmony responses channel");
+                error::internal_error(
+                    "routing_loop_response_channel_closed",
+                    "Routing loop response channel closed",
+                )
+            })?;
+        }
 
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {
@@ -1233,17 +1645,44 @@ impl RequestPipeline {
     pub async fn execute_harmony_responses_streaming(
         &self,
         request: &openai_protocol::responses::ResponsesRequest,
+        headers: Option<http::HeaderMap>,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
             Arc::new(request.clone()),
-            None,
+            headers,
             request.model.clone(),
             harmony_ctx.components.clone(),
         );
         ctx.input.tenant_request_meta = tenant_request_meta;
+
+        if let Some(runtime) = self.routing_loop_runtime.as_ref() {
+            let ctx = self.execute_preparation_only(ctx).await?;
+            let routing_meta = parse_routing_request_meta_from_context(&ctx);
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let entry = RoutingQueueEntry {
+                ctx,
+                pipeline: self.clone_for_routing_dispatch(),
+                completion: RoutingLoopCompletion::HarmonyResponsesStreaming(result_tx),
+                routing_meta,
+            };
+            runtime.enqueue(entry).map_err(|_| {
+                error!("routing loop enqueue channel is closed");
+                error::internal_error(
+                    "routing_loop_enqueue_failed",
+                    "Routing loop enqueue channel is closed",
+                )
+            })?;
+            return result_rx.await.map_err(|err| {
+                error!(error = %err, "routing loop dropped Harmony streaming responses channel");
+                error::internal_error(
+                    "routing_loop_response_channel_closed",
+                    "Routing loop response channel closed",
+                )
+            })?;
+        }
 
         for (idx, stage) in self.stages.iter().enumerate() {
             match stage.execute(&mut ctx).await {

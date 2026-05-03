@@ -2,7 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::response::Response;
+use axum::{http::HeaderMap, response::Response};
 use bytes::Bytes;
 use openai_protocol::responses::ResponsesRequest;
 use serde_json::json;
@@ -44,6 +44,7 @@ use crate::{
 pub(crate) async fn serve_harmony_responses_stream(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
+    headers: Option<HeaderMap>,
     tenant_request_meta: TenantRequestMeta,
 ) -> Response {
     // Load previous conversation history if previous_response_id is set
@@ -100,6 +101,7 @@ pub(crate) async fn serve_harmony_responses_stream(
                 ctx,
                 current_request,
                 &request,
+                headers.clone(),
                 tenant_request_meta.clone(),
                 mcp_servers,
                 &mut emitter,
@@ -111,6 +113,7 @@ pub(crate) async fn serve_harmony_responses_stream(
                 ctx,
                 &current_request,
                 &request,
+                headers,
                 tenant_request_meta,
                 &mut emitter,
                 &tx,
@@ -135,6 +138,7 @@ async fn execute_mcp_tool_loop_streaming(
     ctx: &ResponsesContext,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
+    headers: Option<HeaderMap>,
     tenant_request_meta: TenantRequestMeta,
     mcp_servers: Vec<McpServerBinding>,
     emitter: &mut ResponseStreamEventEmitter,
@@ -219,6 +223,7 @@ async fn execute_mcp_tool_loop_streaming(
             .pipeline
             .execute_harmony_responses_streaming(
                 &current_request,
+                headers.clone(),
                 ctx,
                 Some(tenant_request_meta.clone()),
             )
@@ -426,6 +431,7 @@ async fn execute_without_mcp_streaming(
     ctx: &ResponsesContext,
     current_request: &ResponsesRequest,
     original_request: &ResponsesRequest,
+    headers: Option<HeaderMap>,
     tenant_request_meta: TenantRequestMeta,
     emitter: &mut ResponseStreamEventEmitter,
     tx: &mpsc::UnboundedSender<Result<Bytes, std::io::Error>>,
@@ -435,7 +441,12 @@ async fn execute_without_mcp_streaming(
     // Execute pipeline and get stream + load guards
     let (execution_result, _load_guards) = match ctx
         .pipeline
-        .execute_harmony_responses_streaming(current_request, ctx, Some(tenant_request_meta))
+        .execute_harmony_responses_streaming(
+            current_request,
+            headers,
+            ctx,
+            Some(tenant_request_meta),
+        )
         .await
     {
         Ok(result) => result,

@@ -5,8 +5,8 @@ use smg_mcp::McpConfig;
 use super::{
     CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
     HistoryBackend, MemoryRuntimeConfig, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingMode, SkillsConfig, TokenizerCacheConfig,
-    TraceConfig,
+    RedisConfig, RequestSortKey, RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode,
+    SkillsConfig, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::ConnectionMode;
 
@@ -222,6 +222,46 @@ impl RouterConfigBuilder {
 
     pub fn queue_timeout_secs(mut self, timeout: u64) -> Self {
         self.config.queue_timeout_secs = timeout;
+        self
+    }
+
+    pub fn routing_loop_config(mut self, config: RoutingLoopConfig) -> Self {
+        self.config.routing_loop = config;
+        self
+    }
+
+    pub fn enable_routing_loop(mut self, enabled: bool) -> Self {
+        self.config.routing_loop.enabled = enabled;
+        self
+    }
+
+    pub fn routing_loop_check_interval_ms(mut self, interval_ms: u64) -> Self {
+        self.config.routing_loop.check_interval_ms = interval_ms;
+        self
+    }
+
+    pub fn routing_loop_request_sort_key(mut self, request_sort_key: RequestSortKey) -> Self {
+        self.config.routing_loop.request_sort_key = request_sort_key;
+        self
+    }
+
+    pub fn routing_loop_multi_priority_queue(mut self, enabled: bool) -> Self {
+        self.config.routing_loop.enable_multi_priority_queue = enabled;
+        self
+    }
+
+    pub fn routing_loop_receive_batch_size(mut self, size: usize) -> Self {
+        self.config.routing_loop.receive_batch_size = size;
+        self
+    }
+
+    pub fn routing_loop_dispatch_batch_size(mut self, size: usize) -> Self {
+        self.config.routing_loop.dispatch_batch_size = size;
+        self
+    }
+
+    pub fn routing_loop_max_running_dispatch_tasks(mut self, max_tasks: usize) -> Self {
+        self.config.routing_loop.max_running_dispatch_tasks = max_tasks;
         self
     }
 

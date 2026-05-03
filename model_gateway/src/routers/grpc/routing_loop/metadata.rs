@@ -1,17 +1,11 @@
-//! PSRL request metadata parsing.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "routing loop integration lands after queue/metadata"
-    )
-)]
+//! Request routing metadata parsing.
 
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-/// Routing metadata supplied by PSRL callers.
+use crate::routers::grpc::context::RequestContext;
+
+/// Routing metadata supplied by callers that use the routing loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingMeta {
     pub request_id: Option<i64>,
@@ -21,11 +15,11 @@ pub(crate) struct RoutingMeta {
     pub rollout_instance_hint: Option<(String, usize)>,
 }
 
-/// Parse PSRL metadata from transport headers and a JSON body.
+/// Parse routing metadata from transport headers and a JSON body.
 ///
-/// Headers take precedence over body fields.  Returns `None` when no PSRL
+/// Headers take precedence over body fields.  Returns `None` when no routing
 /// metadata is present so ordinary requests can skip routing-loop bookkeeping.
-pub(crate) fn parse_psrl_request_meta(
+pub(crate) fn parse_routing_request_meta(
     headers: Option<&HeaderMap>,
     body: Option<&Value>,
 ) -> Option<RoutingMeta> {
@@ -58,6 +52,10 @@ pub(crate) fn parse_psrl_request_meta(
         is_validate,
         rollout_instance_hint,
     })
+}
+
+pub(crate) fn parse_routing_request_meta_from_context(ctx: &RequestContext) -> Option<RoutingMeta> {
+    parse_routing_request_meta(ctx.input.headers.as_ref(), None)
 }
 
 fn parse_i64_header(headers: Option<&HeaderMap>, key: &'static str) -> Option<i64> {
@@ -197,7 +195,7 @@ mod tests {
     #[test]
     fn parse_returns_none_without_metadata() {
         assert_eq!(
-            parse_psrl_request_meta(None, Some(&json!({"model": "m"}))),
+            parse_routing_request_meta(None, Some(&json!({"model": "m"}))),
             None
         );
     }
@@ -212,7 +210,7 @@ mod tests {
         headers.insert("x-base-worker-id", HeaderValue::from_static("worker-a"));
         headers.insert("x-target-dp-rank", HeaderValue::from_static("2"));
 
-        let meta = parse_psrl_request_meta(
+        let meta = parse_routing_request_meta(
             Some(&headers),
             Some(&json!({
                 "request_id": 1,
@@ -237,7 +235,7 @@ mod tests {
 
     #[test]
     fn parse_body_rollout_instance_object_aliases() {
-        let meta = parse_psrl_request_meta(
+        let meta = parse_routing_request_meta(
             None,
             Some(&json!({
                 "request_id": "5",

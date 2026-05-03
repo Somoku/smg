@@ -1,4 +1,4 @@
-//! Priority request queue for PSRL routing-loop dispatch.
+//! Priority request queue for routing-loop dispatch.
 
 #![expect(
     dead_code,
@@ -7,14 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-/// Sort key used when computing request priority.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum RequestSortIndicator {
-    #[default]
-    ShortLength,
-    LongLength,
-    SmallId,
-}
+use crate::config::RequestSortKey;
 
 /// Trait implemented by routing-loop queue entries.
 ///
@@ -41,13 +34,13 @@ pub(crate) trait RequestPriority {
         partition_key_for_version_tag(self.version_tag())
     }
 
-    fn priority(&self, indicator: RequestSortIndicator) -> (i64, i64, i64) {
+    fn priority(&self, request_sort_key: RequestSortKey) -> (i64, i64, i64) {
         let validation_priority = i64::from(!self.is_validation());
         let version_priority = priority_for_version_tag(self.version_tag());
-        let final_priority = match indicator {
-            RequestSortIndicator::ShortLength => self.input_len().min(i32::MAX as usize) as i64,
-            RequestSortIndicator::LongLength => -(self.input_len().min(i32::MAX as usize) as i64),
-            RequestSortIndicator::SmallId => self.request_id().unwrap_or(i64::MAX),
+        let final_priority = match request_sort_key {
+            RequestSortKey::ShortLength => self.input_len().min(i32::MAX as usize) as i64,
+            RequestSortKey::LongLength => -(self.input_len().min(i32::MAX as usize) as i64),
+            RequestSortKey::SmallId => self.request_id().unwrap_or(i64::MAX),
         };
         (validation_priority, version_priority, final_priority)
     }
@@ -106,21 +99,21 @@ impl<T> Eq for RequestQueueEntry<T> {}
 pub(crate) struct PriorityRequestQueue<T: RequestPriority> {
     heap: std::collections::BinaryHeap<RequestQueueEntry<T>>,
     next_seq: u64,
-    sort_indicator: RequestSortIndicator,
+    request_sort_key: RequestSortKey,
 }
 
 impl<T: RequestPriority> PriorityRequestQueue<T> {
-    pub(crate) fn new(sort_indicator: RequestSortIndicator) -> Self {
+    pub(crate) fn new(request_sort_key: RequestSortKey) -> Self {
         Self {
             heap: std::collections::BinaryHeap::new(),
             next_seq: 0,
-            sort_indicator,
+            request_sort_key,
         }
     }
 
     pub(crate) fn push(&mut self, request: T) {
         let entry = RequestQueueEntry {
-            priority: request.priority(self.sort_indicator),
+            priority: request.priority(self.request_sort_key),
             seq: self.next_seq,
             request,
         };
@@ -144,8 +137,8 @@ impl<T: RequestPriority> PriorityRequestQueue<T> {
         self.heap.is_empty()
     }
 
-    pub(crate) fn sort_indicator(&self) -> RequestSortIndicator {
-        self.sort_indicator
+    pub(crate) fn request_sort_key(&self) -> RequestSortKey {
+        self.request_sort_key
     }
 
     pub(crate) fn iter_requests(&self) -> impl Iterator<Item = &T> {
@@ -160,18 +153,15 @@ impl<T: RequestPriority> PriorityRequestQueue<T> {
 /// version partitions while low-version work is present.
 pub(crate) struct MultiPriorityRequestQueue<T: RequestPriority> {
     queues: BTreeMap<i32, PriorityRequestQueue<T>>,
-    sort_indicator: RequestSortIndicator,
+    request_sort_key: RequestSortKey,
     enable_multi_priority_queue: bool,
 }
 
 impl<T: RequestPriority> MultiPriorityRequestQueue<T> {
-    pub(crate) fn new(
-        sort_indicator: RequestSortIndicator,
-        enable_multi_priority_queue: bool,
-    ) -> Self {
+    pub(crate) fn new(request_sort_key: RequestSortKey, enable_multi_priority_queue: bool) -> Self {
         Self {
             queues: BTreeMap::new(),
-            sort_indicator,
+            request_sort_key,
             enable_multi_priority_queue,
         }
     }
@@ -184,7 +174,7 @@ impl<T: RequestPriority> MultiPriorityRequestQueue<T> {
     pub(crate) fn push_back_to_partition(&mut self, partition: i32, request: T) {
         self.queues
             .entry(partition)
-            .or_insert_with(|| PriorityRequestQueue::new(self.sort_indicator))
+            .or_insert_with(|| PriorityRequestQueue::new(self.request_sort_key))
             .push(request);
     }
 
@@ -303,7 +293,7 @@ mod tests {
 
     #[test]
     fn priority_queue_orders_by_short_length_with_fifo_tiebreak() {
-        let mut q = PriorityRequestQueue::new(RequestSortIndicator::ShortLength);
+        let mut q = PriorityRequestQueue::new(RequestSortKey::ShortLength);
         q.push(TestReq::new(1, 0, 10));
         q.push(TestReq::new(2, 0, 2));
         q.push(TestReq::new(3, 0, 2));
@@ -315,7 +305,7 @@ mod tests {
 
     #[test]
     fn priority_queue_orders_validate_before_normal() {
-        let mut q = PriorityRequestQueue::new(RequestSortIndicator::ShortLength);
+        let mut q = PriorityRequestQueue::new(RequestSortKey::ShortLength);
         q.push(TestReq::new(1, 0, 1));
         let mut validate = TestReq::new(2, 0, 100);
         validate.validate = true;
@@ -327,12 +317,12 @@ mod tests {
 
     #[test]
     fn priority_queue_supports_long_length_and_small_id() {
-        let mut long = PriorityRequestQueue::new(RequestSortIndicator::LongLength);
+        let mut long = PriorityRequestQueue::new(RequestSortKey::LongLength);
         long.push(TestReq::new(1, 0, 1));
         long.push(TestReq::new(2, 0, 5));
         assert_eq!(long.pop().map(|req| req.id), Some(2));
 
-        let mut id = PriorityRequestQueue::new(RequestSortIndicator::SmallId);
+        let mut id = PriorityRequestQueue::new(RequestSortKey::SmallId);
         id.push(TestReq::new(20, 0, 1));
         id.push(TestReq::new(3, 0, 100));
         assert_eq!(id.pop().map(|req| req.id), Some(3));
@@ -340,7 +330,7 @@ mod tests {
 
     #[test]
     fn multi_queue_partitions_by_version_and_maps_unversioned_last() {
-        let mut q = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true);
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::SmallId, true);
         q.push(TestReq::new(1, 2, 1));
         q.push(TestReq::new(2, -1, 1));
         q.push(TestReq::new(3, 1, 1));
@@ -352,7 +342,7 @@ mod tests {
 
     #[test]
     fn multi_queue_strictly_drains_lower_partition_first() {
-        let mut q = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true);
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::SmallId, true);
         q.push(TestReq::new(1, 1, 1));
         q.push(TestReq::new(2, 1, 1));
         q.push(TestReq::new(3, 2, 1));
@@ -369,7 +359,7 @@ mod tests {
 
     #[test]
     fn multi_queue_single_queue_mode_ignores_version_partitions() {
-        let mut q = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, false);
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::SmallId, false);
         q.push(TestReq::new(2, 2, 1));
         q.push(TestReq::new(1, 1, 1));
 
@@ -380,7 +370,7 @@ mod tests {
 
     #[test]
     fn multi_queue_can_push_back_to_original_partition() {
-        let mut q = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true);
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::SmallId, true);
         q.push_back_to_partition(7, TestReq::new(1, 99, 1));
 
         assert_eq!(q.queue_keys(), vec![7]);
@@ -390,7 +380,7 @@ mod tests {
 
     #[test]
     fn multi_queue_len_and_per_partition_sizes_ignore_empty_partitions() {
-        let mut q = MultiPriorityRequestQueue::new(RequestSortIndicator::SmallId, true);
+        let mut q = MultiPriorityRequestQueue::new(RequestSortKey::SmallId, true);
         q.push(TestReq::new(1, 1, 1));
         q.push(TestReq::new(2, 2, 1));
         q.push(TestReq::new(3, 2, 1));

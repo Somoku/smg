@@ -218,6 +218,14 @@ class Router:
             before timing out. Default: 60
         rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If
             not set, defaults to max_concurrent_requests. Default: None
+        enable_routing_loop: Enable priority routing loop for gRPC request pipelines.
+            Default: False
+        routing_loop_receive_batch_size: Maximum requests drained from routing-loop
+            ingress per pass. Default: 1024
+        routing_loop_dispatch_batch_size: Maximum queued requests dispatched per pass.
+            Default: 1024
+        routing_loop_max_running_dispatch_tasks: Maximum in-flight dispatch tasks
+            created by the routing loop. Default: 4096
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
             origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before

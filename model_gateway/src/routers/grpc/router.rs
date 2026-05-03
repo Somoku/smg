@@ -96,7 +96,8 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
-        );
+        )
+        .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Harmony pipelines
         let harmony_pipeline = RequestPipeline::new_harmony(
@@ -106,15 +107,18 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
-        );
+        )
+        .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Embedding pipeline
         let embedding_pipeline =
-            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone());
+            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone())
+                .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Classify pipeline
         let classify_pipeline =
-            RequestPipeline::new_classify(worker_registry.clone(), _policy_registry.clone());
+            RequestPipeline::new_classify(worker_registry.clone(), _policy_registry.clone())
+                .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Messages pipeline
         let messages_pipeline = RequestPipeline::new_messages(
@@ -124,11 +128,13 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
-        );
+        )
+        .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Completion pipeline
         let completion_pipeline =
-            RequestPipeline::new_completion(worker_registry.clone(), _policy_registry.clone());
+            RequestPipeline::new_completion(worker_registry.clone(), _policy_registry.clone())
+                .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Extract shared dependencies for responses contexts
         let mcp_orchestrator = ctx
@@ -347,10 +353,21 @@ impl GrpcRouter {
             );
 
             if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body.clone(), tenant_meta.clone())
-                    .await
+                serve_harmony_responses_stream(
+                    &harmony_ctx,
+                    body.clone(),
+                    headers.cloned(),
+                    tenant_meta.clone(),
+                )
+                .await
             } else {
-                match serve_harmony_responses(&harmony_ctx, body.clone(), tenant_meta.clone()).await
+                match serve_harmony_responses(
+                    &harmony_ctx,
+                    body.clone(),
+                    headers.cloned(),
+                    tenant_meta.clone(),
+                )
+                .await
                 {
                     Ok(response) => axum::Json(response).into_response(),
                     Err(error_response) => error_response,

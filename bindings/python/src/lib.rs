@@ -434,6 +434,13 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
+    enable_routing_loop: bool,
+    routing_loop_check_interval_ms: u64,
+    routing_loop_request_sort_key: String,
+    routing_loop_multi_priority_queue: bool,
+    routing_loop_receive_batch_size: usize,
+    routing_loop_dispatch_batch_size: usize,
+    routing_loop_max_running_dispatch_tasks: usize,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -608,6 +615,19 @@ impl Router {
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
 
+        let request_sort_key = match self.routing_loop_request_sort_key.as_str() {
+            "short_length" => config::RequestSortKey::ShortLength,
+            "long_length" => config::RequestSortKey::LongLength,
+            "small_id" => config::RequestSortKey::SmallId,
+            other => {
+                return Err(config::ConfigError::InvalidValue {
+                    field: "routing_loop_request_sort_key".to_string(),
+                    value: other.to_string(),
+                    reason: "expected 'short_length', 'long_length', or 'small_id'".to_string(),
+                });
+            }
+        };
+
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -678,6 +698,13 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .enable_routing_loop(self.enable_routing_loop)
+            .routing_loop_check_interval_ms(self.routing_loop_check_interval_ms)
+            .routing_loop_request_sort_key(request_sort_key)
+            .routing_loop_multi_priority_queue(self.routing_loop_multi_priority_queue)
+            .routing_loop_receive_batch_size(self.routing_loop_receive_batch_size)
+            .routing_loop_dispatch_batch_size(self.routing_loop_dispatch_batch_size)
+            .routing_loop_max_running_dispatch_tasks(self.routing_loop_max_running_dispatch_tasks)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -826,6 +853,13 @@ impl Router {
         queue_size = 100,
         queue_timeout_secs = 60,
         rate_limit_tokens_per_second = None,
+        enable_routing_loop = false,
+        routing_loop_check_interval_ms = 10,
+        routing_loop_request_sort_key = String::from("short_length"),
+        routing_loop_multi_priority_queue = false,
+        routing_loop_receive_batch_size = 1024,
+        routing_loop_dispatch_batch_size = 1024,
+        routing_loop_max_running_dispatch_tasks = 4096,
         connection_mode = None,
         model_path = None,
         tokenizer_path = None,
@@ -937,6 +971,13 @@ impl Router {
         queue_size: usize,
         queue_timeout_secs: u64,
         rate_limit_tokens_per_second: Option<i32>,
+        enable_routing_loop: bool,
+        routing_loop_check_interval_ms: u64,
+        routing_loop_request_sort_key: String,
+        routing_loop_multi_priority_queue: bool,
+        routing_loop_receive_batch_size: usize,
+        routing_loop_dispatch_batch_size: usize,
+        routing_loop_max_running_dispatch_tasks: usize,
         connection_mode: Option<String>,
         model_path: Option<String>,
         tokenizer_path: Option<String>,
@@ -1061,6 +1102,13 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            enable_routing_loop,
+            routing_loop_check_interval_ms,
+            routing_loop_request_sort_key,
+            routing_loop_multi_priority_queue,
+            routing_loop_receive_batch_size,
+            routing_loop_dispatch_batch_size,
+            routing_loop_max_running_dispatch_tasks,
             connection_mode,
             model_path,
             tokenizer_path,

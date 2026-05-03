@@ -503,6 +503,35 @@ impl ConfigValidator {
             });
         }
 
+        if config.routing_loop.enabled {
+            for (field, value) in [
+                (
+                    "routing_loop.check_interval_ms",
+                    config.routing_loop.check_interval_ms,
+                ),
+                (
+                    "routing_loop.receive_batch_size",
+                    config.routing_loop.receive_batch_size as u64,
+                ),
+                (
+                    "routing_loop.dispatch_batch_size",
+                    config.routing_loop.dispatch_batch_size as u64,
+                ),
+                (
+                    "routing_loop.max_running_dispatch_tasks",
+                    config.routing_loop.max_running_dispatch_tasks as u64,
+                ),
+            ] {
+                if value == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: field.to_string(),
+                        value: value.to_string(),
+                        reason: "Must be > 0 when routing loop is enabled".to_string(),
+                    });
+                }
+            }
+        }
+
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
             // Allow 0 for pure concurrency limiting (semaphore behavior)
             if tokens_per_second < 0 {

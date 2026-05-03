@@ -59,6 +59,10 @@ use crate::{
     },
     routers::{
         conversations,
+        grpc::routing_loop::{
+            controller::{pause_routing_loop, resume_routing_loop, routing_loop_status},
+            runtime::{run_routing_loop, RoutingLoopRuntime},
+        },
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
             get_mesh_health, get_policy_state, get_policy_states, get_worker_state,
@@ -1110,7 +1114,10 @@ pub fn build_app(
         .route(
             "/v1/tokenizers/{tokenizer_id}/status",
             get(v1_tokenizers_status),
-        );
+        )
+        .route("/routing_loop/status", get(routing_loop_status))
+        .route("/routing_loop/pause", post(pause_routing_loop))
+        .route("/routing_loop/resume", post(resume_routing_loop));
 
     if app_state.context.router_config.skills_enabled
         && app_state
@@ -1304,7 +1311,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
+    let mut app_context = Arc::new(
         AppContext::from_config(
             config.router_config.clone(),
             config.request_timeout_secs,
@@ -1313,6 +1320,30 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         )
         .await?,
     );
+    let mut routing_loop_rx = None;
+
+    if config.router_config.is_routing_loop_enabled() {
+        let (runtime, rx) = RoutingLoopRuntime::new(&config.router_config.routing_loop);
+        routing_loop_rx = Some(rx);
+        let context = Arc::get_mut(&mut app_context).ok_or_else(|| {
+            "failed to initialize routing loop before AppContext sharing".to_string()
+        })?;
+        context.routing_loop_runtime = Some(runtime);
+        info!(
+            "Request routing loop enabled (check_interval_ms: {}, multi_priority_queue: {}, receive_batch_size: {}, dispatch_batch_size: {}, max_running_dispatch_tasks: {})",
+            config.router_config.routing_loop.check_interval_ms,
+            config
+                .router_config
+                .routing_loop
+                .enable_multi_priority_queue,
+            config.router_config.routing_loop.receive_batch_size,
+            config.router_config.routing_loop.dispatch_batch_size,
+            config
+                .router_config
+                .routing_loop
+                .max_running_dispatch_tasks
+        );
+    }
 
     if config.prometheus_config.is_some() {
         app_context.inflight_tracker.start_sampler(20);
@@ -1449,6 +1480,18 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     let router_manager = RouterManager::from_config(&config, &app_context).await?;
     let router: Arc<dyn RouterTrait> = router_manager.clone();
+
+    if let (Some(runtime), Some(rx)) = (
+        app_context.routing_loop_runtime.clone(),
+        routing_loop_rx.take(),
+    ) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "routing loop runs for the lifetime of the server"
+        )]
+        spawn(run_routing_loop(runtime, rx));
+        debug!("Started request routing loop");
+    }
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
