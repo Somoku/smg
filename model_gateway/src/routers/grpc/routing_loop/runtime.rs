@@ -9,6 +9,7 @@ use std::{
 };
 
 use axum::response::Response;
+use metrics::{gauge, histogram};
 use openai_protocol::chat::ChatCompletionResponse;
 use serde::Serialize;
 use tokio::{
@@ -150,6 +151,16 @@ impl RoutingLoopRuntime {
         for entry in entries {
             queue.push(entry);
         }
+        let queue_len = queue.len() as f64;
+        // Update per-version-partition gauges.
+        for (key, size) in queue.per_partition_sizes() {
+            gauge!(
+                "smg_routing_loop_partition_queue_length",
+                "version" => key.to_string(),
+            )
+            .set(size as f64);
+        }
+        gauge!("smg_routing_loop_queue_length").set(queue_len);
     }
 
     async fn pop_entries(&self, max_entries: usize) -> Vec<RoutingQueueEntry> {
@@ -162,6 +173,7 @@ impl RoutingLoopRuntime {
             entries.push(entry);
         }
         queue.remove_empty_partitions();
+        gauge!("smg_routing_loop_queue_length").set(queue.len() as f64);
         entries
     }
 
@@ -174,8 +186,9 @@ impl RoutingLoopRuntime {
     }
 
     fn task_started(&self) {
-        self.running_tasks.fetch_add(1, Ordering::AcqRel);
+        let running = self.running_tasks.fetch_add(1, Ordering::AcqRel) + 1;
         self.set_routing(true);
+        gauge!("smg_routing_loop_running_tasks").set(running as f64);
     }
 
     fn task_finished(&self) {
@@ -183,6 +196,8 @@ impl RoutingLoopRuntime {
         if previous <= 1 {
             self.set_routing(false);
         }
+        let running = if previous > 0 { previous - 1 } else { 0 };
+        gauge!("smg_routing_loop_running_tasks").set(running as f64);
     }
 }
 
@@ -242,7 +257,10 @@ pub(crate) async fn run_routing_loop(
             let runtime_for_task = Arc::clone(&runtime);
             runtime_for_task.task_started();
             dispatch_tasks.spawn(async move {
+                let dispatch_start = std::time::Instant::now();
                 dispatch_entry(entry).await;
+                histogram!("smg_routing_loop_dispatch_duration_seconds")
+                    .record(dispatch_start.elapsed().as_secs_f64());
                 runtime_for_task.task_finished();
             });
         }

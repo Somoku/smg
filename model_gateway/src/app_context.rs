@@ -23,7 +23,10 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
-        grpc::{multimodal::MultimodalConfigRegistry, routing_loop::runtime::RoutingLoopRuntime},
+        grpc::{
+            multimodal::MultimodalConfigRegistry,
+            routing_loop::runtime::{run_routing_loop, RoutingLoopRuntime},
+        },
         openai::realtime::RealtimeRegistry,
         router_manager::RouterManager,
     },
@@ -768,6 +771,21 @@ fn validate_memory_writer_configuration(config: &RouterConfig) -> Result<(), Str
     }
 
     Ok(())
+}
+
+/// Initialize the routing loop runtime for an `AppContext` whose configuration
+/// has `routing_loop.enabled = true`.
+///
+/// This mirrors the production initialization in `server.rs` for test usage:
+/// it creates a [`RoutingLoopRuntime`], stores it in `context.routing_loop_runtime`,
+/// and spawns the background dispatch loop via `tokio::spawn`.
+pub fn init_routing_loop(context: &mut AppContext) {
+    if !context.router_config.routing_loop.enabled {
+        return;
+    }
+    let (runtime, rx) = RoutingLoopRuntime::new(&context.router_config.routing_loop);
+    context.routing_loop_runtime = Some(runtime.clone());
+    tokio::spawn(run_routing_loop(runtime, rx));
 }
 
 #[cfg(test)]

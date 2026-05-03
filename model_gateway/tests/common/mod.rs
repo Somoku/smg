@@ -25,7 +25,7 @@ use openai_protocol::common::{Function, Tool};
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use serde_json::json;
 use smg::{
-    app_context::AppContext,
+    app_context::{init_routing_loop, AppContext},
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
@@ -359,8 +359,7 @@ pub fn create_test_context(
         let workflow_engines = Arc::new(OnceLock::new());
         let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
-        let app_context = Arc::new(
-            AppContext::builder()
+        let mut app_context_inner = AppContext::builder()
                 .router_config(config.clone())
                 .client(client)
                 .rate_limiter(rate_limiter)
@@ -378,8 +377,12 @@ pub fn create_test_context(
                 .workflow_engines(workflow_engines)
                 .mcp_orchestrator(mcp_orchestrator_lock)
                 .build()
-                .unwrap(),
-        );
+                .unwrap();
+
+        // Wire up routing loop if enabled in config (mirrors server.rs initialization)
+        init_routing_loop(&mut app_context_inner);
+
+        let app_context = Arc::new(app_context_inner);
 
         // Mirror production wiring: start the WorkerMonitor event
         // loop so tests exercise the event-driven group reconciliation
@@ -507,8 +510,7 @@ pub fn create_test_context_with_parsers(
         let reasoning_parser_factory = Some(ReasoningParserFactory::new());
         let tool_parser_factory = Some(ToolParserFactory::new());
 
-        let app_context = Arc::new(
-            AppContext::builder()
+        let mut app_context_inner = AppContext::builder()
                 .router_config(config.clone())
                 .client(client)
                 .rate_limiter(rate_limiter)
@@ -526,8 +528,12 @@ pub fn create_test_context_with_parsers(
                 .workflow_engines(workflow_engines)
                 .mcp_orchestrator(mcp_orchestrator_lock)
                 .build()
-                .unwrap(),
-        );
+                .unwrap();
+
+        // Wire up routing loop if enabled in config (mirrors server.rs initialization)
+        init_routing_loop(&mut app_context_inner);
+
+        let app_context = Arc::new(app_context_inner);
 
         // Mirror production wiring: start the WorkerMonitor event
         // loop so tests exercise the event-driven group reconciliation
@@ -654,8 +660,7 @@ pub fn create_test_context_with_mcp_config(
         let workflow_engines = Arc::new(OnceLock::new());
         let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
-        let app_context = Arc::new(
-            AppContext::builder()
+        let mut app_context_inner = AppContext::builder()
                 .router_config(config.clone())
                 .client(client)
                 .rate_limiter(rate_limiter)
@@ -673,8 +678,12 @@ pub fn create_test_context_with_mcp_config(
                 .workflow_engines(workflow_engines)
                 .mcp_orchestrator(mcp_orchestrator_lock)
                 .build()
-                .unwrap(),
-        );
+                .unwrap();
+
+        // Wire up routing loop if enabled in config (mirrors server.rs initialization)
+        init_routing_loop(&mut app_context_inner);
+
+        let app_context = Arc::new(app_context_inner);
 
         // Mirror production wiring: start the WorkerMonitor event
         // loop so tests exercise the event-driven group reconciliation

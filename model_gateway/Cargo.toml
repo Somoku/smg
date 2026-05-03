@@ -197,5 +197,10 @@ name = "sync_alloc_bench"
 harness = false
 path = "benches/sync_alloc_bench.rs"
 
+[[bench]]
+name = "routing_loop_bench"
+harness = false
+path = "benches/routing_loop_bench.rs"
+
 [lints]
 workspace = true

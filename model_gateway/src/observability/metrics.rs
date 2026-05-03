@@ -331,6 +331,24 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
+    // Layer 7: Routing-loop metrics
+    describe_gauge!(
+        "smg_routing_loop_queue_length",
+        "Total number of requests currently queued in the routing-loop"
+    );
+    describe_gauge!(
+        "smg_routing_loop_partition_queue_length",
+        "Number of requests queued in a specific version partition"
+    );
+    describe_gauge!(
+        "smg_routing_loop_running_tasks",
+        "Number of routing-loop dispatch tasks currently executing"
+    );
+    describe_histogram!(
+        "smg_routing_loop_dispatch_duration_seconds",
+        "End-to-end dispatch duration for a single routing-loop entry (preparation already done)"
+    );
+
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
 }
