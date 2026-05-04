@@ -1,0 +1,22 @@
+[package]
+name = "psrl-state"
+version = "0.1.0"
+edition = "2021"
+description = "gRPC client for PSRL PS Manager state service"
+license = "Apache-2.0"
+
+[lib]
+name = "psrl_state"
+
+[dependencies]
+tokio       = { workspace = true }
+tonic       = { workspace = true, features = ["gzip", "transport"] }
+tonic-prost = { workspace = true }
+prost       = { workspace = true }
+prost-types = { workspace = true }
+futures     = { workspace = true }
+tracing     = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14.2"
+prost-build       = "0.14.1"
