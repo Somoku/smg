@@ -17,6 +17,7 @@ use tracing::warn;
 
 use crate::{
     config::RouterConfig,
+    policies::PolicyRegistry,
     worker::{
         registry::WorkerId, worker::worker_to_info, EngineStatsUpdateOutcome, Worker,
         WorkerRegistry, WorkerRoutingControlRequest, WorkerRoutingControlResult,
@@ -211,6 +212,9 @@ pub struct WorkerService {
     worker_registry: Arc<WorkerRegistry>,
     job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
     router_config: RouterConfig,
+    /// Policy registry, used to notify throughput-optimal policies
+    /// when fresh engine stats arrive.
+    policy_registry: Option<Arc<PolicyRegistry>>,
 }
 
 impl WorkerService {
@@ -224,7 +228,15 @@ impl WorkerService {
             worker_registry,
             job_queue,
             router_config,
+            policy_registry: None,
         }
+    }
+
+    /// Attach a policy registry so the service can notify throughput-optimal
+    /// policies when engine stats are applied.
+    pub fn with_policy_registry(mut self, policy_registry: Arc<PolicyRegistry>) -> Self {
+        self.policy_registry = Some(policy_registry);
+        self
     }
 
     /// Parse and validate a worker ID string
@@ -457,6 +469,17 @@ impl WorkerService {
                     let url = worker.url().to_string();
                     let dp_rank = item.dp_rank;
                     let outcome = worker.update_engine_stats(item.stats, staleness_threshold_ms);
+
+                    // Notify throughput-optimal policies that a fresh snapshot has
+                    // been applied so they can reset their optimistic local delta.
+                    if matches!(outcome, EngineStatsUpdateOutcome::Applied) {
+                        if let Some(ref pr) = self.policy_registry {
+                            for policy in pr.get_all_throughput_optimal_policies() {
+                                policy.on_engine_stats_updated(&url);
+                            }
+                        }
+                    }
+
                     results.push(Self::build_stats_update_result(
                         &worker_id, url, dp_rank, outcome,
                     ));

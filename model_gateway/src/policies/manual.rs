@@ -288,7 +288,9 @@ where
 }
 
 fn min_load_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {
-    select_min_by(healthy_indices, |idx| workers[idx].load())
+    select_min_by(healthy_indices, |idx| {
+        workers[idx].engine_stats().waiting_and_running_queue_size()
+    })
 }
 
 fn min_group_select(workers: &[Arc<dyn Worker>], healthy_indices: &[usize]) -> usize {

@@ -1286,7 +1286,9 @@ mod tests {
                 worker_registry,
                 worker_job_queue,
                 router_config,
-            )),
+            ).with_policy_registry(Arc::new(crate::policies::PolicyRegistry::new(
+                router_config.policy.clone(),
+            )))),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
             routing_loop_runtime: None,

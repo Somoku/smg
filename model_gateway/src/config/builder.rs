@@ -144,6 +144,53 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn request_num_balance_policy(mut self) -> Self {
+        self.config.policy = PolicyConfig::RequestNumBalance;
+        self
+    }
+
+    pub fn throughput_optimal_policy(
+        mut self,
+        cost_model_path: String,
+        max_concurrent_seqs_per_instance: usize,
+        delta_throughput_threshold: f64,
+        max_prompt_length: usize,
+        request_budget: usize,
+        max_num_waiting_reqs_after_preemption: usize,
+    ) -> Self {
+        self.config.policy = PolicyConfig::ThroughputOptimal {
+            cost_model_path,
+            max_concurrent_seqs_per_instance,
+            delta_throughput_threshold,
+            max_prompt_length,
+            request_budget,
+            max_num_waiting_reqs_after_preemption,
+        };
+        self
+    }
+
+    pub fn throughput_optimal_with_budget_policy(
+        mut self,
+        budget: usize,
+        cost_model_path: String,
+        max_concurrent_seqs_per_instance: usize,
+        delta_throughput_threshold: f64,
+        max_prompt_length: usize,
+        request_budget: usize,
+        max_num_waiting_reqs_after_preemption: usize,
+    ) -> Self {
+        self.config.policy = PolicyConfig::ThroughputOptimalWithBudget {
+            budget,
+            cost_model_path,
+            max_concurrent_seqs_per_instance,
+            delta_throughput_threshold,
+            max_prompt_length,
+            request_budget,
+            max_num_waiting_reqs_after_preemption,
+        };
+        self
+    }
+
     // ==================== Connection ====================
 
     pub fn connection_mode(mut self, mode: ConnectionMode) -> Self {

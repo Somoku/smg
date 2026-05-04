@@ -293,6 +293,9 @@ impl PolicyRegistry {
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         PolicyFactory::create_from_config(config)
+            .unwrap_or_else(|e| {
+                panic!("Failed to create policy from config: {e}");
+            })
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
@@ -398,7 +401,54 @@ impl PolicyRegistry {
         power_of_two_policies
     }
 
-    /// Initialize cache-aware policy with workers if applicable
+    /// Get all ThroughputOptimal policies (both variants) that need engine-stats
+    /// notifications and completion callbacks (lock-free).
+    ///
+    /// Returns a deduplicated list covering the default policy, PD prefill/decode
+    /// policies, and per-model policies.  The caller can iterate over this to
+    /// invoke [`LoadBalancingPolicy::on_engine_stats_updated`] after a fresh
+    /// engine-stats snapshot is applied for a worker.
+    pub fn get_all_throughput_optimal_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        const NAMES: [&str; 2] = ["throughput_optimal", "throughput_optimal_with_budget"];
+
+        let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
+
+        if NAMES.contains(&self.default_policy.name()) {
+            policies.push(Arc::clone(&self.default_policy));
+        }
+
+        let prefill_policy_opt = self.prefill_policy.get();
+        let decode_policy_opt = self.decode_policy.get();
+
+        if let Some(policy) = prefill_policy_opt {
+            if NAMES.contains(&policy.name()) && !Arc::ptr_eq(policy, &self.default_policy) {
+                policies.push(Arc::clone(policy));
+            }
+        }
+
+        if let Some(policy) = decode_policy_opt {
+            if NAMES.contains(&policy.name())
+                && !Arc::ptr_eq(policy, &self.default_policy)
+                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
+            {
+                policies.push(Arc::clone(policy));
+            }
+        }
+
+        for entry in self.model_policies.iter() {
+            let policy = entry.value();
+            if NAMES.contains(&policy.name()) {
+                let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
+                if !already_added {
+                    policies.push(Arc::clone(policy));
+                }
+            }
+        }
+
+        policies
+    }
+
+
     /// This should be called after workers are registered for a model
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
         // Get the policy for this model

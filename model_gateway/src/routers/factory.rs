@@ -111,9 +111,11 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config))
+                .map_err(|e| e.to_string())?;
         let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config))
+                .map_err(|e| e.to_string())?;
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
@@ -148,9 +150,11 @@ impl RouterFactory {
         ctx: &Arc<AppContext>,
     ) -> Result<Box<dyn RouterTrait>, String> {
         let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
+            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config))
+                .map_err(|e| e.to_string())?;
         let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config))
+                .map_err(|e| e.to_string())?;
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);

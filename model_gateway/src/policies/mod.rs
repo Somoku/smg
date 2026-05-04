@@ -12,7 +12,9 @@ use crate::worker::{HashRing, Worker};
 
 mod bucket;
 mod cache_aware;
+mod completion_guard;
 mod consistent_hashing;
+pub(crate) mod cost_model_utils;
 mod dp_min_token;
 mod factory;
 mod manual;
@@ -20,11 +22,14 @@ mod power_of_two;
 mod prefix_hash;
 mod random;
 mod registry;
+mod request_num_balance;
 mod round_robin;
+mod throughput_optimal;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::CacheAwarePolicy;
+pub use completion_guard::PolicyCompletionGuard;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -35,7 +40,11 @@ pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
+pub use request_num_balance::RequestNumBalancePolicy;
 pub use round_robin::RoundRobinPolicy;
+pub use throughput_optimal::{
+    ThroughputOptimalConfig, ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
+};
 
 /// Core trait for load balancing policies
 ///
@@ -57,6 +66,36 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// This is called when a request completes (successfully or not) to allow
     /// policies to update their internal state.
     fn on_request_complete(&self, _worker_url: &str, _success: bool) {
+        // Default: no-op for stateless policies
+    }
+
+    /// Update policy local state after request completion, providing the token
+    /// delta that should be subtracted from the worker's local optimistic state.
+    ///
+    /// `token_delta` is the number of tokens that were added to the worker's
+    /// local state when the request was routed.  When `None`, the policy should
+    /// fall back to a conservative (no-op) update.
+    ///
+    /// Supersedes [`on_request_complete`] for state-tracking policies; stateless
+    /// policies can leave this as the default no-op.
+    ///
+    /// [`on_request_complete`]: LoadBalancingPolicy::on_request_complete
+    fn on_request_complete_with_tokens(
+        &self,
+        _worker_url: &str,
+        _token_delta: Option<i64>,
+        _success: bool,
+    ) {
+        // Default: no-op for stateless policies
+    }
+
+    /// Notify the policy that fresh engine stats have just been applied for the
+    /// given worker, so any locally-tracked optimistic delta can be reset.
+    ///
+    /// Called from the worker-stats update path immediately after a successful
+    /// `EngineStats` application (i.e., `EngineStatsUpdateOutcome::Applied`).
+    /// Stateless policies can leave this as the default no-op.
+    fn on_engine_stats_updated(&self, _worker_url: &str) {
         // Default: no-op for stateless policies
     }
 
@@ -178,6 +217,27 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
+    /// Number of response tokens already generated (for continuation / multi-turn requests).
+    ///
+    /// Used by throughput-optimal policies to correctly split prompt vs. response tokens
+    /// when computing KV-cache budget-aligned token counts. When `None`, the policy
+    /// conservatively treats all tokens as prompt tokens.
+    ///
+    /// TODO(psrl-refactor): populate from parsed request body (commit 25ad721b)
+    pub response_token_count: Option<usize>,
+    /// Per-worker priority group values for version-aware routing.
+    ///
+    /// When set, this slice has one entry per worker (indexed identically to the
+    /// `workers` slice passed to `select_worker`).  Workers are grouped by their
+    /// priority value; the group with the **largest** value is tried first, and the
+    /// policy falls back to lower-priority groups only if no worker in the
+    /// higher-priority group can accept the request.
+    ///
+    /// `None` means all workers are treated as equal priority (default behaviour).
+    ///
+    /// TODO(psrl-refactor): populate from route_kwargs candidate_indicator_list
+    ///   (commits 100658fe, 2eebc614)
+    pub priority_groups: Option<&'a [i64]>,
 }
 
 #[cfg(test)]

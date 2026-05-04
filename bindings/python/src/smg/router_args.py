@@ -41,6 +41,13 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
+    budget: int = 1  # Token-budget for throughput_optimal_with_budget policy (KV-cache page granularity)
+    cost_model_path: str | None = None  # Path to cost model JSON for throughput_optimal / throughput_optimal_with_budget policy
+    max_concurrent_seqs_per_instance: int = 100  # Max concurrent sequences per instance (throughput_optimal policy)
+    delta_throughput_threshold: float = 0.5  # Throughput delta threshold for throughput_optimal policy
+    max_prompt_length: int = 8192  # Max prompt length for throughput_optimal policy
+    request_budget: int = 1024  # KV-cache page size in tokens for throughput_optimal policy
+    max_num_waiting_reqs_after_preemption: int = 1000  # Max waiting requests after preemption for throughput_optimal policy
     dp_aware: bool = False
     dp_minimum_tokens_scheduler: bool = False
     enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
@@ -298,7 +305,8 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual",
+                     "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
@@ -315,6 +323,9 @@ class RouterArgs:
                 "power_of_two",
                 "manual",
                 "bucket",
+                "request_num_balance",
+                "throughput_optimal",
+                "throughput_optimal_with_budget",
             ],
             help=(
                 "Specific policy for prefill nodes in PD mode."
@@ -325,7 +336,8 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual"],
+            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual",
+                     "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"],
             help=(
                 "Specific policy for decode nodes in PD mode."
                 " If not specified, uses the main policy"
@@ -360,6 +372,73 @@ class RouterArgs:
             type=int,
             default=RouterArgs.bucket_adjust_interval_secs,
             help="Interval in seconds between bucket boundary adjustment operations",
+        )
+        routing_group.add_argument(
+            f"--{prefix}budget",
+            type=int,
+            default=RouterArgs.budget,
+            help=(
+                "Token-budget page granularity for throughput_optimal_with_budget policy."
+                " Response tokens are rounded up to the nearest multiple of budget before summing."
+                " Must be >= 1 (default: 1, which gives exact token counts)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}cost-model-path",
+            type=str,
+            default=None,
+            help=(
+                "Path to a JSON cost-model file for throughput_optimal /"
+                " throughput_optimal_with_budget policy. Required when using these policies."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-concurrent-seqs-per-instance",
+            type=int,
+            default=RouterArgs.max_concurrent_seqs_per_instance,
+            help=(
+                "Maximum number of concurrent sequences per instance for throughput_optimal policy."
+                " Workers with this many or more queued requests are skipped (default: 100)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}delta-throughput-threshold",
+            type=float,
+            default=RouterArgs.delta_throughput_threshold,
+            help=(
+                "Fraction of baseline throughput that a marginal gain must exceed before"
+                " a worker is accepted in throughput_optimal policy."
+                " Higher values make the policy more conservative (default: 0.5)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-prompt-length",
+            type=int,
+            default=RouterArgs.max_prompt_length,
+            help=(
+                "Maximum context length for throughput_optimal policy."
+                " Overridden per-worker by the max_model_len / max_total_tokens label"
+                " (default: 8192)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}request-budget",
+            type=int,
+            default=RouterArgs.request_budget,
+            help=(
+                "KV-cache page size in tokens for throughput_optimal policy."
+                " Used to round response tokens up to the nearest page boundary"
+                " (default: 1024)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}max-num-waiting-reqs-after-preemption",
+            type=int,
+            default=RouterArgs.max_num_waiting_reqs_after_preemption,
+            help=(
+                "Maximum number of waiting requests after preemption for throughput_optimal policy."
+                " Used in the max_model_len fallback calculation (default: 1000)."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}eviction-interval-secs",

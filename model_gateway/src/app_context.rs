@@ -362,11 +362,17 @@ impl AppContextBuilder {
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
 
         // Create WorkerService from the already-built components
+        let policy_registry_ref = self
+            .policy_registry
+            .as_ref()
+            .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
         let worker_service = Arc::new(WorkerService::new(
-            worker_registry.clone(),
-            worker_job_queue.clone(),
-            router_config.clone(),
-        ));
+                worker_registry.clone(),
+                worker_job_queue.clone(),
+                router_config.clone(),
+            )
+            .with_policy_registry(Arc::clone(policy_registry_ref)),
+        );
 
         Ok(AppContext {
             client: self

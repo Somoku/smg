@@ -466,6 +466,16 @@ impl ConfigValidator {
                     });
                 }
             }
+            PolicyConfig::RequestNumBalance | PolicyConfig::ThroughputOptimal { .. } => {}
+            PolicyConfig::ThroughputOptimalWithBudget { budget, .. } => {
+                if *budget == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "budget".to_string(),
+                        value: budget.to_string(),
+                        reason: "Must be >= 1 (0 is treated as 1 at runtime, but explicit 0 in config is rejected to surface misconfiguration)".to_string(),
+                    });
+                }
+            }
         }
         Ok(())
     }

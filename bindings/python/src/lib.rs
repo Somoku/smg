@@ -17,8 +17,9 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    ThroughputOptimal,
+    ThroughputOptimalWithBudget,
 }
-
 #[pyclass(eq, from_py_object)]
 #[derive(Clone, PartialEq, Debug)]
 pub enum BackendType {
@@ -377,6 +378,13 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     block_size: usize,
+    max_concurrent_seqs_per_instance: usize,
+    delta_throughput_threshold: f64,
+    max_prompt_length: usize,
+    request_budget: usize,
+    max_num_waiting_reqs_after_preemption: usize,
+    budget: usize,
+    cost_model_path: Option<String>,
     max_idle_secs: u64,
     assignment_mode: String,
     max_payload_size: usize,
@@ -546,6 +554,27 @@ impl Router {
                     prefix_token_count: 256,
                     load_factor: 1.25,
                 },
+                PolicyType::ThroughputOptimal => {
+                    ConfigPolicyConfig::ThroughputOptimal {
+                        cost_model_path: self.cost_model_path.clone().unwrap_or_default(),
+                        max_concurrent_seqs_per_instance: self.max_concurrent_seqs_per_instance,
+                        delta_throughput_threshold: self.delta_throughput_threshold,
+                        max_prompt_length: self.max_prompt_length,
+                        request_budget: self.request_budget,
+                        max_num_waiting_reqs_after_preemption: self.max_num_waiting_reqs_after_preemption,
+                    }
+                }
+                PolicyType::ThroughputOptimalWithBudget => {
+                    ConfigPolicyConfig::ThroughputOptimalWithBudget {
+                        budget: self.budget,
+                        cost_model_path: self.cost_model_path.clone().unwrap_or_default(),
+                        max_concurrent_seqs_per_instance: self.max_concurrent_seqs_per_instance,
+                        delta_throughput_threshold: self.delta_throughput_threshold,
+                        max_prompt_length: self.max_prompt_length,
+                        request_budget: self.request_budget,
+                        max_num_waiting_reqs_after_preemption: self.max_num_waiting_reqs_after_preemption,
+                    }
+                }
             })
         };
 
@@ -796,6 +825,13 @@ impl Router {
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         block_size = 16,
+        max_concurrent_seqs_per_instance = 100,
+        delta_throughput_threshold = 0.5,
+        max_prompt_length = 8192,
+        request_budget = 1024,
+        max_num_waiting_reqs_after_preemption = 1000,
+        budget = 1,
+        cost_model_path = None,
         max_idle_secs = 14400,
         assignment_mode = String::from("random"),
         max_payload_size = 512 * 1024 * 1024,
@@ -914,6 +950,13 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         block_size: usize,
+        max_concurrent_seqs_per_instance: usize,
+        delta_throughput_threshold: f64,
+        max_prompt_length: usize,
+        request_budget: usize,
+        max_num_waiting_reqs_after_preemption: usize,
+        budget: usize,
+        cost_model_path: Option<String>,
         max_idle_secs: u64,
         assignment_mode: String,
         max_payload_size: usize,
@@ -1045,6 +1088,13 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             block_size,
+            max_concurrent_seqs_per_instance,
+            delta_throughput_threshold,
+            max_prompt_length,
+            request_budget,
+            max_num_waiting_reqs_after_preemption,
+            budget,
+            cost_model_path,
             max_idle_secs,
             assignment_mode,
             max_payload_size,

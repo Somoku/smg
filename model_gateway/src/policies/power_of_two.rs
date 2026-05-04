@@ -78,10 +78,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             }
             _ => {
                 // One or both are missing load data.
-                // Fallback to local request counts for BOTH.
+                // Fallback to engine-stats running+waiting request counts for BOTH.
                 (
-                    worker1.load() as f64,
-                    worker2.load() as f64,
+                    worker1.engine_stats().waiting_and_running_queue_size() as f64,
+                    worker2.engine_stats().waiting_and_running_queue_size() as f64,
                     "request_count",
                 )
             }

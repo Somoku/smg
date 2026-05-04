@@ -119,6 +119,89 @@ impl TestRouterConfig {
         Self::manual_with_mode(port, ManualAssignmentMode::Random)
     }
 
+    /// Create a request_num_balance config (queue-length minimisation)
+    pub fn request_num_balance(port: u16) -> RouterConfig {
+        apply_test_defaults(
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .request_num_balance_policy()
+                .host(defaults::HOST)
+                .port(port)
+                .max_payload_size(defaults::MAX_PAYLOAD_SIZE)
+                .request_timeout_secs(defaults::REQUEST_TIMEOUT_SECS)
+                .worker_startup_timeout_secs(defaults::WORKER_STARTUP_TIMEOUT_SECS)
+                .worker_startup_check_interval_secs(defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS)
+                .max_concurrent_requests(defaults::MAX_CONCURRENT_REQUESTS)
+                .queue_timeout_secs(defaults::QUEUE_TIMEOUT_SECS)
+                .build_unchecked(),
+        )
+    }
+
+    /// Create a throughput_optimal config (minimum token-count routing)
+    pub fn throughput_optimal(port: u16) -> RouterConfig {
+        let cost_model_path = Self::create_test_cost_model_file();
+        apply_test_defaults(
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .throughput_optimal_policy(
+                    cost_model_path,
+                    1024, // max_concurrent_seqs_per_instance
+                    0.5,  // delta_throughput_threshold
+                    8192, // max_prompt_length
+                    1024, // request_budget
+                    1000, // max_num_waiting_reqs_after_preemption
+                )
+                .host(defaults::HOST)
+                .port(port)
+                .max_payload_size(defaults::MAX_PAYLOAD_SIZE)
+                .request_timeout_secs(defaults::REQUEST_TIMEOUT_SECS)
+                .worker_startup_timeout_secs(defaults::WORKER_STARTUP_TIMEOUT_SECS)
+                .worker_startup_check_interval_secs(defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS)
+                .max_concurrent_requests(defaults::MAX_CONCURRENT_REQUESTS)
+                .queue_timeout_secs(defaults::QUEUE_TIMEOUT_SECS)
+                .build_unchecked(),
+        )
+    }
+
+    /// Create a throughput_optimal_with_budget config
+    pub fn throughput_optimal_with_budget(port: u16, budget: usize) -> RouterConfig {
+        let cost_model_path = Self::create_test_cost_model_file();
+        apply_test_defaults(
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .throughput_optimal_with_budget_policy(
+                    budget,
+                    cost_model_path,
+                    1024, // max_concurrent_seqs_per_instance
+                    0.5,  // delta_throughput_threshold
+                    8192, // max_prompt_length
+                    1024, // request_budget
+                    1000, // max_num_waiting_reqs_after_preemption
+                )
+                .host(defaults::HOST)
+                .port(port)
+                .max_payload_size(defaults::MAX_PAYLOAD_SIZE)
+                .request_timeout_secs(defaults::REQUEST_TIMEOUT_SECS)
+                .worker_startup_timeout_secs(defaults::WORKER_STARTUP_TIMEOUT_SECS)
+                .worker_startup_check_interval_secs(defaults::WORKER_STARTUP_CHECK_INTERVAL_SECS)
+                .max_concurrent_requests(defaults::MAX_CONCURRENT_REQUESTS)
+                .queue_timeout_secs(defaults::QUEUE_TIMEOUT_SECS)
+                .build_unchecked(),
+        )
+    }
+
+    /// Create a temporary JSON cost-model file covering `TP1_PP1`
+    /// (the key produced by mock workers whose `tp_size = 1`).
+    pub fn create_test_cost_model_file() -> String {
+        use std::io::Write;
+        let json = r#"{"TP1_PP1":{"other_threshold":0.5,"other_latency_b":0.1,"other_latency_k":0.02,"attn_latency_b":0.05,"attn_latency_k":0.001}}"#;
+        let mut tf = tempfile::NamedTempFile::new().expect("create temp cost model file");
+        tf.write_all(json.as_bytes())
+            .expect("write cost model");
+        let path = tf.into_temp_path().keep().expect("persist cost model file");
+        path.to_string_lossy().into_owned()
+    }
+
     /// Create a manual routing config with min_group assignment mode
     pub fn manual_min_group(port: u16) -> RouterConfig {
         Self::manual_with_mode(port, ManualAssignmentMode::MinGroup)

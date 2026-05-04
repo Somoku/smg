@@ -36,7 +36,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyCompletionGuard, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
             header_utils,
@@ -137,12 +137,15 @@ impl Router {
     /// Select worker considering circuit breaker state.
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
+    ///
+    /// Returns `(worker, policy)` so the caller can create a
+    /// [`PolicyCompletionGuard`] without a second policy lookup.
     fn select_worker_for_model(
         &self,
         model_id: &str,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
-    ) -> Option<Arc<dyn Worker>> {
+    ) -> Option<(Arc<dyn Worker>, Arc<dyn LoadBalancingPolicy>)> {
         // UNKNOWN_MODEL_ID means caller didn't specify a model — find any available worker
         let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
             None
@@ -179,6 +182,8 @@ impl Router {
                 tokens: None, // HTTP doesn't have tokens, use gRPC for PrefixHash
                 headers,
                 hash_ring,
+                response_token_count: None,
+                priority_groups: None,
             },
         )?;
 
@@ -190,7 +195,7 @@ impl Router {
             policy.name(),
         );
 
-        Some(available[idx].clone())
+        Some((available[idx].clone(), policy))
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -287,8 +292,8 @@ impl Router {
         is_stream: bool,
         text: &str,
     ) -> Response {
-        let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
-            Some(w) => w,
+        let (worker, policy) = match self.select_worker_for_model(model_id, Some(text), headers) {
+            Some(pair) => pair,
             None => {
                 // Distinguish "no workers for this model" from "workers exist but unavailable"
                 let model_filter = if model_id == crate::worker::UNKNOWN_MODEL_ID {
@@ -314,11 +319,21 @@ impl Router {
             }
         };
 
-        let policy = self.policy_registry.get_policy_or_default(model_id);
-
         let load_guard = ["cache_aware", "manual"]
             .contains(&policy.name())
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
+
+        // Create a completion guard that will decrement the policy's optimistic
+        // local state when the request completes (or the response body is dropped).
+        //
+        // For stateless policies `on_request_complete_with_tokens` is a no-op,
+        // so this guard is cheap and safe to create unconditionally.
+        let policy_guard = PolicyCompletionGuard::new(
+            policy,
+            worker.url().to_owned(),
+            Some(1), // matches the fallback token count used by ThroughputRuntime
+            true,    // assume success; overridden to false on server errors below
+        );
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -334,6 +349,7 @@ impl Router {
                 worker.as_ref(),
                 is_stream,
                 load_guard,
+                policy_guard,
             )
             .await;
 
@@ -572,6 +588,8 @@ impl Router {
                 tokens: None,
                 headers,
                 hash_ring,
+                response_token_count: None,
+                priority_groups: None,
             },
         ) {
             Some(i) => i,
@@ -840,6 +858,7 @@ impl Router {
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
+        mut policy_guard: PolicyCompletionGuard,
     ) -> Response {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
@@ -892,6 +911,9 @@ impl Router {
                     e
                 );
 
+                // Mark the request as failed so the policy guard decrements
+                // the local state with the correct success flag.
+                policy_guard.set_success(false);
                 return convert_reqwest_error(e);
             }
         };
@@ -942,6 +964,9 @@ impl Router {
             if let Some(guard) = load_guard {
                 response = AttachedBody::wrap_response(response, guard);
             }
+            // Attach policy completion guard so local state is decremented
+            // when the streaming body is fully consumed or the client disconnects.
+            response = AttachedBody::wrap_response(response, policy_guard);
             response
         } else {
             // For non-streaming requests, preserve headers
@@ -960,7 +985,10 @@ impl Router {
                 }
             };
 
-            // load_guard dropped here automatically after response body is read
+            // load_guard and policy_guard are both dropped here automatically
+            // after the response body is read.
+            drop(load_guard);
+            drop(policy_guard);
             response
         }
     }

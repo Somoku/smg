@@ -457,6 +457,81 @@ pub enum PolicyConfig {
         #[serde(default = "default_load_factor")]
         load_factor: f64,
     },
+
+    /// Request-number balance policy.
+    ///
+    /// Selects the healthy worker with the fewest in-flight requests
+    /// (running + waiting).  Suitable for workloads where request latency is
+    /// roughly uniform.
+    #[serde(rename = "request_num_balance")]
+    RequestNumBalance,
+
+    /// Throughput-optimal policy.
+    ///
+    /// Selects the healthy worker with the lowest total token count
+    /// (prompt + response) across all in-flight requests.  Token counts are
+    /// read from pre-aggregated O(1) fields — no per-request map scan.
+    #[serde(rename = "throughput_optimal")]
+    ThroughputOptimal {
+        /// Path to a JSON cost-model file (keyed by `"TP{n}_PP{m}"`).
+        cost_model_path: String,
+        /// Workers with this many or more queued requests are skipped.
+        #[serde(default = "default_max_concurrent_seqs_per_instance")]
+        max_concurrent_seqs_per_instance: usize,
+        /// Fraction of the baseline throughput that a marginal gain must exceed
+        /// before the worker is accepted.  Raising this value makes the policy more
+        /// conservative (prefers idle workers).
+        #[serde(default = "default_delta_throughput_threshold")]
+        delta_throughput_threshold: f64,
+        /// Maximum context length used to decide whether a new request fits.
+        /// Overridden per-worker by the `max_model_len` / `max_total_tokens` label.
+        #[serde(default = "default_max_prompt_length")]
+        max_prompt_length: usize,
+        /// KV-cache page size in tokens.  Used by [`ThroughputOptimalWithBudgetPolicy`]
+        /// to round response tokens up to the nearest page boundary.
+        #[serde(default = "default_request_budget")]
+        request_budget: usize,
+        /// Workers are assumed to have at most this many waiting requests after
+        /// preemption; used in the `max_model_len` fallback calculation.
+        #[serde(default = "default_max_num_waiting_reqs_after_preemption")]
+        max_num_waiting_reqs_after_preemption: usize,
+    },
+
+    /// Throughput-optimal-with-budget policy.
+    ///
+    /// Like `throughput_optimal`, but each request's response tokens are
+    /// rounded up to the nearest multiple of `budget` before summing.  This
+    /// accounts for KV-cache page granularity.  `budget = 1` degrades to
+    /// exact token counts (same as `throughput_optimal`).
+    #[serde(rename = "throughput_optimal_with_budget")]
+    ThroughputOptimalWithBudget {
+        /// KV-cache page size in tokens.  Response tokens are rounded up to
+        /// the nearest multiple of this value (default: 1).
+        #[serde(default = "default_token_budget")]
+        budget: usize,
+        /// Path to a JSON cost-model file (keyed by `"TP{n}_PP{m}"`).
+        cost_model_path: String,
+        /// Workers with this many or more queued requests are skipped.
+        #[serde(default = "default_max_concurrent_seqs_per_instance")]
+        max_concurrent_seqs_per_instance: usize,
+        /// Fraction of the baseline throughput that a marginal gain must exceed
+        /// before the worker is accepted.  Raising this value makes the policy more
+        /// conservative (prefers idle workers).
+        #[serde(default = "default_delta_throughput_threshold")]
+        delta_throughput_threshold: f64,
+        /// Maximum context length used to decide whether a new request fits.
+        /// Overridden per-worker by the `max_model_len` / `max_total_tokens` label.
+        #[serde(default = "default_max_prompt_length")]
+        max_prompt_length: usize,
+        /// KV-cache page size in tokens.  Used by [`ThroughputOptimalWithBudgetPolicy`]
+        /// to round response tokens up to the nearest page boundary.
+        #[serde(default = "default_request_budget")]
+        request_budget: usize,
+        /// Workers are assumed to have at most this many waiting requests after
+        /// preemption; used in the `max_model_len` fallback calculation.
+        #[serde(default = "default_max_num_waiting_reqs_after_preemption")]
+        max_num_waiting_reqs_after_preemption: usize,
+    },
 }
 
 fn default_block_size() -> usize {
@@ -469,6 +544,30 @@ fn default_prefix_token_count() -> usize {
 
 fn default_load_factor() -> f64 {
     1.25
+}
+
+fn default_token_budget() -> usize {
+    1
+}
+
+fn default_max_concurrent_seqs_per_instance() -> usize {
+    100
+}
+
+fn default_delta_throughput_threshold() -> f64 {
+    0.5
+}
+
+fn default_max_prompt_length() -> usize {
+    8192
+}
+
+fn default_request_budget() -> usize {
+    1024
+}
+
+fn default_max_num_waiting_reqs_after_preemption() -> usize {
+    1000
 }
 
 fn default_manual_eviction_interval_secs() -> u64 {
@@ -490,6 +589,9 @@ impl PolicyConfig {
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
             PolicyConfig::PrefixHash { .. } => "prefix_hash",
+            PolicyConfig::RequestNumBalance => "request_num_balance",
+            PolicyConfig::ThroughputOptimal { .. } => "throughput_optimal",
+            PolicyConfig::ThroughputOptimalWithBudget { .. } => "throughput_optimal_with_budget",
         }
     }
 }

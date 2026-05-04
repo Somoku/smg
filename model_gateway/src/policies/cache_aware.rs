@@ -534,15 +534,17 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         // Log load balancing trigger (only compute worker loads if debug enabled)
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let worker_loads: Vec<(&str, usize)> =
-                workers.iter().map(|w| (w.url(), w.load())).collect();
+            let worker_loads: Vec<(&str, usize)> = workers
+                .iter()
+                .map(|w| (w.url(), w.engine_stats().waiting_and_running_queue_size()))
+                .collect();
             debug!("Load balancing triggered | workers: {:?}", worker_loads);
         }
 
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
+            .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
             .copied()?;
 
         let worker_url = workers[min_load_idx].url();
@@ -706,7 +708,7 @@ impl CacheAwarePolicy {
         // No cache overlap — min-load fallback (no token tree involved)
         let min_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].load())
+            .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
             .copied()?;
         debug!(
             worker = workers[min_idx].url(),
@@ -757,7 +759,7 @@ impl CacheAwarePolicy {
                     .and_then(|id| overlap.scores.get(&id))
                     .copied()
                     .unwrap_or(0);
-                let load = workers[idx].load();
+                let load = workers[idx].engine_stats().waiting_and_running_queue_size();
                 let tree_size = wid
                     .and_then(|id| overlap.tree_sizes.get(&id))
                     .copied()
@@ -808,7 +810,7 @@ impl CacheAwarePolicy {
             } else {
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
                     .copied()
             };
 
@@ -869,7 +871,7 @@ impl CacheAwarePolicy {
             } else {
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].load())
+                    .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
                     .copied()
             };
 

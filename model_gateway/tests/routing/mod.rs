@@ -13,3 +13,4 @@ pub mod test_openai_routing;
 pub mod test_pd_routing;
 pub mod routing_loop_test;
 pub mod worker_management_test;
+pub mod load_aware_policy_test;
