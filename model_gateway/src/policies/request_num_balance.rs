@@ -59,7 +59,9 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, EngineSchedulerStats, EngineStats, EngineStatsUpdateOutcome, WorkerType};
+    use crate::worker::{
+        BasicWorkerBuilder, EngineSchedulerStats, EngineStats, EngineStatsUpdateOutcome, WorkerType,
+    };
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
@@ -79,9 +81,8 @@ mod tests {
 
     fn set_queue(worker: &Arc<dyn Worker>, running: usize, waiting: usize) {
         // Far-future timestamp so monotonicity always passes across successive calls.
-        let timestamp = chrono::TimeZone::with_ymd_and_hms(
-            &chrono::Utc, 2099, 1, 1, 0, 0, 0
-        ).unwrap();
+        let timestamp =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2099, 1, 1, 0, 0, 0).unwrap();
         let stats = EngineStats {
             timestamp,
             scheduler_stats: EngineSchedulerStats {
@@ -109,7 +110,10 @@ mod tests {
     #[test]
     fn empty_workers_returns_none() {
         let policy = RequestNumBalancePolicy::new();
-        assert_eq!(policy.select_worker(&[], &SelectWorkerInfo::default()), None);
+        assert_eq!(
+            policy.select_worker(&[], &SelectWorkerInfo::default()),
+            None
+        );
     }
 
     #[test]
@@ -169,7 +173,10 @@ mod tests {
         w1.set_status(WorkerStatus::NotReady);
 
         let workers: Vec<Arc<dyn Worker>> = vec![w0, w1];
-        assert_eq!(policy.select_worker(&workers, &SelectWorkerInfo::default()), None);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            None
+        );
     }
 
     #[test]

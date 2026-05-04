@@ -104,17 +104,17 @@ impl PolicyFactory {
             } => {
                 // `budget` is the KV-cache page granularity used by the WithBudget
                 // variant; it maps to `request_budget` in the shared config.
-                let policy = ThroughputOptimalWithBudgetPolicy::with_config(
-                    ThroughputOptimalConfig {
+                let policy =
+                    ThroughputOptimalWithBudgetPolicy::with_config(ThroughputOptimalConfig {
                         request_budget: *budget,
                         cost_model_path: cost_model_path.clone(),
                         max_concurrent_seqs_per_instance: *max_concurrent_seqs_per_instance,
                         delta_throughput_threshold: *delta_throughput_threshold,
                         max_prompt_length: *max_prompt_length,
-                        max_num_waiting_reqs_after_preemption: *max_num_waiting_reqs_after_preemption,
-                    },
-                )
-                .map_err(|e| ConfigError::ValidationFailed { reason: e })?;
+                        max_num_waiting_reqs_after_preemption:
+                            *max_num_waiting_reqs_after_preemption,
+                    })
+                    .map_err(|e| ConfigError::ValidationFailed { reason: e })?;
                 Ok(Arc::new(policy))
             }
         }
@@ -167,7 +167,8 @@ mod tests {
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(policy.name(), "power_of_two");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::CacheAware {
@@ -177,28 +178,30 @@ mod tests {
             eviction_interval_secs: 30,
             max_tree_size: 1000,
             block_size: 16,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(policy.name(), "cache_aware");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Bucket {
             balance_abs_threshold: 10,
             balance_rel_threshold: 1.5,
             bucket_adjust_interval_secs: 5,
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(policy.name(), "bucket");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::Manual {
             eviction_interval_secs: 60,
             max_idle_secs: 4 * 3600,
             assignment_mode: Default::default(),
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(policy.name(), "manual");
 
         let policy = PolicyFactory::create_from_config(&PolicyConfig::ConsistentHashing).unwrap();
         assert_eq!(policy.name(), "consistent_hashing");
 
-        let policy =
-            PolicyFactory::create_from_config(&PolicyConfig::RequestNumBalance).unwrap();
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::RequestNumBalance).unwrap();
         assert_eq!(policy.name(), "request_num_balance");
 
         // ThroughputOptimal requires a valid cost model path.

@@ -196,8 +196,7 @@ impl TestRouterConfig {
         use std::io::Write;
         let json = r#"{"TP1_PP1":{"other_threshold":0.5,"other_latency_b":0.1,"other_latency_k":0.02,"attn_latency_b":0.05,"attn_latency_k":0.001}}"#;
         let mut tf = tempfile::NamedTempFile::new().expect("create temp cost model file");
-        tf.write_all(json.as_bytes())
-            .expect("write cost model");
+        tf.write_all(json.as_bytes()).expect("write cost model");
         let path = tf.into_temp_path().keep().expect("persist cost model file");
         path.to_string_lossy().into_owned()
     }

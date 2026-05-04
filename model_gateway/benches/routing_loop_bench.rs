@@ -252,20 +252,19 @@ fn bench_multi_queue_push(c: &mut Criterion) {
         for &partitions in &[2usize, 8, 32] {
             let param = format!("{n}_entries_{partitions}_partitions");
             group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::new("n_partitions", &param), &(n, partitions), |b, &(n, p)| {
-                b.iter(|| {
-                    let mut q = MultiQueue::new();
-                    for i in 0..n {
-                        q.push(
-                            black_box(i as u64),
-                            false,
-                            (i % p) as i64,
-                            i % 128,
-                        );
-                    }
-                    black_box(q.len());
-                });
-            });
+            group.bench_with_input(
+                BenchmarkId::new("n_partitions", &param),
+                &(n, partitions),
+                |b, &(n, p)| {
+                    b.iter(|| {
+                        let mut q = MultiQueue::new();
+                        for i in 0..n {
+                            q.push(black_box(i as u64), false, (i % p) as i64, i % 128);
+                        }
+                        black_box(q.len());
+                    });
+                },
+            );
         }
     }
     group.finish();
@@ -282,20 +281,24 @@ fn bench_multi_queue_pop(c: &mut Criterion) {
         for &partitions in &[2usize, 8, 32] {
             let param = format!("{n}_entries_{partitions}_partitions");
             group.throughput(Throughput::Elements(n as u64));
-            group.bench_with_input(BenchmarkId::new("n_partitions", &param), &(n, partitions), |b, &(n, p)| {
-                b.iter_batched(
-                    || make_multi_queue(n, p),
-                    |mut q| {
-                        let mut total = 0u64;
-                        while let Some(id) = q.pop() {
-                            total += black_box(id);
-                        }
-                        q.remove_empty_partitions();
-                        black_box(total);
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            });
+            group.bench_with_input(
+                BenchmarkId::new("n_partitions", &param),
+                &(n, partitions),
+                |b, &(n, p)| {
+                    b.iter_batched(
+                        || make_multi_queue(n, p),
+                        |mut q| {
+                            let mut total = 0u64;
+                            while let Some(id) = q.pop() {
+                                total += black_box(id);
+                            }
+                            q.remove_empty_partitions();
+                            black_box(total);
+                        },
+                        criterion::BatchSize::SmallInput,
+                    );
+                },
+            );
         }
     }
     group.finish();
@@ -384,8 +387,7 @@ fn bench_mpsc_enqueue_throughput(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
                 rt.block_on(async {
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::unbounded_channel::<u64>();
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
                     for i in 0..n {
                         tx.send(black_box(i as u64)).unwrap();
                     }

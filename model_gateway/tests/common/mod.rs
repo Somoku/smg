@@ -360,24 +360,24 @@ pub fn create_test_context(
         let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
         let mut app_context_inner = AppContext::builder()
-                .router_config(config.clone())
-                .client(client)
-                .rate_limiter(rate_limiter)
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-                .reasoning_parser_factory(None) // reasoning_parser_factory
-                .tool_parser_factory(None) // tool_parser_factory
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(response_storage)
-                .conversation_storage(conversation_storage)
-                .conversation_item_storage(conversation_item_storage)
-                .conversation_memory_writer(conversation_memory_writer)
-                .worker_monitor(worker_monitor)
-                .worker_job_queue(worker_job_queue)
-                .workflow_engines(workflow_engines)
-                .mcp_orchestrator(mcp_orchestrator_lock)
-                .build()
-                .unwrap();
+            .router_config(config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .conversation_memory_writer(conversation_memory_writer)
+            .worker_monitor(worker_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engines(workflow_engines)
+            .mcp_orchestrator(mcp_orchestrator_lock)
+            .build()
+            .unwrap();
 
         // Wire up routing loop if enabled in config (mirrors server.rs initialization)
         init_routing_loop(&mut app_context_inner);
@@ -511,24 +511,24 @@ pub fn create_test_context_with_parsers(
         let tool_parser_factory = Some(ToolParserFactory::new());
 
         let mut app_context_inner = AppContext::builder()
-                .router_config(config.clone())
-                .client(client)
-                .rate_limiter(rate_limiter)
-                .tokenizer_registry(tokenizer_registry)
-                .reasoning_parser_factory(reasoning_parser_factory)
-                .tool_parser_factory(tool_parser_factory)
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(response_storage)
-                .conversation_storage(conversation_storage)
-                .conversation_item_storage(conversation_item_storage)
-                .conversation_memory_writer(conversation_memory_writer)
-                .worker_monitor(worker_monitor)
-                .worker_job_queue(worker_job_queue)
-                .workflow_engines(workflow_engines)
-                .mcp_orchestrator(mcp_orchestrator_lock)
-                .build()
-                .unwrap();
+            .router_config(config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer_registry(tokenizer_registry)
+            .reasoning_parser_factory(reasoning_parser_factory)
+            .tool_parser_factory(tool_parser_factory)
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .conversation_memory_writer(conversation_memory_writer)
+            .worker_monitor(worker_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engines(workflow_engines)
+            .mcp_orchestrator(mcp_orchestrator_lock)
+            .build()
+            .unwrap();
 
         // Wire up routing loop if enabled in config (mirrors server.rs initialization)
         init_routing_loop(&mut app_context_inner);
@@ -661,24 +661,24 @@ pub fn create_test_context_with_mcp_config(
         let mcp_orchestrator_lock = Arc::new(OnceLock::new());
 
         let mut app_context_inner = AppContext::builder()
-                .router_config(config.clone())
-                .client(client)
-                .rate_limiter(rate_limiter)
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
-                .reasoning_parser_factory(None) // reasoning_parser_factory
-                .tool_parser_factory(None) // tool_parser_factory
-                .worker_registry(worker_registry)
-                .policy_registry(policy_registry)
-                .response_storage(response_storage)
-                .conversation_storage(conversation_storage)
-                .conversation_item_storage(conversation_item_storage)
-                .conversation_memory_writer(conversation_memory_writer)
-                .worker_monitor(worker_monitor)
-                .worker_job_queue(worker_job_queue)
-                .workflow_engines(workflow_engines)
-                .mcp_orchestrator(mcp_orchestrator_lock)
-                .build()
-                .unwrap();
+            .router_config(config.clone())
+            .client(client)
+            .rate_limiter(rate_limiter)
+            .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
+            .reasoning_parser_factory(None) // reasoning_parser_factory
+            .tool_parser_factory(None) // tool_parser_factory
+            .worker_registry(worker_registry)
+            .policy_registry(policy_registry)
+            .response_storage(response_storage)
+            .conversation_storage(conversation_storage)
+            .conversation_item_storage(conversation_item_storage)
+            .conversation_memory_writer(conversation_memory_writer)
+            .worker_monitor(worker_monitor)
+            .worker_job_queue(worker_job_queue)
+            .workflow_engines(workflow_engines)
+            .mcp_orchestrator(mcp_orchestrator_lock)
+            .build()
+            .unwrap();
 
         // Wire up routing loop if enabled in config (mirrors server.rs initialization)
         init_routing_loop(&mut app_context_inner);

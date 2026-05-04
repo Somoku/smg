@@ -292,10 +292,9 @@ impl PolicyRegistry {
 
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
-        PolicyFactory::create_from_config(config)
-            .unwrap_or_else(|e| {
-                panic!("Failed to create policy from config: {e}");
-            })
+        PolicyFactory::create_from_config(config).unwrap_or_else(|e| {
+            panic!("Failed to create policy from config: {e}");
+        })
     }
 
     /// Get current model->policy mappings (for debugging/monitoring)
@@ -447,7 +446,6 @@ impl PolicyRegistry {
 
         policies
     }
-
 
     /// This should be called after workers are registered for a model
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {

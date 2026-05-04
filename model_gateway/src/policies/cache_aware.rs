@@ -810,7 +810,9 @@ impl CacheAwarePolicy {
             } else {
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
+                    .min_by_key(|&&idx| {
+                        workers[idx].engine_stats().waiting_and_running_queue_size()
+                    })
                     .copied()
             };
 
@@ -871,7 +873,9 @@ impl CacheAwarePolicy {
             } else {
                 healthy_indices
                     .iter()
-                    .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
+                    .min_by_key(|&&idx| {
+                        workers[idx].engine_stats().waiting_and_running_queue_size()
+                    })
                     .copied()
             };
 

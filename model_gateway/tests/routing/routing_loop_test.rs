@@ -122,13 +122,7 @@ mod routing_loop_tests {
         );
 
         // /v1/chat/completions
-        let (status, _) = post(
-            app.clone(),
-            "/v1/chat/completions",
-            chat_body(model),
-            &[],
-        )
-        .await;
+        let (status, _) = post(app.clone(), "/v1/chat/completions", chat_body(model), &[]).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -136,13 +130,7 @@ mod routing_loop_tests {
         );
 
         // /v1/completions
-        let (status, _) = post(
-            app.clone(),
-            "/v1/completions",
-            completion_body(model),
-            &[],
-        )
-        .await;
+        let (status, _) = post(app.clone(), "/v1/completions", completion_body(model), &[]).await;
         assert_eq!(
             status,
             StatusCode::OK,
@@ -240,8 +228,7 @@ mod routing_loop_tests {
             .header("x-request-id", "100")
             .body(Body::from(serde_json::to_string(&generate_body()).unwrap()))
             .unwrap();
-        let normal_handle =
-            tokio::spawn(app.clone().oneshot(normal_req));
+        let normal_handle = tokio::spawn(app.clone().oneshot(normal_req));
 
         // Small yield so the normal request enters the queue first.
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -256,8 +243,7 @@ mod routing_loop_tests {
             .header("x-is-validate", "true")
             .body(Body::from(serde_json::to_string(&generate_body()).unwrap()))
             .unwrap();
-        let validate_handle =
-            tokio::spawn(app.clone().oneshot(validate_req));
+        let validate_handle = tokio::spawn(app.clone().oneshot(validate_req));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
@@ -268,7 +254,11 @@ mod routing_loop_tests {
             .body(Body::empty())
             .unwrap();
         let resume_resp = app.clone().oneshot(resume_req).await.unwrap();
-        assert_eq!(resume_resp.status(), StatusCode::OK, "resume should succeed");
+        assert_eq!(
+            resume_resp.status(),
+            StatusCode::OK,
+            "resume should succeed"
+        );
 
         // Both requests should complete successfully.
         let (normal_resp, validate_resp) = tokio::join!(normal_handle, validate_handle);

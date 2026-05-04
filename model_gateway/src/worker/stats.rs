@@ -30,7 +30,7 @@ pub struct EngineSchedulerStats {
     /// and [`EngineSchedulerStats::total_response_tokens`] instead — they are
     /// pre-aggregated at deserialisation time so that `total_token_num()` and
     /// `token_num_with_budget()` are O(1) reads.
-    /// 
+    ///
     /// Sum of all values in `req_id_to_prompt_token_num`.
     /// Pre-aggregated at construction / deserialisation; not serialised.
     #[serde(skip)]
@@ -128,8 +128,7 @@ impl EngineStats {
     }
 
     pub fn total_token_num(&self) -> usize {
-        self.scheduler_stats.total_prompt_tokens
-            + self.scheduler_stats.total_response_tokens
+        self.scheduler_stats.total_prompt_tokens + self.scheduler_stats.total_response_tokens
     }
 
     /// For each running request the contribution is:
@@ -225,10 +224,14 @@ mod tests {
         running: usize,
         waiting: usize,
     ) -> EngineStats {
-        let req_id_to_prompt_token_num: HashMap<String, usize> =
-            prompt.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        let req_id_to_response_token_num: HashMap<String, usize> =
-            response.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let req_id_to_prompt_token_num: HashMap<String, usize> = prompt
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let req_id_to_response_token_num: HashMap<String, usize> = response
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
         let total_prompt_tokens = req_id_to_prompt_token_num.values().sum();
         let total_response_tokens = req_id_to_response_token_num.values().sum();
         EngineStats {
@@ -295,12 +298,7 @@ mod tests {
     fn token_num_with_budget_response_zero_counts_one_unit() {
         // prompt=50, response=0, budget=16
         // contribution = 50 + ceil((0+1)/16)*16 = 50 + 1*16 = 66
-        let s = make_stats(
-            HashMap::from([("r1", 50)]),
-            HashMap::new(),
-            1,
-            0,
-        );
+        let s = make_stats(HashMap::from([("r1", 50)]), HashMap::new(), 1, 0);
         assert_eq!(s.token_num_with_budget(16), 66);
     }
 
@@ -363,10 +361,8 @@ mod tests {
     #[test]
     fn recompute_aggregates_after_manual_modification() {
         let mut s = EngineSchedulerStats::default();
-        s.req_id_to_prompt_token_num
-            .insert("x".to_string(), 42);
-        s.req_id_to_response_token_num
-            .insert("x".to_string(), 8);
+        s.req_id_to_prompt_token_num.insert("x".to_string(), 42);
+        s.req_id_to_response_token_num.insert("x".to_string(), 8);
         s.recompute_aggregates();
         assert_eq!(s.total_prompt_tokens, 42);
         assert_eq!(s.total_response_tokens, 8);

@@ -15,11 +15,13 @@
 //! `request_budget` when computing the current token load of each worker
 //! (via [`EngineStats::token_num_with_budget`]).
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
-use std::collections::HashMap;
 
 use tracing::{error, warn};
 
@@ -135,8 +137,8 @@ impl ThroughputRuntime {
             .or_else(|| Self::label_i64(worker, "max_total_tokens"))
             .unwrap_or_else(|| {
                 (self.cfg.max_prompt_length
-                    + self.cfg.request_budget
-                        * self.cfg.max_num_waiting_reqs_after_preemption) as i64
+                    + self.cfg.request_budget * self.cfg.max_num_waiting_reqs_after_preemption)
+                    as i64
             })
     }
 
@@ -226,8 +228,7 @@ impl ThroughputRuntime {
     #[inline]
     fn current_token_num(&self, worker: &Arc<dyn Worker>, use_budget: bool) -> i64 {
         let stats = worker.engine_stats();
-        let has_stats =
-            stats.waiting_and_running_queue_size() > 0 || stats.total_token_num() > 0;
+        let has_stats = stats.waiting_and_running_queue_size() > 0 || stats.total_token_num() > 0;
 
         let engine_tokens = if has_stats {
             let token_num = if use_budget {
@@ -243,7 +244,11 @@ impl ThroughputRuntime {
                 let estimated = (stats.scheduler_stats.kv_cache_usage
                     * self.max_model_len(worker) as f64)
                     .ceil() as i64;
-                if estimated > 0 { estimated } else { 0 }
+                if estimated > 0 {
+                    estimated
+                } else {
+                    0
+                }
             }
         } else {
             0
@@ -376,8 +381,7 @@ impl ThroughputRuntime {
                 let worker = &workers[idx];
 
                 // Capacity check (current_queue includes optimistic local delta).
-                if self.current_queue(worker) as usize
-                    >= self.cfg.max_concurrent_seqs_per_instance
+                if self.current_queue(worker) as usize >= self.cfg.max_concurrent_seqs_per_instance
                 {
                     continue;
                 }
@@ -396,12 +400,11 @@ impl ThroughputRuntime {
                     Some(t) => t,
                     None => continue,
                 };
-                let after = match self
-                    .estimate_throughput(worker, running + 1, token_num + req_tokens)
-                {
-                    Some(t) => t,
-                    None => continue,
-                };
+                let after =
+                    match self.estimate_throughput(worker, running + 1, token_num + req_tokens) {
+                        Some(t) => t,
+                        None => continue,
+                    };
                 let delta = after - curr;
 
                 if delta > best_delta {
@@ -634,17 +637,20 @@ mod tests {
     ) {
         use crate::worker::{EngineSchedulerStats, EngineStatsUpdateOutcome};
 
-        let req_id_to_prompt_token_num: HashMap<String, usize> =
-            prompt.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        let req_id_to_response_token_num: HashMap<String, usize> =
-            response.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+        let req_id_to_prompt_token_num: HashMap<String, usize> = prompt
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        let req_id_to_response_token_num: HashMap<String, usize> = response
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
         let total_prompt_tokens = req_id_to_prompt_token_num.values().sum();
         let total_response_tokens = req_id_to_response_token_num.values().sum();
 
         // Far-future timestamp ensures monotonicity check always passes.
-        let timestamp = chrono::TimeZone::with_ymd_and_hms(
-            &chrono::Utc, 2099, 1, 1, 0, 0, 0
-        ).unwrap();
+        let timestamp =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2099, 1, 1, 0, 0, 0).unwrap();
         let stats = EngineStats {
             timestamp,
             scheduler_stats: EngineSchedulerStats {
@@ -780,10 +786,9 @@ mod tests {
 
     #[test]
     fn selects_worker_with_lower_token_load() {
-        let policy = ThroughputOptimalPolicy::with_config(
-            config_with_cost_model_and_threshold(0.01),
-        )
-            .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalPolicy::with_config(config_with_cost_model_and_threshold(0.01))
+                .expect("policy creation should succeed");
 
         let w1 = build_worker("http://w1:8000", default_labels());
         let w2 = build_worker("http://w2:8000", default_labels());
@@ -793,8 +798,22 @@ mod tests {
             w1.increment_load();
             w2.increment_load();
         }
-        set_stats(&w1, 4, 0, HashMap::from([("r1", 15_000)]), HashMap::new(), 0.75);
-        set_stats(&w2, 4, 0, HashMap::from([("r2", 500)]), HashMap::new(), 0.03);
+        set_stats(
+            &w1,
+            4,
+            0,
+            HashMap::from([("r1", 15_000)]),
+            HashMap::new(),
+            0.75,
+        );
+        set_stats(
+            &w2,
+            4,
+            0,
+            HashMap::from([("r2", 500)]),
+            HashMap::new(),
+            0.03,
+        );
 
         let tokens: Vec<u32> = vec![1, 2, 3, 4];
         let workers: Vec<Arc<dyn Worker>> = vec![w1, w2];
@@ -804,9 +823,7 @@ mod tests {
 
     #[test]
     fn saturated_worker_skipped() {
-        let policy = ThroughputOptimalPolicy::with_config(
-            config_with_cost_model_and_max_seqs(2),
-        )
+        let policy = ThroughputOptimalPolicy::with_config(config_with_cost_model_and_max_seqs(2))
             .expect("policy creation should succeed");
 
         let w1 = build_worker("http://w1:8000", default_labels());
@@ -823,10 +840,9 @@ mod tests {
 
     #[test]
     fn waiting_queue_prevents_selection() {
-        let policy = ThroughputOptimalPolicy::with_config(
-            config_with_cost_model_and_threshold(0.01),
-        )
-            .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalPolicy::with_config(config_with_cost_model_and_threshold(0.01))
+                .expect("policy creation should succeed");
 
         let w = build_worker("http://w1:8000", default_labels());
         w.increment_load();
@@ -842,8 +858,8 @@ mod tests {
     fn delta_below_threshold_returns_none() {
         let mut cfg = config_with_cost_model();
         cfg.delta_throughput_threshold = 1000.0; // impossibly high
-        let policy = ThroughputOptimalPolicy::with_config(cfg)
-            .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalPolicy::with_config(cfg).expect("policy creation should succeed");
 
         let w = build_worker("http://w1:8000", default_labels());
         w.increment_load();
@@ -899,8 +915,8 @@ mod tests {
         let w = build_worker("http://w1:8000", labels);
         set_stats(&w, 0, 0, HashMap::new(), HashMap::new(), 0.0);
 
-        let policy = ThroughputOptimalPolicy::with_config(cfg)
-            .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalPolicy::with_config(cfg).expect("policy creation should succeed");
         let tokens: Vec<u32> = vec![1, 2, 3];
         let workers: Vec<Arc<dyn Worker>> = vec![w];
         let selected = policy.select_worker(&workers, &info_with_tokens(&tokens));
@@ -913,10 +929,7 @@ mod tests {
     fn budget_policy_name() {
         let policy = ThroughputOptimalWithBudgetPolicy::with_config(config_with_cost_model())
             .expect("policy creation should succeed");
-        assert_eq!(
-            policy.name(),
-            "throughput_optimal_with_budget"
-        );
+        assert_eq!(policy.name(), "throughput_optimal_with_budget");
     }
 
     #[test]
@@ -945,10 +958,9 @@ mod tests {
 
     #[test]
     fn budget_policy_prefers_lower_load() {
-        let policy = ThroughputOptimalWithBudgetPolicy::with_config(
-            budget_config_with_cost_model(16, 0.01),
-        )
-            .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalWithBudgetPolicy::with_config(budget_config_with_cost_model(16, 0.01))
+                .expect("policy creation should succeed");
 
         let w1 = build_worker("http://w1:8000", default_labels());
         let w2 = build_worker("http://w2:8000", default_labels());
@@ -967,7 +979,14 @@ mod tests {
             0.5,
         );
         // w2 is nearly idle
-        set_stats(&w2, 4, 0, HashMap::from([("r2", 100)]), HashMap::new(), 0.01);
+        set_stats(
+            &w2,
+            4,
+            0,
+            HashMap::from([("r2", 100)]),
+            HashMap::new(),
+            0.01,
+        );
 
         let tokens: Vec<u32> = vec![1, 2, 3];
         let workers: Vec<Arc<dyn Worker>> = vec![w1, w2];
@@ -982,10 +1001,9 @@ mod tests {
     /// a less-loaded worker.
     #[test]
     fn priority_groups_prefers_higher_priority_group() {
-        let policy = ThroughputOptimalPolicy::with_config(
-            config_with_cost_model_and_threshold(0.01),
-        )
-        .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalPolicy::with_config(config_with_cost_model_and_threshold(0.01))
+                .expect("policy creation should succeed");
 
         let w0 = build_worker("http://w0:8000", default_labels()); // priority 0 (high)
         let w1 = build_worker("http://w1:8000", default_labels()); // priority 1 (low)
@@ -1023,10 +1041,8 @@ mod tests {
     #[test]
     fn priority_groups_falls_through_when_high_priority_saturated() {
         // Set max_concurrent_seqs to 2 so w0 (3 running) is over-capacity.
-        let policy = ThroughputOptimalPolicy::with_config(
-            config_with_cost_model_and_max_seqs(2),
-        )
-        .expect("policy creation should succeed");
+        let policy = ThroughputOptimalPolicy::with_config(config_with_cost_model_and_max_seqs(2))
+            .expect("policy creation should succeed");
 
         let w0 = build_worker("http://w0:8000", default_labels()); // priority 0 (high, saturated)
         let w1 = build_worker("http://w1:8000", default_labels()); // priority 1 (low, idle)
@@ -1052,17 +1068,20 @@ mod tests {
 
         // w0 is over the max_concurrent_seqs limit → must fall through to w1.
         let selected = policy.select_worker(&workers, &info);
-        assert_eq!(selected, Some(1), "should fall through to low-priority worker");
+        assert_eq!(
+            selected,
+            Some(1),
+            "should fall through to low-priority worker"
+        );
     }
 
     /// Without priority_groups the policy behaves identically to the original
     /// (single-group) behaviour.
     #[test]
     fn no_priority_groups_single_group_behaviour() {
-        let policy = ThroughputOptimalPolicy::with_config(
-            config_with_cost_model_and_threshold(0.01),
-        )
-        .expect("policy creation should succeed");
+        let policy =
+            ThroughputOptimalPolicy::with_config(config_with_cost_model_and_threshold(0.01))
+                .expect("policy creation should succeed");
 
         let w0 = build_worker("http://w0:8000", default_labels());
         let w1 = build_worker("http://w1:8000", default_labels());

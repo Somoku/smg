@@ -107,7 +107,7 @@ mod request_num_balance_tests {
             config,
             vec![
                 TestWorkerConfig::flaky(19702, 1.0), // always fails
-                TestWorkerConfig::healthy(19703),     // always succeeds
+                TestWorkerConfig::healthy(19703),    // always succeeds
             ],
         )
         .await;
@@ -209,7 +209,7 @@ mod throughput_optimal_tests {
             config,
             vec![
                 TestWorkerConfig::flaky(19712, 1.0), // always fails
-                TestWorkerConfig::healthy(19713),     // always succeeds
+                TestWorkerConfig::healthy(19713),    // always succeeds
             ],
         )
         .await;
@@ -341,7 +341,7 @@ mod throughput_optimal_with_budget_tests {
             config,
             vec![
                 TestWorkerConfig::flaky(19726, 1.0), // always fails
-                TestWorkerConfig::healthy(19727),     // always succeeds
+                TestWorkerConfig::healthy(19727),    // always succeeds
             ],
         )
         .await;
