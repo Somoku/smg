@@ -228,6 +228,10 @@ mod routing_loop_tests {
             .header("x-request-id", "100")
             .body(Body::from(serde_json::to_string(&generate_body()).unwrap()))
             .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test code: tasks are joined before test ends"
+        )]
         let normal_handle = tokio::spawn(app.clone().oneshot(normal_req));
 
         // Small yield so the normal request enters the queue first.
@@ -243,6 +247,10 @@ mod routing_loop_tests {
             .header("x-is-validate", "true")
             .body(Body::from(serde_json::to_string(&generate_body()).unwrap()))
             .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test code: tasks are joined before test ends"
+        )]
         let validate_handle = tokio::spawn(app.clone().oneshot(validate_req));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -314,6 +322,10 @@ mod routing_loop_tests {
             .header("x-request-id", "200")
             .body(Body::from(serde_json::to_string(&generate_body()).unwrap()))
             .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test code: tasks are joined before test ends"
+        )]
         let high_handle = tokio::spawn(app.clone().oneshot(high_req));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -327,6 +339,10 @@ mod routing_loop_tests {
             .header("x-request-id", "201")
             .body(Body::from(serde_json::to_string(&generate_body()).unwrap()))
             .unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test code: tasks are joined before test ends"
+        )]
         let low_handle = tokio::spawn(app.clone().oneshot(low_req));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -382,7 +398,11 @@ mod routing_loop_tests {
         for i in 0..n {
             let a = app.clone();
             let body = generate_body();
-            handles.push(tokio::spawn(async move {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test code: tasks are joined before test ends"
+            )]
+            let handle = tokio::spawn(async move {
                 let req = Request::builder()
                     .method("POST")
                     .uri("/generate")
@@ -392,7 +412,8 @@ mod routing_loop_tests {
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap();
                 a.oneshot(req).await.unwrap().status()
-            }));
+            });
+            handles.push(handle);
         }
 
         for handle in handles {
@@ -457,7 +478,11 @@ mod routing_loop_tests {
         for i in 0..N {
             let a = app.clone();
             let body = generate_body();
-            handles.push(tokio::spawn(async move {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "test code: tasks are joined before test ends"
+            )]
+            let handle = tokio::spawn(async move {
                 let req = Request::builder()
                     .method("POST")
                     .uri("/generate")
@@ -467,7 +492,8 @@ mod routing_loop_tests {
                     .body(Body::from(serde_json::to_string(&body).unwrap()))
                     .unwrap();
                 a.oneshot(req).await.unwrap().status()
-            }));
+            });
+            handles.push(handle);
         }
 
         // Small delay so requests enter the queue before we resume.

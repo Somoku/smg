@@ -22,7 +22,7 @@ use std::{
 };
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use tokio::runtime::Runtime;
+use tokio::{runtime::Runtime, sync::mpsc::unbounded_channel};
 
 // ---------------------------------------------------------------------------
 // Minimal in-process replica of the queue data structures
@@ -377,8 +377,9 @@ fn bench_validation_priority(c: &mut Criterion) {
 // Benchmark 8 – mpsc enqueue throughput (the RoutingLoopRuntime::enqueue path)
 // ---------------------------------------------------------------------------
 
+#[expect(clippy::panic, reason = "bench setup failures are unrecoverable")]
 fn bench_mpsc_enqueue_throughput(c: &mut Criterion) {
-    let rt = Runtime::new().expect("tokio runtime");
+    let rt = Runtime::new().unwrap_or_else(|e| panic!("tokio runtime: {e}"));
 
     let mut group = c.benchmark_group("routing_loop/mpsc_enqueue");
 
@@ -387,9 +388,10 @@ fn bench_mpsc_enqueue_throughput(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
                 rt.block_on(async {
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                    let (tx, mut rx) = unbounded_channel::<u64>();
                     for i in 0..n {
-                        tx.send(black_box(i as u64)).unwrap();
+                        tx.send(black_box(i as u64))
+                            .unwrap_or_else(|e| panic!("send failed: {e}"));
                     }
                     drop(tx);
                     let mut total = 0u64;
@@ -411,8 +413,9 @@ fn bench_mpsc_enqueue_throughput(c: &mut Criterion) {
 // on each tick using `try_recv`.  This benchmarks that drain pattern.
 // ---------------------------------------------------------------------------
 
+#[expect(clippy::panic, reason = "bench setup failures are unrecoverable")]
 fn bench_channel_drain(c: &mut Criterion) {
-    let rt = Runtime::new().expect("tokio runtime");
+    let rt = Runtime::new().unwrap_or_else(|e| panic!("tokio runtime: {e}"));
 
     let mut group = c.benchmark_group("routing_loop/channel_drain");
 
@@ -421,20 +424,18 @@ fn bench_channel_drain(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                    let (tx, rx) = unbounded_channel::<u64>();
                     for i in 0..n {
-                        tx.send(i as u64).unwrap();
+                        tx.send(i as u64)
+                            .unwrap_or_else(|e| panic!("send failed: {e}"));
                     }
                     (tx, rx)
                 },
                 |(_tx, mut rx)| {
                     rt.block_on(async {
                         let mut entries = Vec::with_capacity(n);
-                        loop {
-                            match rx.try_recv() {
-                                Ok(v) => entries.push(v),
-                                Err(_) => break,
-                            }
+                        while let Ok(v) = rx.try_recv() {
+                            entries.push(v);
                         }
                         black_box(entries);
                     });

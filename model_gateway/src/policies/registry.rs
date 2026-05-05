@@ -292,6 +292,10 @@ impl PolicyRegistry {
 
     /// Create a policy from a PolicyConfig (delegates to PolicyFactory)
     fn create_policy_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
+        #[expect(
+            clippy::panic,
+            reason = "policy creation failure is unrecoverable at startup"
+        )]
         PolicyFactory::create_from_config(config).unwrap_or_else(|e| {
             panic!("Failed to create policy from config: {e}");
         })

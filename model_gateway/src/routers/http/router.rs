@@ -850,6 +850,10 @@ impl Router {
     }
 
     // Send typed request directly without conversion
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "typed request dispatch requires all parameters"
+    )]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,

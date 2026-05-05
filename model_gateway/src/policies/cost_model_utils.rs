@@ -107,6 +107,10 @@ impl CostModel {
     }
 
     /// Load a [`CostModel`] from a JSON string.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "load_from_str is only used in tests")
+    )]
     pub fn load_from_str(json_str: &str) -> Result<Self, serde_json::Error> {
         let entries: HashMap<String, CostModelEntry> = serde_json::from_str(json_str)?;
         Ok(Self { entries })
@@ -120,14 +124,17 @@ impl CostModel {
 
     /// Number of entries in the model.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(not(test), expect(dead_code, reason = "len is only used in tests"))]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when the model has no entries.
     #[inline]
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "is_empty is only used in tests")
+    )]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }

@@ -566,7 +566,8 @@ impl Router {
                     delta_throughput_threshold: self.delta_throughput_threshold,
                     max_prompt_length: self.max_prompt_length,
                     request_budget: self.request_budget,
-                    max_num_waiting_reqs_after_preemption: self.max_num_waiting_reqs_after_preemption,
+                    max_num_waiting_reqs_after_preemption: self
+                        .max_num_waiting_reqs_after_preemption,
                 },
                 PolicyType::ThroughputOptimalWithBudget => {
                     ConfigPolicyConfig::ThroughputOptimalWithBudget {
@@ -576,7 +577,8 @@ impl Router {
                         delta_throughput_threshold: self.delta_throughput_threshold,
                         max_prompt_length: self.max_prompt_length,
                         request_budget: self.request_budget,
-                        max_num_waiting_reqs_after_preemption: self.max_num_waiting_reqs_after_preemption,
+                        max_num_waiting_reqs_after_preemption: self
+                            .max_num_waiting_reqs_after_preemption,
                     }
                 }
             })

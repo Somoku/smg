@@ -190,7 +190,12 @@ mod throughput_optimal_tests {
         let mut config = RouterConfig::builder()
             .regular_mode(vec![])
             .throughput_optimal_policy(
-                crate::common::TestRouterConfig::create_test_cost_model_file(),
+                TestRouterConfig::create_test_cost_model_file(),
+                1024, // max_concurrent_seqs_per_instance
+                0.5,  // delta_throughput_threshold
+                8192, // max_prompt_length
+                1024, // request_budget
+                1000, // max_num_waiting_reqs_after_preemption
             )
             .host("127.0.0.1")
             .port(3711)
@@ -322,7 +327,12 @@ mod throughput_optimal_with_budget_tests {
             .regular_mode(vec![])
             .throughput_optimal_with_budget_policy(
                 8,
-                crate::common::TestRouterConfig::create_test_cost_model_file(),
+                TestRouterConfig::create_test_cost_model_file(),
+                1024, // max_concurrent_seqs_per_instance
+                0.5,  // delta_throughput_threshold
+                8192, // max_prompt_length
+                1024, // request_budget
+                1000, // max_num_waiting_reqs_after_preemption
             )
             .host("127.0.0.1")
             .port(3722)
@@ -375,7 +385,15 @@ mod throughput_optimal_with_budget_tests {
 
         let config = RouterConfig::builder()
             .regular_mode(vec!["http://worker1:8000".to_string()])
-            .throughput_optimal_with_budget_policy(32)
+            .throughput_optimal_with_budget_policy(
+                32,
+                TestRouterConfig::create_test_cost_model_file(),
+                1024, // max_concurrent_seqs_per_instance
+                0.5,  // delta_throughput_threshold
+                8192, // max_prompt_length
+                1024, // request_budget
+                1000, // max_num_waiting_reqs_after_preemption
+            )
             .host("127.0.0.1")
             .port(3723)
             .build()
