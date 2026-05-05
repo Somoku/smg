@@ -11,7 +11,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::PipelineStage,
+            common::stages::{PipelineStage, StagePhase},
             context::{FinalResponse, RequestContext, RequestType},
         },
     },
@@ -158,6 +158,10 @@ impl PipelineStage for HarmonyResponseProcessingStage {
 
     fn name(&self) -> &'static str {
         "HarmonyResponseProcessing"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::PostExecution
     }
 }
 

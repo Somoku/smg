@@ -11,7 +11,7 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
+        common::stages::{PipelineStage, StagePhase},
         context::{PreparationOutput, RequestContext},
         utils,
     },
@@ -33,6 +33,10 @@ impl PipelineStage for GeneratePreparationStage {
 
     fn name(&self) -> &'static str {
         "GeneratePreparation"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::Preparation
     }
 }
 

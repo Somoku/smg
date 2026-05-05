@@ -20,7 +20,7 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
+        common::stages::{PipelineStage, StagePhase},
         context::{ExecutionResult, FinalResponse, RequestContext, WorkerSelection},
     },
 };
@@ -209,6 +209,10 @@ impl PipelineStage for ClassifyResponseProcessingStage {
 
     fn name(&self) -> &'static str {
         "ClassifyResponseProcessing"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::PostExecution
     }
 }
 

@@ -11,6 +11,21 @@ use axum::response::Response;
 
 use crate::routers::grpc::context::RequestContext;
 
+/// Phase a pipeline stage belongs to.
+///
+/// Used by `execute_through_execution` / `execute_remaining_stages` to split
+/// the pipeline at the execution boundary for partial-rollout loopback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StagePhase {
+    /// Stage 0 — tokenisation, prompt pre-processing.
+    Preparation,
+    /// Stages 1-5 — worker selection, client acquisition, request building,
+    /// dispatch metadata, request execution (the "hot path").
+    Execution,
+    /// Stage 6 — response serialisation, streaming, metrics emission.
+    PostExecution,
+}
+
 /// Trait for pipeline stages that process requests
 #[async_trait]
 pub trait PipelineStage: Send + Sync {
@@ -24,6 +39,16 @@ pub trait PipelineStage: Send + Sync {
 
     /// Stage name for logging
     fn name(&self) -> &'static str;
+
+    /// Phase this stage belongs to.
+    ///
+    /// The default implementation returns [`StagePhase::Execution`], which is
+    /// correct for the common middle stages (worker selection through request
+    /// execution).  Only preparation and response-processing stages need to
+    /// override this.
+    fn phase(&self) -> StagePhase {
+        StagePhase::Execution
+    }
 }
 
 mod client_acquisition;

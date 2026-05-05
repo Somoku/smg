@@ -16,7 +16,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::PipelineStage,
+            common::stages::{PipelineStage, StagePhase},
             context::{FinalResponse, RequestContext},
             regular::{processor, streaming},
         },
@@ -138,5 +138,9 @@ impl PipelineStage for CompletionResponseProcessingStage {
 
     fn name(&self) -> &'static str {
         "CompletionResponseProcessing"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::PostExecution
     }
 }

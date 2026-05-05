@@ -11,7 +11,7 @@ use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
 use crate::routers::{
     error as grpc_error,
     grpc::{
-        common::stages::PipelineStage,
+        common::stages::{PipelineStage, StagePhase},
         context::{RequestContext, RequestType},
     },
 };
@@ -59,5 +59,9 @@ impl PipelineStage for ChatGeneratePreparationStage {
 
     fn name(&self) -> &'static str {
         "ChatGeneratePreparation"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::Preparation
     }
 }

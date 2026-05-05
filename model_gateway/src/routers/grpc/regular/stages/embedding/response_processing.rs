@@ -8,7 +8,7 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
+        common::stages::{PipelineStage, StagePhase},
         context::{ExecutionResult, FinalResponse, RequestContext},
         proto_wrapper::ProtoEmbedComplete,
     },
@@ -68,6 +68,10 @@ impl PipelineStage for EmbeddingResponseProcessingStage {
 
     fn name(&self) -> &'static str {
         "EmbeddingResponseProcessing"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::PostExecution
     }
 }
 

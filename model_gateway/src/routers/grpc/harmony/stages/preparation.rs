@@ -16,7 +16,10 @@ use super::super::HarmonyBuilder;
 use crate::routers::{
     error,
     grpc::{
-        common::{responses::utils::extract_tools_from_response_tools, stages::PipelineStage},
+        common::{
+            responses::utils::extract_tools_from_response_tools,
+            stages::{PipelineStage, StagePhase},
+        },
         context::{PreparationOutput, RequestContext, RequestType},
         utils,
     },
@@ -84,6 +87,10 @@ impl PipelineStage for HarmonyPreparationStage {
 
     fn name(&self) -> &'static str {
         "HarmonyPreparation"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::Preparation
     }
 }
 

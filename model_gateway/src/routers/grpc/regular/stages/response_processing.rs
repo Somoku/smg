@@ -13,7 +13,7 @@ use super::{chat::ChatResponseProcessingStage, generate::GenerateResponseProcess
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
+        common::stages::{PipelineStage, StagePhase},
         context::{RequestContext, RequestType},
         regular::{processor, streaming},
     },
@@ -62,5 +62,9 @@ impl PipelineStage for ChatGenerateResponseProcessingStage {
 
     fn name(&self) -> &'static str {
         "ChatGenerateResponseProcessing"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::PostExecution
     }
 }
