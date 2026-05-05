@@ -3,15 +3,18 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use tokio::task;
 
     use crate::{
         config::types::RoutingLoopConfig, routers::grpc::routing_loop::runtime::RoutingLoopRuntime,
+        worker::WorkerRegistry,
     };
 
     fn make_runtime() -> Arc<RoutingLoopRuntime> {
-        let (rt, _rx) =
-            RoutingLoopRuntime::new(&RoutingLoopConfig::default(), Arc::new(dashmap::DashMap::new()));
+        let (rt, _rx) = RoutingLoopRuntime::new(
+            &RoutingLoopConfig::default(),
+            Arc::new(dashmap::DashMap::new()),
+            Arc::new(WorkerRegistry::new()),
+        );
         rt
     }
 
@@ -134,11 +137,17 @@ mod tests {
         // Spawn 10 concurrent tasks, each trying to record an instance
         for i in 0..10 {
             let rt = Arc::clone(&runtime);
-            let handle = task::spawn(async move {
-                let instance = (format!("worker-{}", i), i as usize);
-                rt.record_selected_instance(100 + i as i64, Some(prompt_id), instance.clone());
-                instance
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    let instance = (format!("worker-{i}"), i as usize);
+                    rt.record_selected_instance(100 + i as i64, Some(prompt_id), instance.clone());
+                    instance
+                })
+            };
             handles.push(handle);
         }
 
@@ -183,7 +192,11 @@ mod tests {
             .map(|ids| ids.value().clone())
             .unwrap_or_default();
 
-        assert_eq!(running_ids, vec![request_id], "Request should be recorded in group");
+        assert_eq!(
+            running_ids,
+            vec![request_id],
+            "Request should be recorded in group"
+        );
     }
 
     /// Test: Cleanup removes single request from prompt group
@@ -198,7 +211,9 @@ mod tests {
         // Cleanup should remove request and empty prompt entry
         runtime.cleanup_tracking(Some(request_id), Some(prompt_id));
 
-        let still_exists = runtime.prompt_to_running_request_ids.contains_key(&prompt_id);
+        let still_exists = runtime
+            .prompt_to_running_request_ids
+            .contains_key(&prompt_id);
         assert!(
             !still_exists,
             "Prompt entry should be removed when last request completes"
@@ -231,7 +246,8 @@ mod tests {
             .unwrap_or_default();
 
         assert_eq!(
-            remaining_ids, vec![43],
+            remaining_ids,
+            vec![43],
             "Second request should remain after first is cleaned up"
         );
 
@@ -253,11 +269,17 @@ mod tests {
         // Spawn 5 concurrent requests to same prompt
         for i in 0..5 {
             let rt = Arc::clone(&runtime);
-            let handle = task::spawn(async move {
-                let request_id = 100 + i as i64;
-                let instance = ("worker-shared".to_string(), 0_usize);
-                rt.record_selected_instance(request_id, Some(prompt_id), instance);
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    let request_id = 100 + i as i64;
+                    let instance = ("worker-shared".to_string(), 0_usize);
+                    rt.record_selected_instance(request_id, Some(prompt_id), instance);
+                })
+            };
             handles.push(handle);
         }
 
@@ -274,7 +296,11 @@ mod tests {
             .unwrap_or_default();
 
         assert_eq!(running_ids.len(), 5, "All 5 requests should be recorded");
-        assert_eq!(running_ids, vec![100, 101, 102, 103, 104], "Requests recorded in order");
+        assert_eq!(
+            running_ids,
+            vec![100, 101, 102, 103, 104],
+            "Requests recorded in order"
+        );
     }
 
     /// Test: Multiple independent prompt groups maintain separate pins
@@ -324,7 +350,9 @@ mod tests {
         let instance = ("worker-sync".to_string(), 0_usize);
 
         // Initial sync: version 3
-        runtime.instance_to_version_after_sync.insert(instance.clone(), 3);
+        runtime
+            .instance_to_version_after_sync
+            .insert(instance.clone(), 3);
 
         let v1 = runtime
             .instance_to_version_after_sync
@@ -333,7 +361,9 @@ mod tests {
         assert_eq!(v1, Some(3), "Initial version should be 3");
 
         // Update after new sync: version 5
-        runtime.instance_to_version_after_sync.insert(instance.clone(), 5);
+        runtime
+            .instance_to_version_after_sync
+            .insert(instance.clone(), 5);
 
         let v2 = runtime
             .instance_to_version_after_sync

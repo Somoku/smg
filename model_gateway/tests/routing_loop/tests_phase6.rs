@@ -3,15 +3,19 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
     use tokio::sync::Barrier;
 
-    use crate::config::RoutingLoopConfig;
-    use crate::routers::grpc::routing_loop::runtime::RoutingLoopRuntime;
+    use crate::{
+        config::RoutingLoopConfig, routers::grpc::routing_loop::runtime::RoutingLoopRuntime,
+        worker::WorkerRegistry,
+    };
 
     fn make_runtime() -> Arc<RoutingLoopRuntime> {
         let (rt, _rx) = RoutingLoopRuntime::new(
             &RoutingLoopConfig::default(),
             Arc::new(dashmap::DashMap::new()),
+            Arc::new(WorkerRegistry::new()),
         );
         rt
     }
@@ -26,14 +30,20 @@ mod tests {
         for i in 0..5 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                for j in 0..10 {
-                    let version = (i * 10 + j) as i64;
-                    rt.instance_to_version_after_sync
-                        .insert(("worker".to_string(), i as usize), version);
-                }
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    for j in 0..10 {
+                        let version = (i * 10 + j) as i64;
+                        rt.instance_to_version_after_sync
+                            .insert(("worker".to_string(), i as usize), version);
+                    }
+                })
+            };
             handles.push(handle);
         }
 
@@ -47,7 +57,7 @@ mod tests {
                 .instance_to_version_after_sync
                 .get(&("worker".to_string(), i as usize))
                 .map(|r| *r.value());
-            assert_eq!(final_version, Some(((i * 10 + 9) as i64)));
+            assert_eq!(final_version, Some((i * 10 + 9) as i64));
         }
     }
 
@@ -62,14 +72,20 @@ mod tests {
         for i in 0..5 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                rt.record_selected_instance(
-                    i as i64,
-                    Some(42), // Same prompt_id
-                    (format!("worker-{}", i), i as usize),
-                );
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    rt.record_selected_instance(
+                        i as i64,
+                        Some(42), // Same prompt_id
+                        (format!("worker-{i}"), i as usize),
+                    );
+                })
+            };
             handles.push(handle);
         }
 
@@ -85,14 +101,11 @@ mod tests {
         assert!(pinned.is_some());
 
         // All 5 requests should be recorded regardless of which pinned first
-        let request_ids = runtime
-            .prompt_to_running_request_ids
-            .get(&42)
-            .map(|r| {
-                let mut ids = r.value().clone();
-                ids.sort_unstable();
-                ids
-            });
+        let request_ids = runtime.prompt_to_running_request_ids.get(&42).map(|r| {
+            let mut ids = r.value().clone();
+            ids.sort_unstable();
+            ids
+        });
         assert_eq!(request_ids, Some(vec![0, 1, 2, 3, 4]));
     }
 
@@ -103,11 +116,7 @@ mod tests {
 
         // Pre-populate with 5 requests in same prompt group
         for i in 0..5 {
-            runtime.record_selected_instance(
-                i as i64,
-                Some(42),
-                ("worker-initial".to_string(), 0),
-            );
+            runtime.record_selected_instance(i as i64, Some(42), ("worker-initial".to_string(), 0));
         }
 
         let barrier = Arc::new(Barrier::new(5));
@@ -117,10 +126,16 @@ mod tests {
         for i in 0..5 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                rt.cleanup_tracking(Some(i as i64), Some(42));
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    rt.cleanup_tracking(Some(i as i64), Some(42));
+                })
+            };
             handles.push(handle);
         }
 
@@ -129,9 +144,7 @@ mod tests {
         }
 
         // After all cleanups, prompt group should be completely gone
-        let has_prompt = runtime
-            .prompt_to_running_request_ids
-            .contains_key(&42);
+        let has_prompt = runtime.prompt_to_running_request_ids.contains_key(&42);
         let has_pin = runtime.prompt_to_pinned_instance.contains_key(&42);
 
         assert!(!has_prompt, "Prompt group should be removed");
@@ -145,11 +158,7 @@ mod tests {
 
         // Pre-populate with 3 requests in same prompt group
         for i in 0..3 {
-            runtime.record_selected_instance(
-                i as i64,
-                Some(99),
-                ("worker-initial".to_string(), 0),
-            );
+            runtime.record_selected_instance(i as i64, Some(99), ("worker-initial".to_string(), 0));
         }
 
         // Cleanup first 2 requests
@@ -188,15 +197,19 @@ mod tests {
         for worker_idx in 0..10 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                for version in 1..=5 {
-                    rt.instance_to_version_after_sync.insert(
-                        (format!("worker-{}", worker_idx), 0),
-                        version as i64,
-                    );
-                }
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    for version in 1..=5 {
+                        rt.instance_to_version_after_sync
+                            .insert((format!("worker-{worker_idx}"), 0), version as i64);
+                    }
+                })
+            };
             handles.push(handle);
         }
 
@@ -208,9 +221,13 @@ mod tests {
         for worker_idx in 0..10 {
             let version = runtime
                 .instance_to_version_after_sync
-                .get(&(format!("worker-{}", worker_idx), 0))
+                .get(&(format!("worker-{worker_idx}"), 0))
                 .map(|r| *r.value());
-            assert_eq!(version, Some(5), "Worker {} should have version 5", worker_idx);
+            assert_eq!(
+                version,
+                Some(5),
+                "Worker {worker_idx} should have version 5",
+            );
         }
     }
 
@@ -225,16 +242,22 @@ mod tests {
         for prompt_idx in 0..10 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                for req in 0..3 {
-                    rt.record_selected_instance(
-                        (prompt_idx * 100 + req) as i64,
-                        Some(prompt_idx as i64),
-                        (format!("worker-{}", prompt_idx), 0),
-                    );
-                }
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    for req in 0..3 {
+                        rt.record_selected_instance(
+                            (prompt_idx * 100 + req) as i64,
+                            Some(prompt_idx as i64),
+                            (format!("worker-{prompt_idx}"), 0),
+                        );
+                    }
+                })
+            };
             handles.push(handle);
         }
 
@@ -254,7 +277,7 @@ mod tests {
                 .prompt_to_pinned_instance
                 .get(&(prompt_idx as i64))
                 .map(|r| r.value().clone());
-            assert_eq!(pinned, Some((format!("worker-{}", prompt_idx), 0)));
+            assert_eq!(pinned, Some((format!("worker-{prompt_idx}"), 0)));
         }
     }
 
@@ -269,7 +292,7 @@ mod tests {
                 runtime.record_selected_instance(
                     (prompt_idx * 100 + req_idx) as i64,
                     Some(prompt_idx as i64),
-                    (format!("worker-{}", prompt_idx), 0),
+                    (format!("worker-{prompt_idx}"), 0),
                 );
             }
         }
@@ -282,13 +305,19 @@ mod tests {
             for req_idx in 0..3 {
                 let rt = runtime.clone();
                 let b = barrier.clone();
-                let handle = tokio::spawn(async move {
-                    b.wait().await;
-                    rt.cleanup_tracking(
-                        Some((prompt_idx * 100 + req_idx) as i64),
-                        Some(prompt_idx as i64),
-                    );
-                });
+                let handle = {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "test code: tasks are joined before test ends"
+                    )]
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        rt.cleanup_tracking(
+                            Some((prompt_idx * 100 + req_idx) as i64),
+                            Some(prompt_idx as i64),
+                        );
+                    })
+                };
                 handles.push(handle);
             }
         }
@@ -321,16 +350,22 @@ mod tests {
         for prompt_idx in 0..5 {
             let rt = runtime.clone();
             let b = barrier1.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                for req_idx in 0..3 {
-                    rt.record_selected_instance(
-                        (prompt_idx * 100 + req_idx) as i64,
-                        Some(prompt_idx as i64),
-                        (format!("worker-{}", prompt_idx), 0),
-                    );
-                }
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    for req_idx in 0..3 {
+                        rt.record_selected_instance(
+                            (prompt_idx * 100 + req_idx) as i64,
+                            Some(prompt_idx as i64),
+                            (format!("worker-{prompt_idx}"), 0),
+                        );
+                    }
+                })
+            };
             handles.push(handle);
         }
 
@@ -352,13 +387,19 @@ mod tests {
             for req_idx in 0..3 {
                 let rt = runtime.clone();
                 let b = barrier2.clone();
-                let handle = tokio::spawn(async move {
-                    b.wait().await;
-                    rt.cleanup_tracking(
-                        Some((prompt_idx * 100 + req_idx) as i64),
-                        Some(prompt_idx as i64),
-                    );
-                });
+                let handle = {
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "test code: tasks are joined before test ends"
+                    )]
+                    tokio::spawn(async move {
+                        b.wait().await;
+                        rt.cleanup_tracking(
+                            Some((prompt_idx * 100 + req_idx) as i64),
+                            Some(prompt_idx as i64),
+                        );
+                    })
+                };
                 handles.push(handle);
             }
         }
@@ -389,18 +430,24 @@ mod tests {
         for task_idx in 0..50 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                for worker_idx in 0..5 {
-                    for version in 1..=10 {
-                        let actual_version = (task_idx * 50 + worker_idx * 10 + version) as i64;
-                        rt.instance_to_version_after_sync.insert(
-                            (format!("worker-{}", worker_idx), task_idx as usize),
-                            actual_version,
-                        );
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    for worker_idx in 0..5 {
+                        for version in 1..=10 {
+                            let actual_version = (task_idx * 50 + worker_idx * 10 + version) as i64;
+                            rt.instance_to_version_after_sync.insert(
+                                (format!("worker-{worker_idx}"), task_idx as usize),
+                                actual_version,
+                            );
+                        }
                     }
-                }
-            });
+                })
+            };
             handles.push(handle);
         }
 
@@ -410,7 +457,11 @@ mod tests {
 
         // Verify the map contains all expected entries
         let total_entries = runtime.instance_to_version_after_sync.len();
-        assert_eq!(total_entries, 5 * 50, "Should have 250 distinct (worker, rank) entries");
+        assert_eq!(
+            total_entries,
+            5 * 50,
+            "Should have 250 distinct (worker, rank) entries"
+        );
     }
 
     /// Test: Concurrent version reads while writes happening
@@ -429,41 +480,53 @@ mod tests {
         let mut handles = vec![];
 
         // 5 writers, 5 readers
-        for i in 0..5 {
+        for _i in 0..5 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                // Writer: increment versions
-                for _ in 0..5 {
-                    for j in 0..10 {
-                        if let Some(mut entry) = rt
-                            .instance_to_version_after_sync
-                            .get_mut(&("worker".to_string(), j))
-                        {
-                            *entry += 1;
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    // Writer: increment versions
+                    for _ in 0..5 {
+                        for j in 0..10 {
+                            if let Some(mut entry) = rt
+                                .instance_to_version_after_sync
+                                .get_mut(&("worker".to_string(), j))
+                            {
+                                *entry += 1;
+                            }
                         }
                     }
-                }
-            });
+                })
+            };
             handles.push(handle);
         }
 
-        for i in 5..10 {
+        for _i in 5..10 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                // Reader: collect all versions
-                for _ in 0..25 {
-                    for j in 0..10 {
-                        let _ = rt
-                            .instance_to_version_after_sync
-                            .get(&("worker".to_string(), j))
-                            .map(|r| *r.value());
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    // Reader: collect all versions
+                    for _ in 0..25 {
+                        for j in 0..10 {
+                            let _ = rt
+                                .instance_to_version_after_sync
+                                .get(&("worker".to_string(), j))
+                                .map(|r| *r.value());
+                        }
                     }
-                }
-            });
+                })
+            };
             handles.push(handle);
         }
 
@@ -477,7 +540,11 @@ mod tests {
                 .instance_to_version_after_sync
                 .get(&("worker".to_string(), j))
                 .map(|r| *r.value());
-            assert_eq!(final_version, Some(10 + 25), "Worker {} should have version 35", j);
+            assert_eq!(
+                final_version,
+                Some(10 + 25),
+                "Worker {j} should have version 35",
+            );
         }
     }
 
@@ -492,15 +559,21 @@ mod tests {
         for task_idx in 0..100 {
             let rt = runtime.clone();
             let b = barrier.clone();
-            let handle = tokio::spawn(async move {
-                b.wait().await;
-                let prompt_idx = task_idx % 20;
-                rt.record_selected_instance(
-                    task_idx as i64,
-                    Some(prompt_idx as i64),
-                    (format!("worker-{}", prompt_idx), 0),
-                );
-            });
+            let handle = {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "test code: tasks are joined before test ends"
+                )]
+                tokio::spawn(async move {
+                    b.wait().await;
+                    let prompt_idx = task_idx % 20;
+                    rt.record_selected_instance(
+                        task_idx as i64,
+                        Some(prompt_idx as i64),
+                        (format!("worker-{prompt_idx}"), 0),
+                    );
+                })
+            };
             handles.push(handle);
         }
 
@@ -514,7 +587,7 @@ mod tests {
                 .prompt_to_running_request_ids
                 .get(&(prompt_idx as i64))
                 .map(|r| r.value().len());
-            assert_eq!(count, Some(5), "Prompt {} should have 5 requests", prompt_idx);
+            assert_eq!(count, Some(5), "Prompt {prompt_idx} should have 5 requests",);
         }
     }
 }

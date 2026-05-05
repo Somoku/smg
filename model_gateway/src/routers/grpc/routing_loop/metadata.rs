@@ -14,6 +14,8 @@ pub(crate) struct RoutingMeta {
     pub is_validate: bool,
     pub is_sticky: bool,
     pub rollout_instance_hint: Option<(String, usize)>,
+    /// Number of tokens already generated in previous partial-rollout iterations.
+    pub response_token_count: Option<usize>,
 }
 
 /// Parse routing metadata from transport headers and a JSON body.
@@ -26,8 +28,8 @@ pub(crate) fn parse_routing_request_meta(
 ) -> Option<RoutingMeta> {
     let request_id = parse_i64_header(headers, "x-request-id")
         .or_else(|| parse_i64_from_body(body, "request_id"))?;
-    let prompt_id =
-        parse_i64_header(headers, "x-prompt-id").or_else(|| parse_i64_from_body(body, "prompt_id"))?;
+    let prompt_id = parse_i64_header(headers, "x-prompt-id")
+        .or_else(|| parse_i64_from_body(body, "prompt_id"))?;
     let version_tag = parse_i64_header(headers, "x-version-tag")
         .or_else(|| parse_i64_from_body(body, "version_tag"))
         .unwrap_or(-1);
@@ -39,6 +41,7 @@ pub(crate) fn parse_routing_request_meta(
         .unwrap_or(false);
     let rollout_instance_hint = parse_rollout_instance_hint_from_headers(headers)
         .or_else(|| parse_rollout_instance_hint_from_body(body));
+    let response_token_count = parse_usize_header(headers, "x-response-token-count");
 
     Some(RoutingMeta {
         request_id,
@@ -47,6 +50,7 @@ pub(crate) fn parse_routing_request_meta(
         is_validate,
         is_sticky,
         rollout_instance_hint,
+        response_token_count,
     })
 }
 
@@ -66,6 +70,13 @@ fn parse_bool_header(headers: Option<&HeaderMap>, key: &'static str) -> Option<b
         .and_then(|h| h.get(key))
         .and_then(|v| v.to_str().ok())
         .and_then(parse_bool_like)
+}
+
+fn parse_usize_header(headers: Option<&HeaderMap>, key: &'static str) -> Option<usize> {
+    headers
+        .and_then(|h| h.get(key))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<usize>().ok())
 }
 
 pub(crate) fn parse_i64_from_body(body: Option<&Value>, key: &str) -> Option<i64> {
@@ -228,6 +239,7 @@ mod tests {
                 is_validate: true,
                 is_sticky: true,
                 rollout_instance_hint: Some(("worker-a".to_string(), 2)),
+                response_token_count: None,
             })
         );
     }
@@ -273,6 +285,7 @@ mod tests {
                 is_validate: false,
                 is_sticky: false,
                 rollout_instance_hint: Some(("worker-c".to_string(), 4)),
+                response_token_count: None,
             })
         );
     }

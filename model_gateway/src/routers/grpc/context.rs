@@ -24,7 +24,8 @@ use tracing::debug;
 use super::{
     client::GrpcClient,
     multimodal::MultimodalComponents,
-    proto_wrapper::{ProtoEmbedComplete, ProtoRequest, ProtoStream},
+    proto_wrapper::{ProtoEmbedComplete, ProtoGenerateComplete, ProtoRequest, ProtoStream},
+    routing_loop::partial_rollout::PartialRolloutState,
 };
 use crate::{
     middleware::TenantRequestMeta,
@@ -128,6 +129,9 @@ pub(crate) struct ProcessingState {
 
     // Stage 6: Response processing state
     pub response: ResponseState,
+
+    /// Accumulated partial-rollout state across loopback iterations.
+    pub partial_rollout_state: Option<PartialRolloutState>,
 }
 
 /// Output from preparation stage (Step 1)
@@ -712,6 +716,11 @@ pub(crate) enum ExecutionResult {
     Embedding {
         response: ProtoEmbedComplete,
     },
+    /// Partial-rollout: accumulated complete frame after all loopback iterations finish.
+    /// PostExecution response-processing stages handle this identically to a normal
+    /// single-stream result — they just call `collect_responses` which returns the
+    /// already-assembled `ProtoGenerateComplete` directly.
+    Complete(ProtoGenerateComplete),
 }
 
 /// Final processed response

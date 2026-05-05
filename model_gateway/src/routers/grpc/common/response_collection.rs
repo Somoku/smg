@@ -66,6 +66,11 @@ pub(crate) async fn collect_responses(
                 "Embedding result encountered in response collection",
             ));
         }
+        ExecutionResult::Complete(complete) => {
+            // Partial-rollout fast path: the dispatch loop already assembled the
+            // final ProtoGenerateComplete with accumulated tokens; return it directly.
+            vec![complete]
+        }
     };
 
     if all_responses.is_empty() {

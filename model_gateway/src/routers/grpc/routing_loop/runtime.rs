@@ -9,9 +9,12 @@ use std::{
     time::Duration,
 };
 
-use axum::response::Response;
+use axum::{
+    http::HeaderValue,
+    response::{IntoResponse, Response},
+};
 use dashmap::DashMap;
-use metrics::{gauge, histogram};
+use metrics::{counter, gauge, histogram};
 use openai_protocol::chat::ChatCompletionResponse;
 use serde::Serialize;
 use tokio::{
@@ -23,6 +26,9 @@ use tracing::error;
 
 use super::{
     metadata::RoutingMeta,
+    partial_rollout::{
+        drain_stream_for_partial_rollout, merge_into_partial_state, reset_ctx_for_loopback,
+    },
     queue::{MultiPriorityRequestQueue, RequestPriority},
 };
 use crate::{
@@ -30,11 +36,14 @@ use crate::{
     routers::{
         error as router_error,
         grpc::{
-            context::{ExecutionResult, LoadGuards, RequestContext},
+            context::{
+                ExecutionResult, FinalResponse, LoadGuards, RequestContext, WorkerSelection,
+            },
             harmony::ResponsesIterationResult,
             pipeline::RequestPipeline,
         },
     },
+    worker::{Worker, WorkerRegistry},
 };
 
 pub(crate) type InstanceVersionMap = Arc<DashMap<(String, usize), i64>>;
@@ -91,6 +100,17 @@ pub(crate) struct RoutingLoopStatus {
     pub(crate) queue_keys: Vec<i32>,
 }
 
+/// Lightweight metadata snapshot for a single queued request.
+///
+/// Returned by `RoutingLoopRuntime::filter_queue_by_version_tag` and serialised
+/// as JSON by the `GET /routing_loop/filter` endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct QueuedRequestMeta {
+    pub(crate) request_id: i64,
+    pub(crate) version_tag: i64,
+    pub(crate) prompt_id: i64,
+}
+
 pub struct RoutingLoopRuntime {
     queue: Mutex<MultiPriorityRequestQueue<RoutingQueueEntry>>,
     tx: mpsc::UnboundedSender<RoutingQueueEntry>,
@@ -124,12 +144,17 @@ pub struct RoutingLoopRuntime {
     /// Initialised once during router start-up via `connect_ps_manager()`.
     /// `OnceLock` avoids a Mutex on the read hot path.
     pub(crate) ps_manager_client: OnceLock<Arc<psrl_state::PSManagerStateClient>>,
+
+    /// Worker registry used to resolve stable worker IDs during partial-rollout
+    /// loopback — specifically to call `reserve_id_for_url` for header injection.
+    pub(crate) worker_registry: Arc<WorkerRegistry>,
 }
 
 impl RoutingLoopRuntime {
     pub(crate) fn new(
         config: &RoutingLoopConfig,
         instance_to_version_after_sync: InstanceVersionMap,
+        worker_registry: Arc<WorkerRegistry>,
     ) -> (Arc<Self>, mpsc::UnboundedReceiver<RoutingQueueEntry>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let runtime = Arc::new(Self {
@@ -149,6 +174,7 @@ impl RoutingLoopRuntime {
             prompt_to_running_request_ids: DashMap::new(),
             prompt_to_pinned_instance: DashMap::new(),
             ps_manager_client: OnceLock::new(),
+            worker_registry,
         });
         (runtime, rx)
     }
@@ -213,6 +239,15 @@ impl RoutingLoopRuntime {
         }
     }
 
+    pub(crate) fn instance_id_for_worker(&self, worker: &Arc<dyn Worker>) -> (String, usize) {
+        let base_worker_id = self
+            .worker_registry
+            .reserve_id_for_url(worker.base_url())
+            .as_str()
+            .to_string();
+        (base_worker_id, worker.dp_rank().unwrap_or(0))
+    }
+
     pub(crate) fn enqueue(&self, entry: RoutingQueueEntry) -> Result<(), Box<RoutingQueueEntry>> {
         self.tx.send(entry).map_err(|err| Box::new(err.0))
     }
@@ -229,6 +264,11 @@ impl RoutingLoopRuntime {
         self.paused.load(Ordering::Acquire)
     }
 
+    /// Returns `true` while the dispatch batch is in progress.
+    pub(crate) fn is_routing(&self) -> bool {
+        self.routing.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn status(&self) -> RoutingLoopStatus {
         let queue = self.queue.lock().await;
         RoutingLoopStatus {
@@ -239,6 +279,29 @@ impl RoutingLoopRuntime {
             running_tasks: self.running_tasks.load(Ordering::Acquire),
             queue_keys: queue.queue_keys(),
         }
+    }
+
+    /// Return metadata for all queued entries whose `version_tag ≤ max_version_tag`.
+    ///
+    /// Used by `GET /routing_loop/filter` to let the Python coordinator check
+    /// whether old-version requests have fully drained from the queue.
+    pub(crate) async fn filter_queue_by_version_tag(
+        &self,
+        max_version_tag: i64,
+    ) -> Vec<QueuedRequestMeta> {
+        let queue = self.queue.lock().await;
+        queue
+            .iter_requests()
+            .filter_map(|entry| {
+                entry.routing_meta.as_ref().and_then(|meta| {
+                    (meta.version_tag <= max_version_tag).then_some(QueuedRequestMeta {
+                        request_id: meta.request_id,
+                        version_tag: meta.version_tag,
+                        prompt_id: meta.prompt_id,
+                    })
+                })
+            })
+            .collect()
     }
 
     async fn push_entries(&self, entries: Vec<RoutingQueueEntry>) {
@@ -350,10 +413,7 @@ pub(crate) async fn run_routing_loop(
         let dispatched = !entries.is_empty();
         let aborted_ids = check_aborted_requests(&runtime, &entries).await;
         for entry in entries {
-            let entry_request_id = entry
-                .routing_meta
-                .as_ref()
-                .map(|meta| meta.request_id);
+            let entry_request_id = entry.routing_meta.as_ref().map(|meta| meta.request_id);
             if entry_request_id.is_some_and(|request_id| aborted_ids.contains(&request_id)) {
                 let prompt_id = entry.routing_meta.as_ref().map(|meta| meta.prompt_id);
                 send_aborted(entry);
@@ -458,35 +518,224 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, entry: RoutingQueueEnt
     let request_id = entry.routing_meta.as_ref().map(|meta| meta.request_id);
     let prompt_id = entry.routing_meta.as_ref().map(|meta| meta.prompt_id);
 
-    match entry.completion {
-        RoutingLoopCompletion::Http(tx) => {
-            let response = entry.pipeline.execute_after_preparation(entry.ctx).await;
-            let _ = tx.send(response);
+    if entry.routing_meta.is_none() {
+        match entry.completion {
+            RoutingLoopCompletion::Http(tx) => {
+                let response = entry.pipeline.execute_after_preparation(entry.ctx).await;
+                let _ = tx.send(response);
+            }
+            RoutingLoopCompletion::ChatForResponses(tx) => {
+                let result = entry
+                    .pipeline
+                    .execute_chat_for_responses_after_preparation(entry.ctx)
+                    .await;
+                let _ = tx.send(result);
+            }
+            RoutingLoopCompletion::HarmonyResponses(tx) => {
+                let result = entry
+                    .pipeline
+                    .execute_harmony_responses_after_preparation(entry.ctx)
+                    .await;
+                let _ = tx.send(result);
+            }
+            RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
+                let result = entry
+                    .pipeline
+                    .execute_harmony_responses_streaming_after_preparation(entry.ctx)
+                    .await;
+                let _ = tx.send(result);
+            }
         }
-        RoutingLoopCompletion::ChatForResponses(tx) => {
-            let result = entry
-                .pipeline
-                .execute_chat_for_responses_after_preparation(entry.ctx)
-                .await;
-            let _ = tx.send(result);
-        }
-        RoutingLoopCompletion::HarmonyResponses(tx) => {
-            let result = entry
-                .pipeline
-                .execute_harmony_responses_after_preparation(entry.ctx)
-                .await;
-            let _ = tx.send(result);
-        }
-        RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
-            let result = entry
-                .pipeline
-                .execute_harmony_responses_streaming_after_preparation(entry.ctx)
-                .await;
-            let _ = tx.send(result);
-        }
+        runtime.cleanup_tracking(request_id, prompt_id);
+    } else {
+        dispatch_entry_with_partial_rollout(runtime, entry, request_id, prompt_id).await;
     }
 
-    runtime.cleanup_tracking(request_id, prompt_id);
+}
+
+/// Extract a `Response` from `ctx.state.response.final_response`
+fn extract_final_response(ctx: &mut RequestContext) -> Response {
+    match ctx.state.response.final_response.take() {
+        Some(FinalResponse::Chat(r)) => axum::Json(r).into_response(),
+        Some(FinalResponse::Generate(r)) => axum::Json(r).into_response(),
+        Some(FinalResponse::Completion(r)) => axum::Json(r).into_response(),
+        Some(FinalResponse::Embedding(r)) => axum::Json(r).into_response(),
+        Some(FinalResponse::Classify(r)) => axum::Json(r).into_response(),
+        Some(FinalResponse::Messages(r)) => axum::Json(r).into_response(),
+        None => router_error::internal_error("no_response_produced", "No response produced"),
+    }
+}
+
+/// Send the final `Response` through the appropriate completion channel.
+fn send_http_completion(completion: RoutingLoopCompletion, response: Response) {
+    match completion {
+        RoutingLoopCompletion::Http(tx) => {
+            let _ = tx.send(response);
+        }
+        // PSRL dispatch only uses Http completion; other variants are not
+        // reachable here, but we log an error rather than panic.
+        other => {
+            error!(
+                "dispatch_entry_with_partial_rollout: unexpected completion type; dropping response"
+            );
+            drop(other);
+        }
+    }
+}
+
+/// Full partial-rollout loopback loop for PSRL requests.
+///
+/// Runs pipeline stages through execution on each iteration.  If the stream
+/// finishes with `"abort"` (PS weight-sync interrupted generation), the
+/// accumulated tokens are preserved and the request is re-routed to the
+/// newly-synced instance.  The loop terminates on `"stop"` / `"length"`.
+async fn dispatch_entry_with_partial_rollout(
+    runtime: Arc<RoutingLoopRuntime>,
+    entry: RoutingQueueEntry,
+    request_id: Option<i64>,
+    prompt_id: Option<i64>,
+) {
+    let RoutingQueueEntry {
+        mut ctx,
+        pipeline,
+        completion,
+        ..
+    } = entry;
+
+    let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
+
+    loop {
+        // ── Step 1: write current accumulated state into ctx ─────────────────
+        // The PSRL worker selector reads `partial_rollout_state.response_token_count()`
+        // during Stage 5 to route to the KV-cache-warm instance.
+        ctx.state.partial_rollout_state = Some(partial_state.clone());
+
+        // ── Step 2: run execution-phase stages (worker select → dispatch) ────
+        if let Err(response) = pipeline.execute_through_execution(&mut ctx).await {
+            send_http_completion(completion, response);
+            runtime.cleanup_tracking(request_id, prompt_id);
+            return;
+        }
+
+        // ── Step 3: extract the raw gRPC stream ──────────────────────────────
+        let stream = match ctx.state.response.execution_result.take() {
+            Some(ExecutionResult::Single { stream }) => stream,
+            Some(ExecutionResult::Dual { decode, .. }) => *decode,
+            other => {
+                // Non-generate result (embedding, etc.) — put it back and run
+                // post-execution stages normally (no loopback needed).
+                ctx.state.response.execution_result = other;
+                let response = match pipeline.execute_remaining_stages(&mut ctx).await {
+                    Ok(Some(r)) => r,
+                    Ok(None) => extract_final_response(&mut ctx),
+                    Err(r) => r,
+                };
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+                return;
+            }
+        };
+
+        // ── Step 4: drain the stream, collecting tokens and finish_reason ────
+        let mut stream = stream;
+        let drained = match drain_stream_for_partial_rollout(&mut stream).await {
+            Ok(d) => d,
+            Err(msg) => {
+                let response = router_error::internal_error("stream_drain_failed", msg.as_str());
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+                return;
+            }
+        };
+
+        // ── Step 5: branch on finish_reason ─────────────────────────────────
+        match drained.finish_reason.as_str() {
+            "stop" | "length" => {
+                // ── ROLLOUT_COMPLETED ────────────────────────────────────────
+                merge_into_partial_state(&mut partial_state, &drained);
+
+                // Emit completion metrics.
+                histogram!("smg_partial_rollout_loopback_count")
+                    .record(partial_state.iteration_count as f64);
+                histogram!("smg_partial_rollout_accumulated_tokens")
+                    .record(partial_state.token_ids.len() as f64);
+                counter!("smg_partial_rollout_completed_total").increment(1);
+
+                // Override the output_ids in the final complete frame with the
+                // full accumulated token sequence from all loopback iterations.
+                let mut complete = drained.complete;
+                complete.set_output_ids(partial_state.token_ids.clone());
+
+                // Place the assembled complete frame back for PostExecution stages.
+                ctx.state.response.execution_result = Some(ExecutionResult::Complete(complete));
+
+                let response = match pipeline.execute_remaining_stages(&mut ctx).await {
+                    Ok(Some(r)) => r,
+                    Ok(None) => extract_final_response(&mut ctx),
+                    Err(r) => r,
+                };
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+                return;
+            }
+            "abort" => {
+                // ── ROLLOUT_INTERRUPTED — loopback to newly-synced instance ──
+                merge_into_partial_state(&mut partial_state, &drained);
+                counter!("smg_partial_rollout_abort_total").increment(1);
+
+                // Determine the instance that was just used so we can pin the
+                // loopback request to the same worker (which now has the fresh
+                // weights after the sync that triggered the abort).
+                let worker = match ctx.state.workers.as_ref() {
+                    Some(WorkerSelection::Single { worker }) => worker.clone(),
+                    Some(WorkerSelection::Dual { decode, .. }) => decode.clone(),
+                    None => {
+                        let response = router_error::internal_error(
+                            "loopback_no_instance",
+                            "no worker selected",
+                        );
+                        send_http_completion(completion, response);
+                        runtime.cleanup_tracking(request_id, prompt_id);
+                        return;
+                    }
+                };
+                let (base_id, dp_rank) = runtime.instance_id_for_worker(&worker);
+
+                // Reset ctx for the next iteration (clears workers, clients,
+                // proto_request, dispatch, load_guards, and execution_result).
+                reset_ctx_for_loopback(&mut ctx);
+
+                // Inject loopback routing headers so that on the next iteration
+                // `parse_routing_request_meta_from_context` picks up the hint.
+                let headers = ctx.input.headers.get_or_insert_with(Default::default);
+                if let Ok(v) = HeaderValue::from_str(&base_id) {
+                    headers.insert("x-base-worker-id", v);
+                }
+                if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
+                    headers.insert("x-target-dp-rank", v);
+                }
+                let token_count = partial_state.response_token_count();
+                if let Ok(v) = HeaderValue::from_str(&token_count.to_string()) {
+                    headers.insert("x-response-token-count", v);
+                }
+
+                // Carry the accumulated state forward to the next iteration.
+                ctx.state.partial_rollout_state = Some(partial_state.clone());
+                // continue loop
+            }
+            other => {
+                error!(
+                    finish_reason = other,
+                    request_id = ?request_id,
+                    "unexpected finish_reason in partial rollout; terminating"
+                );
+                let response = router_error::internal_error("unexpected_finish_reason", other);
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+                return;
+            }
+        }
+    }
 }
 
 fn drain_receiver(

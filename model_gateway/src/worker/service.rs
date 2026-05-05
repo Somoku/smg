@@ -204,6 +204,9 @@ impl IntoResponse for GetWorkerResponse {
     }
 }
 
+/// Type alias for a list of resolved (WorkerId, Worker) pairs.
+type ResolvedWorkers = Vec<(WorkerId, Arc<dyn Worker>)>;
+
 /// Worker Service - Orchestrates worker business logic
 ///
 /// This service provides a clean API for worker operations, separating
@@ -479,10 +482,7 @@ impl WorkerService {
         Ok(UpdateWorkerResult { worker_id, url })
     }
 
-    pub fn update_worker_stats(
-        &self,
-        update: WorkerStatsUpdateRequest,
-    ) -> WorkerStatsUpdateResult {
+    pub fn update_worker_stats(&self, update: WorkerStatsUpdateRequest) -> WorkerStatsUpdateResult {
         let total = update.len();
         let mut results = Vec::with_capacity(total);
         let staleness_threshold_ms = self.router_config.engine_stats_staleness_threshold_ms;
@@ -695,7 +695,7 @@ impl WorkerService {
     fn resolve_routing_control_target(
         &self,
         target: &WorkerRoutingControlTargetRequest,
-    ) -> Result<Vec<(WorkerId, Arc<dyn Worker>)>, WorkerServiceError> {
+    ) -> Result<ResolvedWorkers, WorkerServiceError> {
         match (
             target.worker_id.as_deref(),
             target.base_worker_id.as_deref(),
@@ -782,8 +782,7 @@ impl WorkerService {
             if worker.is_dp_aware() {
                 return Err(WorkerServiceError::BadRequest {
                     message: format!(
-                        "worker_id '{}' points to a DP worker; include the base worker_id and dp_rank instead",
-                        worker_id_raw
+                        "worker_id '{worker_id_raw}' points to a DP worker; include the base worker_id and dp_rank instead"
                     ),
                 });
             }
@@ -797,8 +796,7 @@ impl WorkerService {
         {
             return Err(WorkerServiceError::BadRequest {
                 message: format!(
-                    "worker_id '{}' points to a DP worker; use the base worker_id with dp_rank",
-                    worker_id_raw
+                    "worker_id '{worker_id_raw}' points to a DP worker; use the base worker_id with dp_rank"
                 ),
             });
         }

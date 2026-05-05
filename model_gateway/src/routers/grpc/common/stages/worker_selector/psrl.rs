@@ -317,47 +317,46 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                 .collect(),
 
             CandidateSortKey::ReserveCapability => {
-                let indicators: Vec<f64> = if let Some(ps_client) =
-                    self.runtime.ps_manager_client.get()
-                {
-                    let unique_versions: Vec<i64> = {
-                        let mut v: Vec<i64> =
-                            candidates.iter().filter_map(worker_version_tag).collect();
-                        v.sort_unstable();
-                        v.dedup();
-                        v
-                    };
+                let indicators: Vec<f64> =
+                    if let Some(ps_client) = self.runtime.ps_manager_client.get() {
+                        let unique_versions: Vec<i64> = {
+                            let mut v: Vec<i64> =
+                                candidates.iter().filter_map(worker_version_tag).collect();
+                            v.sort_unstable();
+                            v.dedup();
+                            v
+                        };
 
-                    match ps_client
-                        .get_reserve_indicator(request_id, unique_versions.clone(), is_validate)
-                        .await
-                    {
-                        Ok(ind) => {
-                            // Map each candidate's version → its indicator.
-                            let version_to_indicator: std::collections::HashMap<i64, f64> =
-                                unique_versions.into_iter().zip(ind).collect();
-                            candidates
-                                .iter()
-                                .map(|w| {
-                                    worker_version_tag(w)
-                                        .and_then(|v| version_to_indicator.get(&v).copied())
-                                        .unwrap_or(0.0_f64)
-                                })
-                                .collect()
+                        match ps_client
+                            .get_reserve_indicator(request_id, unique_versions.clone(), is_validate)
+                            .await
+                        {
+                            Ok(ind) => {
+                                // Map each candidate's version → its indicator.
+                                let version_to_indicator: std::collections::HashMap<i64, f64> =
+                                    unique_versions.into_iter().zip(ind).collect();
+                                candidates
+                                    .iter()
+                                    .map(|w| {
+                                        worker_version_tag(w)
+                                            .and_then(|v| version_to_indicator.get(&v).copied())
+                                            .unwrap_or(0.0_f64)
+                                    })
+                                    .collect()
+                            }
+                            Err(status) => {
+                                error!(
+                                    request_id,
+                                    %status,
+                                    "PSRL Stage 5: get_reserve_indicator RPC failed"
+                                );
+                                return None;
+                            }
                         }
-                        Err(status) => {
-                            error!(
-                                request_id,
-                                %status,
-                                "PSRL Stage 5: get_reserve_indicator RPC failed"
-                            );
-                            return None;
-                        }
-                    }
-                } else {
-                    error!("PSRL Stage 5: PS Manager client not available");
-                    return None;
-                };
+                    } else {
+                        error!("PSRL Stage 5: PS Manager client not available");
+                        return None;
+                    };
 
                 candidates
                     .iter()
@@ -407,7 +406,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                 headers,
                 hash_ring,
                 priority_groups: Some(&priority_groups),
-                response_token_count: None,
+                response_token_count: meta.response_token_count,
             },
         )?;
 
@@ -475,8 +474,11 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             }
 
             if meta.rollout_instance_hint.is_none() {
-                self.runtime
-                    .record_selected_instance(request_id, Some(meta.prompt_id), instance.clone());
+                self.runtime.record_selected_instance(
+                    request_id,
+                    Some(meta.prompt_id),
+                    instance.clone(),
+                );
             }
         }
 
@@ -498,12 +500,14 @@ mod tests {
     use super::*;
     use crate::{
         config::RoutingLoopConfig, routers::grpc::routing_loop::runtime::RoutingLoopRuntime,
+        worker::WorkerRegistry,
     };
 
     fn make_runtime() -> Arc<RoutingLoopRuntime> {
         let (rt, _rx) = RoutingLoopRuntime::new(
             &RoutingLoopConfig::default(),
             Arc::new(dashmap::DashMap::new()),
+            Arc::new(WorkerRegistry::new()),
         );
         rt
     }

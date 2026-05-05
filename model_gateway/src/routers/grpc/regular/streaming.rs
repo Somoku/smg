@@ -175,6 +175,14 @@ impl StreamingProcessor {
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }
+            context::ExecutionResult::Complete(_) => {
+                utils::send_error_sse(
+                    &tx,
+                    "Partial-rollout Complete variant not supported in streaming",
+                    "internal_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
         }
 
         // Return SSE response
@@ -721,6 +729,14 @@ impl StreamingProcessor {
                     &tx,
                     "Embeddings not supported in streaming generate",
                     "invalid_request_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
+            context::ExecutionResult::Complete(_) => {
+                utils::send_error_sse(
+                    &tx,
+                    "Partial-rollout Complete variant not supported in generate streaming",
+                    "internal_error",
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }
@@ -1543,6 +1559,16 @@ impl StreamingProcessor {
                 let mut buf = Vec::with_capacity(256);
                 let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
             }
+            context::ExecutionResult::Complete(_) => {
+                let error_event = MessageStreamEvent::Error {
+                    error: messages::ErrorResponse {
+                        error_type: "internal_error".to_string(),
+                        message: "Partial-rollout Complete variant not supported in Messages API streaming".to_string(),
+                    },
+                };
+                let mut buf = Vec::with_capacity(256);
+                let _ = Self::send_messages_event(&tx, &mut buf, &error_event);
+            }
         }
 
         build_sse_response(rx)
@@ -2284,6 +2310,14 @@ impl StreamingProcessor {
                     &tx,
                     "Embeddings not supported in streaming mode",
                     "invalid_request_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
+            context::ExecutionResult::Complete(_) => {
+                utils::send_error_sse(
+                    &tx,
+                    "Partial-rollout Complete variant not supported in completion streaming",
+                    "internal_error",
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }

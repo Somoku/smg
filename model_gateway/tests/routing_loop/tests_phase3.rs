@@ -67,7 +67,11 @@ mod tests {
 
         let result = parse_routing_request_meta(Some(&headers), Some(&body));
         assert!(result.is_some());
-        assert_eq!(result.unwrap().request_id, 100, "Header should take precedence");
+        assert_eq!(
+            result.unwrap().request_id,
+            100,
+            "Header should take precedence"
+        );
     }
 
     /// Test: Parse prompt_id from header (request_id also required)
@@ -113,7 +117,7 @@ mod tests {
 
         let result = parse_routing_request_meta(Some(&headers), None);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().is_validate, true);
+        assert!(result.unwrap().is_validate);
     }
 
     /// Test: Parse boolean variations (yes, 1, True, etc.)
@@ -131,8 +135,7 @@ mod tests {
             let result = parse_routing_request_meta(Some(&headers), None);
             assert!(
                 result.is_some_and(|m| m.is_validate),
-                "Should parse '{}' as true",
-                val
+                "Should parse '{val}' as true",
             );
         }
     }
@@ -152,8 +155,7 @@ mod tests {
             let result = parse_routing_request_meta(Some(&headers), None);
             assert!(
                 result.is_some_and(|m| !m.is_validate),
-                "Should parse '{}' as false",
-                val
+                "Should parse '{val}' as false",
             );
         }
     }
@@ -170,7 +172,10 @@ mod tests {
         let result = parse_routing_request_meta(Some(&headers), None);
         assert!(result.is_some());
         let meta = result.unwrap();
-        assert_eq!(meta.rollout_instance_hint, Some(("worker-a".to_string(), 2)));
+        assert_eq!(
+            meta.rollout_instance_hint,
+            Some(("worker-a".to_string(), 2))
+        );
     }
 
     /// Test: Parse rollout_instance_hint as array from body (both IDs required)
@@ -185,7 +190,10 @@ mod tests {
         let result = parse_routing_request_meta(None, Some(&body));
         assert!(result.is_some());
         let meta = result.unwrap();
-        assert_eq!(meta.rollout_instance_hint, Some(("worker-b".to_string(), 3)));
+        assert_eq!(
+            meta.rollout_instance_hint,
+            Some(("worker-b".to_string(), 3))
+        );
     }
 
     /// Test: Parse rollout_instance_hint as object from body (both IDs required)
@@ -203,7 +211,10 @@ mod tests {
         let result = parse_routing_request_meta(None, Some(&body));
         assert!(result.is_some());
         let meta = result.unwrap();
-        assert_eq!(meta.rollout_instance_hint, Some(("worker-c".to_string(), 1)));
+        assert_eq!(
+            meta.rollout_instance_hint,
+            Some(("worker-c".to_string(), 1))
+        );
     }
 
     /// Test: Fallback to replica_id alias in object (both IDs required)
@@ -221,7 +232,10 @@ mod tests {
         let result = parse_routing_request_meta(None, Some(&body));
         assert!(result.is_some());
         let meta = result.unwrap();
-        assert_eq!(meta.rollout_instance_hint, Some(("worker-d".to_string(), 4)));
+        assert_eq!(
+            meta.rollout_instance_hint,
+            Some(("worker-d".to_string(), 4))
+        );
     }
 
     /// Test: Complete metadata with all fields
@@ -243,8 +257,8 @@ mod tests {
         assert_eq!(meta.request_id, 42);
         assert_eq!(meta.prompt_id, 7);
         assert_eq!(meta.version_tag, 3);
-        assert_eq!(meta.is_validate, true);
-        assert_eq!(meta.is_sticky, false);
+        assert!(meta.is_validate);
+        assert!(!meta.is_sticky);
         assert_eq!(
             meta.rollout_instance_hint,
             Some(("worker-main".to_string(), 0))

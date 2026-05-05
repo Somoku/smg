@@ -1,32 +1,65 @@
 //! Control-plane handlers for the request routing loop.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde::{Deserialize, Serialize};
+use tokio::time::sleep;
 
 use super::runtime::RoutingLoopRuntime;
 use crate::{routers::error, server::AppState};
 
-fn runtime_from_state(state: &AppState) -> Result<Arc<RoutingLoopRuntime>, Response> {
-    state
-        .context
-        .routing_loop_runtime
-        .clone()
-        .ok_or_else(|| error::not_found("routing_loop_disabled", "Routing loop is not enabled"))
+fn runtime_from_state(state: &AppState) -> Result<Arc<RoutingLoopRuntime>, Box<Response>> {
+    state.context.routing_loop_runtime.clone().ok_or_else(|| {
+        Box::new(error::not_found(
+            "routing_loop_disabled",
+            "Routing loop is not enabled",
+        ))
+    })
 }
 
-pub(crate) async fn pause_routing_loop(State(state): State<Arc<AppState>>) -> Response {
+// ── pause ─────────────────────────────────────────────────────────────────────
+
+/// Query params for `POST /routing_loop/pause`.
+#[derive(Deserialize)]
+pub(crate) struct PauseParams {
+    /// When `true`, poll until the routing loop's `routing` flag becomes false
+    /// (i.e. the current dispatch batch has drained) before returning.
+    /// Polls every 10 ms up to a 30-second deadline; the caller can detect a
+    /// timeout by inspecting the `routing` field of the returned status object.
+    wait: Option<bool>,
+}
+
+pub(crate) async fn pause_routing_loop(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PauseParams>,
+) -> Response {
     match runtime_from_state(&state) {
         Ok(runtime) => {
             runtime.pause();
-            Json(json!({"status": "paused"})).into_response()
+
+            if params.wait.unwrap_or(false) {
+                let deadline = Duration::from_secs(30);
+                let poll_interval = Duration::from_millis(10);
+                let start = Instant::now();
+                while runtime.is_routing() {
+                    if start.elapsed() >= deadline {
+                        break;
+                    }
+                    sleep(poll_interval).await;
+                }
+            }
+
+            Json(runtime.status().await).into_response()
         }
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -34,15 +67,85 @@ pub(crate) async fn resume_routing_loop(State(state): State<Arc<AppState>>) -> R
     match runtime_from_state(&state) {
         Ok(runtime) => {
             runtime.resume();
-            Json(json!({"status": "running"})).into_response()
+            Json(runtime.status().await).into_response()
         }
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
 pub(crate) async fn routing_loop_status(State(state): State<Arc<AppState>>) -> Response {
     match runtime_from_state(&state) {
         Ok(runtime) => Json(runtime.status().await).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
+    }
+}
+
+/// Query params for `GET /routing_loop/filter`.
+#[derive(Deserialize)]
+pub(crate) struct FilterParams {
+    version_tag: i64,
+}
+
+/// `GET /routing_loop/filter?version_tag=N`
+///
+/// Returns the metadata of all queued requests whose `version_tag ≤ N`.
+/// Used by the Python coordinator's `_check_should_sync` first step to
+/// determine whether all old-version requests have drained from the queue.
+pub(crate) async fn routing_loop_filter(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<FilterParams>,
+) -> Response {
+    match runtime_from_state(&state) {
+        Ok(runtime) => {
+            let filtered = runtime
+                .filter_queue_by_version_tag(params.version_tag)
+                .await;
+            Json(filtered).into_response()
+        }
+        Err(response) => *response,
+    }
+}
+
+/// Per-worker stats returned by `GET /workers/stats`.
+#[derive(Serialize)]
+pub(crate) struct WorkerStats {
+    base_worker_id: String,
+    dp_rank: usize,
+    version_tag: i64,
+    /// Number of prompt groups currently pinned to this worker instance.
+    running_requests: usize,
+}
+
+/// `GET /workers/stats`
+///
+/// Returns an array of per-worker statistics: synced version tag and the count
+/// of active prompt groups routed to each instance.  Used by the Python
+/// coordinator for migration decisions.
+pub(crate) async fn workers_stats(State(state): State<Arc<AppState>>) -> Response {
+    match runtime_from_state(&state) {
+        Ok(runtime) => {
+            let stats: Vec<WorkerStats> = runtime
+                .instance_to_version_after_sync
+                .iter()
+                .map(|entry| {
+                    let (base_worker_id, dp_rank) = entry.key().clone();
+                    let version_tag = *entry.value();
+                    // Count prompt groups whose pinned instance equals this worker.
+                    let running_requests = runtime
+                        .prompt_to_pinned_instance
+                        .iter()
+                        .filter(|e| *e.value() == (base_worker_id.clone(), dp_rank))
+                        .count();
+                    WorkerStats {
+                        base_worker_id,
+                        dp_rank,
+                        version_tag,
+                        running_requests,
+                    }
+                })
+                .collect();
+            Json(stats).into_response()
+        }
+        Err(response) => *response,
     }
 }

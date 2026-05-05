@@ -797,8 +797,13 @@ pub fn init_routing_loop(context: &mut AppContext) {
     let (runtime, rx) = RoutingLoopRuntime::new(
         &context.router_config.routing_loop,
         context.instance_to_version_after_sync.clone(),
+        context.worker_registry.clone(),
     );
     context.routing_loop_runtime = Some(runtime.clone());
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "background routing loop task requires tokio::spawn"
+    )]
     tokio::spawn(run_routing_loop(runtime, rx));
 }
 

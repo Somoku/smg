@@ -234,9 +234,6 @@ pub struct SelectWorkerInfo<'a> {
     /// higher-priority group can accept the request.
     ///
     /// `None` means all workers are treated as equal priority (default behaviour).
-    ///
-    /// TODO(psrl-refactor): populate from route_kwargs candidate_indicator_list
-    ///   (commits 100658fe, 2eebc614)
     pub priority_groups: Option<&'a [i64]>,
 }
 

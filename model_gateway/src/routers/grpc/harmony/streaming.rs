@@ -141,6 +141,15 @@ impl HarmonyStreamingProcessor {
                 );
                 let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
             }
+            context::ExecutionResult::Complete(_) => {
+                error!("Harmony streaming: unexpected partial-rollout Complete variant");
+                utils::send_error_sse(
+                    &tx,
+                    "Partial-rollout Complete variant not supported in streaming",
+                    "internal_error",
+                );
+                let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+            }
         }
 
         // Return SSE response
@@ -512,6 +521,10 @@ impl HarmonyStreamingProcessor {
             context::ExecutionResult::Embedding { .. } => {
                 Err("Embeddings not supported in Responses API streaming".to_string())
             }
+            context::ExecutionResult::Complete(_) => Err(
+                "Partial-rollout Complete variant not supported in Responses API streaming"
+                    .to_string(),
+            ),
         }
     }
 

@@ -60,7 +60,10 @@ use crate::{
     routers::{
         conversations,
         grpc::routing_loop::{
-            controller::{pause_routing_loop, resume_routing_loop, routing_loop_status},
+            controller::{
+                pause_routing_loop, resume_routing_loop, routing_loop_filter, routing_loop_status,
+                workers_stats,
+            },
             runtime::{run_routing_loop, RoutingLoopRuntime},
         },
         mesh::{
@@ -1116,7 +1119,8 @@ pub fn build_app(
         )
         .route("/routing_loop/status", get(routing_loop_status))
         .route("/routing_loop/pause", post(pause_routing_loop))
-        .route("/routing_loop/resume", post(resume_routing_loop));
+        .route("/routing_loop/resume", post(resume_routing_loop))
+        .route("/routing_loop/filter", get(routing_loop_filter));
 
     if app_state.context.router_config.skills_enabled
         && app_state
@@ -1158,6 +1162,7 @@ pub fn build_app(
                 .delete(delete_worker),
         )
         .route("/workers/update_stats", post(update_worker_stats))
+        .route("/workers/stats", get(workers_stats))
         .route(
             "/workers/update_weight_version",
             post(update_worker_weight_version),
@@ -1325,6 +1330,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let (runtime, rx) = RoutingLoopRuntime::new(
             &config.router_config.routing_loop,
             app_context.instance_to_version_after_sync.clone(),
+            app_context.worker_registry.clone(),
         );
 
         // Connect to PS Manager if configured

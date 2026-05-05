@@ -15,6 +15,7 @@ use openai_protocol::{
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use tokio::sync::oneshot;
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{debug, error};
 
@@ -317,6 +318,79 @@ impl RequestPipeline {
         Ok((execution_result, load_guards))
     }
 
+    /// Run execution-phase stages only (worker selection → request execution).
+    ///
+    /// Used by partial-rollout dispatch: called once per loopback iteration.
+    /// Skips `Preparation` stages; stops before `PostExecution` stages.
+    /// Execution stages must not produce an early `Ok(Some(response))`; doing so is
+    /// treated as an internal error.
+    pub(crate) async fn execute_through_execution(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<(), Response> {
+        for stage in self
+            .stages
+            .iter()
+            .filter(|s| s.phase() == StagePhase::Execution)
+        {
+            match stage.execute(ctx).await {
+                Ok(Some(_)) => {
+                    error!(
+                        function = "execute_through_execution",
+                        stage = stage.name(),
+                        "Unexpected early response from execution stage"
+                    );
+                    return Err(error::internal_error(
+                        "unexpected_early_response",
+                        "Execution stage returned an unexpected early response",
+                    ));
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        function = "execute_through_execution",
+                        stage = stage.name(),
+                        status = %response.status(),
+                        "Execution stage failed"
+                    );
+                    return Err(response);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run post-execution stages (response processing) to completion.
+    ///
+    /// Used by partial-rollout dispatch: called once after all loopback iterations finish.
+    /// Returns `Ok(Some(response))` for streaming (early exit), `Ok(None)` if the response
+    /// is stored in `ctx.state.response.final_response` for non-streaming callers to extract.
+    pub(crate) async fn execute_remaining_stages(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<Option<Response>, Response> {
+        for stage in self
+            .stages
+            .iter()
+            .filter(|s| s.phase() == StagePhase::PostExecution)
+        {
+            match stage.execute(ctx).await {
+                Ok(Some(response)) => return Ok(Some(response)),
+                Ok(None) => continue,
+                Err(response) => {
+                    error!(
+                        function = "execute_remaining_stages",
+                        stage = stage.name(),
+                        status = %response.status(),
+                        "Post-execution stage failed"
+                    );
+                    return Err(response);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     pub(crate) fn with_routing_loop(mut self, runtime: Option<Arc<RoutingLoopRuntime>>) -> Self {
         self.routing_loop_runtime = runtime;
         self
@@ -359,7 +433,7 @@ impl RequestPipeline {
         };
 
         let routing_meta = parse_routing_request_meta_from_context(&ctx);
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = oneshot::channel();
         let entry = RoutingQueueEntry {
             ctx,
             pipeline: self.clone_for_routing_dispatch(),
@@ -1417,7 +1491,7 @@ impl RequestPipeline {
         if let Some(runtime) = self.routing_loop_runtime.as_ref() {
             let ctx = self.execute_preparation_only(ctx).await?;
             let routing_meta = parse_routing_request_meta_from_context(&ctx);
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
             let entry = RoutingQueueEntry {
                 ctx,
                 pipeline: self.clone_for_routing_dispatch(),
@@ -1532,7 +1606,7 @@ impl RequestPipeline {
         if let Some(runtime) = self.routing_loop_runtime.as_ref() {
             let ctx = self.execute_preparation_only(ctx).await?;
             let routing_meta = parse_routing_request_meta_from_context(&ctx);
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
             let entry = RoutingQueueEntry {
                 ctx,
                 pipeline: self.clone_for_routing_dispatch(),
@@ -1624,7 +1698,7 @@ impl RequestPipeline {
         if let Some(runtime) = self.routing_loop_runtime.as_ref() {
             let ctx = self.execute_preparation_only(ctx).await?;
             let routing_meta = parse_routing_request_meta_from_context(&ctx);
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
             let entry = RoutingQueueEntry {
                 ctx,
                 pipeline: self.clone_for_routing_dispatch(),

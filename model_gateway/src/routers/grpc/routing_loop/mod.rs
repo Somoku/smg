@@ -6,23 +6,6 @@
 
 pub(crate) mod controller;
 pub(crate) mod metadata;
+pub(crate) mod partial_rollout;
 pub(crate) mod queue;
 pub(crate) mod runtime;
-
-#[cfg(test)]
-mod tests_phase1;
-
-#[cfg(test)]
-mod tests_phase2;
-
-#[cfg(test)]
-mod tests_phase3;
-
-#[cfg(test)]
-mod tests_phase4;
-
-#[cfg(test)]
-mod tests_phase5;
-
-#[cfg(test)]
-mod tests_phase6;

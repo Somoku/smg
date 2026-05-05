@@ -836,6 +836,20 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Override output token IDs with accumulated partial-rollout tokens.
+    ///
+    /// Used by the partial-rollout dispatch loop after all loopback iterations
+    /// finish so that the final `ProtoGenerateComplete` carries the full
+    /// accumulated token sequence rather than only the last iteration's tokens.
+    pub fn set_output_ids(&mut self, tokens: Vec<u32>) {
+        match self {
+            Self::Sglang(c) => c.output_ids = tokens,
+            Self::Vllm(c) => c.output_ids = tokens,
+            Self::Trtllm(c) => c.output_token_ids = tokens,
+            Self::Mlx(c) => c.output_ids = tokens,
+        }
+    }
+
     /// Get cached tokens
     pub fn cached_tokens(&self) -> u32 {
         match self {
