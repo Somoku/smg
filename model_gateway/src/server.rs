@@ -740,7 +740,6 @@ async fn update_worker_stats(
         .context
         .worker_service
         .update_worker_stats(update)
-        .await
         .into_response()
 }
 
@@ -1323,7 +1322,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     let mut routing_loop_rx = None;
 
     if config.router_config.is_routing_loop_enabled() {
-        let (runtime, rx) = RoutingLoopRuntime::new(&config.router_config.routing_loop);
+        let (runtime, rx) = RoutingLoopRuntime::new(
+            &config.router_config.routing_loop,
+            app_context.instance_to_version_after_sync.clone(),
+        );
+
+        // Connect to PS Manager if configured
+        let ps_manager_addr = config.router_config.psrl.ps_manager_addr.trim();
+        if !ps_manager_addr.is_empty() {
+            match runtime.connect_ps_manager(ps_manager_addr).await {
+                Ok(()) => info!(ps_manager_addr, "Connected to PS Manager"),
+                Err(err) => warn!(
+                    ps_manager_addr,
+                    error = %err,
+                    "PS Manager not available; routing loop will continue without PS Manager RPCs"
+                ),
+            }
+        }
+
         routing_loop_rx = Some(rx);
         let context = Arc::get_mut(&mut app_context).ok_or_else(|| {
             "failed to initialize routing loop before AppContext sharing".to_string()

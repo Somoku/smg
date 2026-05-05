@@ -13,8 +13,11 @@ use openai_protocol::{
 use tracing::debug;
 
 use super::{
-    common::responses::{
-        handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+    common::{
+        responses::{
+            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+        },
+        stages::build_strategy,
     },
     context::SharedComponents,
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
@@ -68,7 +71,18 @@ impl GrpcRouter {
             .clone();
 
         let worker_registry = ctx.worker_registry.clone();
-        let _policy_registry = ctx.policy_registry.clone();
+        let policy_registry = ctx.policy_registry.clone();
+
+        // Build the worker selection strategy once (shared across all regular-mode pipelines).
+        // PD-mode pipelines always use the naive selector directly.
+        let strategy = build_strategy(
+            ctx.router_config.worker_selection_strategy,
+            worker_registry.clone(),
+            policy_registry.clone(),
+            ctx.routing_loop_runtime.clone(),
+            &ctx.router_config.psrl,
+        )
+        .map_err(|e| format!("Failed to build worker selection strategy: {e}"))?;
 
         // Create multimodal components (best-effort; non-fatal if initialization fails)
         let multimodal = match MultimodalComponents::new(ctx.multimodal_config_registry.clone()) {
@@ -90,8 +104,7 @@ impl GrpcRouter {
 
         // Create regular pipeline
         let pipeline = RequestPipeline::new_regular(
-            worker_registry.clone(),
-            _policy_registry.clone(),
+            strategy.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -101,8 +114,7 @@ impl GrpcRouter {
 
         // Create Harmony pipelines
         let harmony_pipeline = RequestPipeline::new_harmony(
-            worker_registry.clone(),
-            _policy_registry.clone(),
+            strategy.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -111,19 +123,16 @@ impl GrpcRouter {
         .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Embedding pipeline
-        let embedding_pipeline =
-            RequestPipeline::new_embeddings(worker_registry.clone(), _policy_registry.clone())
-                .with_routing_loop(ctx.routing_loop_runtime.clone());
+        let embedding_pipeline = RequestPipeline::new_embeddings(strategy.clone())
+            .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Classify pipeline
-        let classify_pipeline =
-            RequestPipeline::new_classify(worker_registry.clone(), _policy_registry.clone())
-                .with_routing_loop(ctx.routing_loop_runtime.clone());
+        let classify_pipeline = RequestPipeline::new_classify(strategy.clone())
+            .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Messages pipeline
         let messages_pipeline = RequestPipeline::new_messages(
-            worker_registry.clone(),
-            _policy_registry.clone(),
+            strategy.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
@@ -132,9 +141,8 @@ impl GrpcRouter {
         .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Create Completion pipeline
-        let completion_pipeline =
-            RequestPipeline::new_completion(worker_registry.clone(), _policy_registry.clone())
-                .with_routing_loop(ctx.routing_loop_runtime.clone());
+        let completion_pipeline = RequestPipeline::new_completion(strategy.clone())
+            .with_routing_loop(ctx.routing_loop_runtime.clone());
 
         // Extract shared dependencies for responses contexts
         let mcp_orchestrator = ctx

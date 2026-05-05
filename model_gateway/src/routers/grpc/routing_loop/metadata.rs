@@ -8,10 +8,11 @@ use crate::routers::grpc::context::RequestContext;
 /// Routing metadata supplied by callers that use the routing loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RoutingMeta {
-    pub request_id: Option<i64>,
-    pub prompt_id: Option<i64>,
+    pub request_id: i64,
+    pub prompt_id: i64,
     pub version_tag: i64,
     pub is_validate: bool,
+    pub is_sticky: bool,
     pub rollout_instance_hint: Option<(String, usize)>,
 }
 
@@ -24,32 +25,27 @@ pub(crate) fn parse_routing_request_meta(
     body: Option<&Value>,
 ) -> Option<RoutingMeta> {
     let request_id = parse_i64_header(headers, "x-request-id")
-        .or_else(|| parse_i64_from_body(body, "request_id"));
+        .or_else(|| parse_i64_from_body(body, "request_id"))?;
     let prompt_id =
-        parse_i64_header(headers, "x-prompt-id").or_else(|| parse_i64_from_body(body, "prompt_id"));
+        parse_i64_header(headers, "x-prompt-id").or_else(|| parse_i64_from_body(body, "prompt_id"))?;
     let version_tag = parse_i64_header(headers, "x-version-tag")
         .or_else(|| parse_i64_from_body(body, "version_tag"))
         .unwrap_or(-1);
     let is_validate = parse_bool_header(headers, "x-is-validate")
         .or_else(|| parse_bool_from_body(body, "is_validate"))
         .unwrap_or(false);
+    let is_sticky = parse_bool_header(headers, "x-is-sticky")
+        .or_else(|| parse_bool_from_body(body, "is_sticky"))
+        .unwrap_or(false);
     let rollout_instance_hint = parse_rollout_instance_hint_from_headers(headers)
         .or_else(|| parse_rollout_instance_hint_from_body(body));
-
-    if request_id.is_none()
-        && prompt_id.is_none()
-        && version_tag == -1
-        && !is_validate
-        && rollout_instance_hint.is_none()
-    {
-        return None;
-    }
 
     Some(RoutingMeta {
         request_id,
         prompt_id,
         version_tag,
         is_validate,
+        is_sticky,
         rollout_instance_hint,
     })
 }
@@ -207,6 +203,7 @@ mod tests {
         headers.insert("x-prompt-id", HeaderValue::from_static("7"));
         headers.insert("x-version-tag", HeaderValue::from_static("3"));
         headers.insert("x-is-validate", HeaderValue::from_static("yes"));
+        headers.insert("x-is-sticky", HeaderValue::from_static("yes"));
         headers.insert("x-base-worker-id", HeaderValue::from_static("worker-a"));
         headers.insert("x-target-dp-rank", HeaderValue::from_static("2"));
 
@@ -217,6 +214,7 @@ mod tests {
                 "prompt_id": 1,
                 "version_tag": 1,
                 "is_validate": false,
+                "is_sticky": false,
                 "rollout_instance_id": ["worker-b", 5]
             })),
         );
@@ -224,10 +222,11 @@ mod tests {
         assert_eq!(
             meta,
             Some(RoutingMeta {
-                request_id: Some(42),
-                prompt_id: Some(7),
+                request_id: 42,
+                prompt_id: 7,
                 version_tag: 3,
                 is_validate: true,
+                is_sticky: true,
                 rollout_instance_hint: Some(("worker-a".to_string(), 2)),
             })
         );
@@ -235,6 +234,8 @@ mod tests {
 
     #[test]
     fn parse_body_rollout_instance_object_aliases() {
+        // request_id is present but prompt_id is absent → returns None
+        // because both are required for RoutingMeta to be constructed.
         let meta = parse_routing_request_meta(
             None,
             Some(&json!({
@@ -246,13 +247,31 @@ mod tests {
             })),
         );
 
+        assert_eq!(meta, None);
+    }
+
+    #[test]
+    fn parse_body_both_ids_with_rollout_hint() {
+        let meta = parse_routing_request_meta(
+            None,
+            Some(&json!({
+                "request_id": "5",
+                "prompt_id": "3",
+                "rollout_instance_hint": {
+                    "replica_id": "worker-c",
+                    "data_parallel_rank": "4"
+                }
+            })),
+        );
+
         assert_eq!(
             meta,
             Some(RoutingMeta {
-                request_id: Some(5),
-                prompt_id: None,
+                request_id: 5,
+                prompt_id: 3,
                 version_tag: -1,
                 is_validate: false,
+                is_sticky: false,
                 rollout_instance_hint: Some(("worker-c".to_string(), 4)),
             })
         );

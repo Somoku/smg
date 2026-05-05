@@ -483,6 +483,12 @@ struct Router {
     mesh_advertise_host: Option<String>,
     mesh_port: u16,
     mesh_peer_urls: Vec<String>,
+    worker_selection_strategy: String,
+    // Config for PSRL worker selection strategy
+    psrl_ps_manager_addr: String,
+    psrl_enable_mig_strategy: bool,
+    psrl_candidate_sort_key: String,
+    psrl_enable_group_sticky: bool,
 }
 
 impl Router {
@@ -554,16 +560,14 @@ impl Router {
                     prefix_token_count: 256,
                     load_factor: 1.25,
                 },
-                PolicyType::ThroughputOptimal => {
-                    ConfigPolicyConfig::ThroughputOptimal {
-                        cost_model_path: self.cost_model_path.clone().unwrap_or_default(),
-                        max_concurrent_seqs_per_instance: self.max_concurrent_seqs_per_instance,
-                        delta_throughput_threshold: self.delta_throughput_threshold,
-                        max_prompt_length: self.max_prompt_length,
-                        request_budget: self.request_budget,
-                        max_num_waiting_reqs_after_preemption: self.max_num_waiting_reqs_after_preemption,
-                    }
-                }
+                PolicyType::ThroughputOptimal => ConfigPolicyConfig::ThroughputOptimal {
+                    cost_model_path: self.cost_model_path.clone().unwrap_or_default(),
+                    max_concurrent_seqs_per_instance: self.max_concurrent_seqs_per_instance,
+                    delta_throughput_threshold: self.delta_throughput_threshold,
+                    max_prompt_length: self.max_prompt_length,
+                    request_budget: self.request_budget,
+                    max_num_waiting_reqs_after_preemption: self.max_num_waiting_reqs_after_preemption,
+                },
                 PolicyType::ThroughputOptimalWithBudget => {
                     ConfigPolicyConfig::ThroughputOptimalWithBudget {
                         budget: self.budget,
@@ -655,6 +659,16 @@ impl Router {
                     reason: "expected 'short_length', 'long_length', or 'small_id'".to_string(),
                 });
             }
+        };
+
+        let candidate_sort_key = match self.psrl_candidate_sort_key.as_str() {
+            "reserve_capability" => config::CandidateSortKey::ReserveCapability,
+            _ => config::CandidateSortKey::Version,
+        };
+
+        let worker_selection_strategy = match self.worker_selection_strategy.as_str() {
+            "psrl" => config::WorkerSelectionStrategy::Psrl,
+            _ => config::WorkerSelectionStrategy::Naive,
         };
 
         let history_backend = match self.history_backend {
@@ -803,6 +817,11 @@ impl Router {
                 self.server_key_path.as_ref(),
             )
             .dp_minimum_tokens_scheduler(self.dp_minimum_tokens_scheduler)
+            .worker_selection_strategy(worker_selection_strategy)
+            .psrl_ps_manager_addr(&self.psrl_ps_manager_addr)
+            .psrl_enable_mig_strategy(self.psrl_enable_mig_strategy)
+            .psrl_candidate_sort_key(candidate_sort_key)
+            .psrl_enable_group_sticky(self.psrl_enable_group_sticky)
             .build()
     }
 }
@@ -929,6 +948,11 @@ impl Router {
         mesh_port = 39527u16,
         mesh_peer_urls = vec![],
         mesh_advertise_host = None,
+        worker_selection_strategy = String::from("naive"),
+        psrl_ps_manager_addr = String::new(),
+        psrl_enable_mig_strategy = false,
+        psrl_candidate_sort_key = String::from("version"),
+        psrl_enable_group_sticky = false,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1054,6 +1078,11 @@ impl Router {
         mesh_port: u16,
         mesh_peer_urls: Vec<String>,
         mesh_advertise_host: Option<String>,
+        worker_selection_strategy: String,
+        psrl_ps_manager_addr: String,
+        psrl_enable_mig_strategy: bool,
+        psrl_candidate_sort_key: String,
+        psrl_enable_group_sticky: bool,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1192,6 +1221,11 @@ impl Router {
             mesh_advertise_host,
             mesh_port,
             mesh_peer_urls,
+            worker_selection_strategy,
+            psrl_ps_manager_addr,
+            psrl_enable_mig_strategy,
+            psrl_candidate_sort_key,
+            psrl_enable_group_sticky,
         })
     }
 

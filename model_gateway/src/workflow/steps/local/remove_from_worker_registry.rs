@@ -59,15 +59,20 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
         }
 
         let mut removed_count = 0;
+        let mut removed_workers = Vec::with_capacity(worker_urls.len());
         for worker_url in worker_urls {
-            if app_context
-                .worker_registry
-                .remove_by_url(worker_url)
-                .is_some()
-            {
+            if let Some(worker) = app_context.worker_registry.remove_by_url(worker_url) {
+                removed_workers.push(worker);
                 removed_count += 1;
             }
         }
+
+        // Purge version-map entries so `instance_to_version_after_sync` does
+        // not grow unboundedly as workers come and go over the lifetime of the
+        // process.
+        app_context
+            .worker_service
+            .remove_version_entries(&removed_workers);
 
         // Log if some workers were already removed (e.g., by another process)
         if removed_count == worker_urls.len() {

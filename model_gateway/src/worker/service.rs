@@ -18,6 +18,7 @@ use tracing::warn;
 use crate::{
     config::RouterConfig,
     policies::PolicyRegistry,
+    routers::grpc::routing_loop::runtime::InstanceVersionMap,
     worker::{
         registry::WorkerId, worker::worker_to_info, EngineStatsUpdateOutcome, Worker,
         WorkerRegistry, WorkerRoutingControlRequest, WorkerRoutingControlResult,
@@ -212,6 +213,7 @@ pub struct WorkerService {
     worker_registry: Arc<WorkerRegistry>,
     job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
     router_config: RouterConfig,
+    instance_to_version_after_sync: InstanceVersionMap,
     /// Policy registry, used to notify throughput-optimal policies
     /// when fresh engine stats arrive.
     policy_registry: Option<Arc<PolicyRegistry>>,
@@ -223,12 +225,35 @@ impl WorkerService {
         worker_registry: Arc<WorkerRegistry>,
         job_queue: Arc<std::sync::OnceLock<Arc<JobQueue>>>,
         router_config: RouterConfig,
+        instance_to_version_after_sync: InstanceVersionMap,
     ) -> Self {
         Self {
             worker_registry,
             job_queue,
             router_config,
+            instance_to_version_after_sync,
             policy_registry: None,
+        }
+    }
+
+    pub fn instance_to_version_map(&self) -> &InstanceVersionMap {
+        &self.instance_to_version_after_sync
+    }
+
+    /// Remove version-map entries for a set of workers.
+    ///
+    /// Called after workers are deregistered from the registry so that stale
+    /// `(base_worker_id, dp_rank)` → version entries do not accumulate
+    /// indefinitely in `instance_to_version_after_sync`.
+    pub fn remove_version_entries(&self, workers: &[Arc<dyn Worker>]) {
+        for worker in workers {
+            let base_worker_id = self
+                .worker_registry
+                .reserve_id_for_url(worker.base_url())
+                .as_str()
+                .to_string();
+            let key = (base_worker_id, worker.dp_rank().unwrap_or(0));
+            self.instance_to_version_after_sync.remove(&key);
         }
     }
 
@@ -454,7 +479,7 @@ impl WorkerService {
         Ok(UpdateWorkerResult { worker_id, url })
     }
 
-    pub async fn update_worker_stats(
+    pub fn update_worker_stats(
         &self,
         update: WorkerStatsUpdateRequest,
     ) -> WorkerStatsUpdateResult {
@@ -527,6 +552,18 @@ impl WorkerService {
             match self.resolve_worker_by_id_and_dp(&item.worker_id, item.dp_rank) {
                 Ok((worker_id, worker)) => {
                     if worker.update_dyn_weight_version(weight_version) {
+                        if let Ok(version_tag) = i64::try_from(weight_version) {
+                            self.instance_to_version_after_sync.insert(
+                                (
+                                    self.worker_registry
+                                        .reserve_id_for_url(worker.base_url())
+                                        .as_str()
+                                        .to_string(),
+                                    worker.dp_rank().unwrap_or(0),
+                                ),
+                                version_tag,
+                            );
+                        }
                         results.push(WorkerWeightVersionUpdateResultItem {
                             status: "updated".to_string(),
                             worker_id: worker_id.as_str().to_string(),

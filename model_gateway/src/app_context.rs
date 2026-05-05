@@ -25,7 +25,7 @@ use crate::{
     routers::{
         grpc::{
             multimodal::MultimodalConfigRegistry,
-            routing_loop::runtime::{run_routing_loop, RoutingLoopRuntime},
+            routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
         },
         openai::realtime::RealtimeRegistry,
         router_manager::RouterManager,
@@ -83,6 +83,7 @@ pub struct AppContext {
     pub inflight_tracker: Arc<InFlightRequestTracker>,
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
+    pub instance_to_version_after_sync: InstanceVersionMap,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -360,16 +361,19 @@ impl AppContextBuilder {
         let worker_job_queue = self
             .worker_job_queue
             .ok_or(AppContextBuildError::MissingField("worker_job_queue"))?;
+        let instance_to_version_after_sync = Arc::new(dashmap::DashMap::new());
 
         // Create WorkerService from the already-built components
         let policy_registry_ref = self
             .policy_registry
             .as_ref()
             .ok_or(AppContextBuildError::MissingField("policy_registry"))?;
-        let worker_service = Arc::new(WorkerService::new(
+        let worker_service = Arc::new(
+            WorkerService::new(
                 worker_registry.clone(),
                 worker_job_queue.clone(),
                 router_config.clone(),
+                instance_to_version_after_sync.clone(),
             )
             .with_policy_registry(Arc::clone(policy_registry_ref)),
         );
@@ -420,6 +424,7 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             routing_loop_runtime: self.routing_loop_runtime,
+            instance_to_version_after_sync,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server,
@@ -789,7 +794,10 @@ pub fn init_routing_loop(context: &mut AppContext) {
     if !context.router_config.routing_loop.enabled {
         return;
     }
-    let (runtime, rx) = RoutingLoopRuntime::new(&context.router_config.routing_loop);
+    let (runtime, rx) = RoutingLoopRuntime::new(
+        &context.router_config.routing_loop,
+        context.instance_to_version_after_sync.clone(),
+    );
     context.routing_loop_runtime = Some(runtime.clone());
     tokio::spawn(run_routing_loop(runtime, rx));
 }

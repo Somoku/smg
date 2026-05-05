@@ -18,7 +18,6 @@ categories = ["web-programming", "network-programming"]
 default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
-psrl = ["dep:psrl-state"]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -79,7 +78,7 @@ smg-mesh.workspace = true
 smg-grpc-client.workspace = true
 smg-skills.workspace = true
 smg-blob-storage.workspace = true
-psrl-state = { workspace = true, optional = true }
+psrl-state.workspace = true
 
 # External dependencies (not in workspace)
 bincode = "1.3"

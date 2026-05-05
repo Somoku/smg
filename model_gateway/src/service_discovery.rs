@@ -1249,6 +1249,7 @@ mod tests {
 
         let worker_registry = Arc::new(crate::worker::WorkerRegistry::new());
         let worker_job_queue = Arc::new(std::sync::OnceLock::new());
+        let instance_to_version_after_sync = Arc::new(dashmap::DashMap::new());
 
         // Note: Using uninitialized queue for tests to avoid spawning background workers
         // Jobs submitted during tests will queue but not be processed
@@ -1282,15 +1283,20 @@ mod tests {
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
             skill_service: None,
             wasm_manager: None,
-            worker_service: Arc::new(WorkerService::new(
-                worker_registry,
-                worker_job_queue,
-                router_config,
-            ).with_policy_registry(Arc::new(crate::policies::PolicyRegistry::new(
-                router_config.policy.clone(),
-            )))),
+            worker_service: Arc::new(
+                WorkerService::new(
+                    worker_registry,
+                    worker_job_queue,
+                    router_config.clone(),
+                    instance_to_version_after_sync.clone(),
+                )
+                .with_policy_registry(Arc::new(
+                    crate::policies::PolicyRegistry::new(router_config.policy.clone()),
+                )),
+            ),
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: None,
+            instance_to_version_after_sync,
             routing_loop_runtime: None,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: None,

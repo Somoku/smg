@@ -20,6 +20,53 @@ pub enum RequestSortKey {
     SmallId,
 }
 
+/// Worker selection strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerSelectionStrategy {
+    /// Naive (round-robin / policy-only) selection. Default.
+    #[default]
+    Naive,
+    /// Policy-based Scheduling for RL (PSRL) five-stage selection.
+    Psrl,
+}
+
+/// Sorting function for the PSRL worker selection strategy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateSortKey {
+    /// Sort by version tag descending (no RPC needed). Default.
+    #[default]
+    Version,
+    /// Sort by PS Manager reserve score (calls get_reserve_indicator RPC),
+    /// with version tag as tiebreaker.
+    ReserveCapability,
+}
+
+/// Configuration for the PSRL worker selection strategy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PsrlConfig {
+    pub ps_manager_addr: String,
+    /// Allow instance migration
+    pub enable_mig_strategy: bool,
+    /// Candidate sorting function
+    pub candidate_sort_key: CandidateSortKey,
+    /// When true, the same prompt will run on the same worker.
+    pub enable_group_sticky_routing: bool,
+}
+
+impl Default for PsrlConfig {
+    fn default() -> Self {
+        Self {
+            ps_manager_addr: String::new(),
+            enable_mig_strategy: false,
+            candidate_sort_key: CandidateSortKey::Version,
+            enable_group_sticky_routing: false,
+        }
+    }
+}
+
 /// Runtime knobs for the routing loop.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -153,6 +200,10 @@ pub struct RouterConfig {
     pub queue_timeout_secs: u64,
     #[serde(default)]
     pub routing_loop: RoutingLoopConfig,
+    pub worker_selection_strategy: WorkerSelectionStrategy,
+    /// PSRL worker selection strategy parameters
+    #[serde(default)]
+    pub psrl: PsrlConfig,
     /// If not set, defaults to max_concurrent_requests
     pub rate_limit_tokens_per_second: Option<i32>,
     /// Staleness threshold for engine stats updates
@@ -794,6 +845,8 @@ impl Default for RouterConfig {
             queue_size: 100,
             queue_timeout_secs: 60,
             routing_loop: RoutingLoopConfig::default(),
+            worker_selection_strategy: WorkerSelectionStrategy::Naive,
+            psrl: PsrlConfig::default(),
             rate_limit_tokens_per_second: None,
             engine_stats_staleness_threshold_ms: 0,
             cors_allowed_origins: vec![],
@@ -1075,6 +1128,7 @@ stream_retention_secs: 3600
                 "max_concurrent_requests": -1,
                 "queue_size": 10,
                 "queue_timeout_secs": 5,
+                "worker_selection_strategy": "naive",
                 "cors_allowed_origins": [],
                 "retry": {
                     "max_retries": 3,
@@ -1770,5 +1824,40 @@ stream_retention_secs: 3600
             PolicyConfig::RoundRobin => {}
             _ => panic!("Expected RoundRobin for regular mode"),
         }
+    }
+
+    /// CandidateSortKey serde roundtrip: snake_case names must survive
+    /// JSON serialization and deserialization unchanged.
+    #[test]
+    fn test_candidate_sort_key_serde_roundtrip() {
+        let cases = [
+            (CandidateSortKey::Version, "\"version\""),
+            (
+                CandidateSortKey::ReserveCapability,
+                "\"reserve_capability\"",
+            ),
+        ];
+        for (variant, expected_json) in &cases {
+            let serialized = serde_json::to_string(variant)
+                .unwrap_or_else(|e| panic!("serialize {variant:?} failed: {e}"));
+            assert_eq!(&serialized, expected_json, "JSON mismatch for {variant:?}");
+
+            let deserialized: CandidateSortKey = serde_json::from_str(expected_json)
+                .unwrap_or_else(|e| panic!("deserialize {expected_json} failed: {e}"));
+            assert_eq!(
+                &deserialized, variant,
+                "Roundtrip mismatch for {expected_json}"
+            );
+        }
+    }
+
+    /// PsrlConfig::default() must use "naive" as the worker selection strategy.
+    #[test]
+    fn test_psrl_config_defaults() {
+        let cfg = PsrlConfig::default();
+        assert_eq!(cfg.ps_manager_addr, "");
+        assert!(!cfg.enable_mig_strategy);
+        assert_eq!(cfg.candidate_sort_key, CandidateSortKey::Version);
+        assert!(!cfg.enable_group_sticky_routing);
     }
 }

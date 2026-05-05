@@ -3,10 +3,11 @@ use std::collections::HashMap;
 use smg_mcp::McpConfig;
 
 use super::{
-    CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig, HealthCheckConfig,
-    HistoryBackend, MemoryRuntimeConfig, MetricsConfig, OracleConfig, PolicyConfig, PostgresConfig,
-    RedisConfig, RequestSortKey, RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode,
-    SkillsConfig, TokenizerCacheConfig, TraceConfig,
+    CandidateSortKey, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
+    HealthCheckConfig, HistoryBackend, MemoryRuntimeConfig, MetricsConfig, OracleConfig,
+    PolicyConfig, PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey, RetryConfig,
+    RouterConfig, RoutingLoopConfig, RoutingMode, SkillsConfig, TokenizerCacheConfig, TraceConfig,
+    WorkerSelectionStrategy,
 };
 use crate::worker::ConnectionMode;
 
@@ -309,6 +310,36 @@ impl RouterConfigBuilder {
 
     pub fn routing_loop_max_running_dispatch_tasks(mut self, max_tasks: usize) -> Self {
         self.config.routing_loop.max_running_dispatch_tasks = max_tasks;
+        self
+    }
+
+    pub fn worker_selection_strategy(mut self, s: WorkerSelectionStrategy) -> Self {
+        self.config.worker_selection_strategy = s;
+        self
+    }
+
+    pub fn psrl_ps_manager_addr(mut self, addr: impl Into<String>) -> Self {
+        self.config.psrl.ps_manager_addr = addr.into();
+        self
+    }
+
+    pub fn psrl_enable_mig_strategy(mut self, v: bool) -> Self {
+        self.config.psrl.enable_mig_strategy = v;
+        self
+    }
+
+    pub fn psrl_candidate_sort_key(mut self, v: CandidateSortKey) -> Self {
+        self.config.psrl.candidate_sort_key = v;
+        self
+    }
+
+    pub fn psrl_enable_group_sticky(mut self, v: bool) -> Self {
+        self.config.psrl.enable_group_sticky_routing = v;
+        self
+    }
+
+    pub fn psrl_config(mut self, config: PsrlConfig) -> Self {
+        self.config.psrl = config;
         self
     }
 

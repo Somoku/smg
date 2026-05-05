@@ -21,7 +21,10 @@ use tracing::{debug, error};
 // Import embedding-specific, classify-specific, messages-specific, and completion-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
-    common::{responses::ResponsesContext, stages::*},
+    common::{
+        responses::ResponsesContext,
+        stages::{WorkerSelectorStrategy, *},
+    },
     context::*,
     harmony,
     regular::{
@@ -409,8 +412,7 @@ impl RequestPipeline {
 
     /// Create a regular (single-worker) pipeline
     pub fn new_regular(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
+        strategy: Arc<dyn WorkerSelectorStrategy>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
@@ -433,11 +435,7 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(ChatGeneratePreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(ChatGenerateRequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
@@ -457,8 +455,7 @@ impl RequestPipeline {
 
     /// Create a Harmony (single-worker) pipeline for Harmony-capable models
     pub fn new_harmony(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
+        strategy: Arc<dyn WorkerSelectorStrategy>,
         _tool_parser_factory: ToolParserFactory,
         _reasoning_parser_factory: ReasoningParserFactory,
         _configured_tool_parser: Option<String>,
@@ -466,11 +463,7 @@ impl RequestPipeline {
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(harmony::stages::HarmonyPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(false)),
             Box::new(DispatchMetadataStage),
@@ -497,10 +490,9 @@ impl RequestPipeline {
     ) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(harmony::stages::HarmonyPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::PrefillDecode,
+            Box::new(WorkerSelectionStage::new_pd(
+                Arc::clone(&worker_registry),
+                Arc::clone(&policy_registry),
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(harmony::stages::HarmonyRequestBuildingStage::new(true)),
@@ -542,10 +534,9 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(ChatGeneratePreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::PrefillDecode,
+            Box::new(WorkerSelectionStage::new_pd(
+                Arc::clone(&worker_registry),
+                Arc::clone(&policy_registry),
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(ChatGenerateRequestBuildingStage::new(true)), // Inject PD metadata
@@ -565,17 +556,10 @@ impl RequestPipeline {
     }
 
     /// Create an embeddings pipeline
-    pub fn new_embeddings(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-    ) -> Self {
+    pub fn new_embeddings(strategy: Arc<dyn WorkerSelectorStrategy>) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(EmbeddingPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular, // Embeddings are always single
-            )),
+            Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
             Box::new(DispatchMetadataStage),
@@ -594,17 +578,10 @@ impl RequestPipeline {
     ///
     /// Classify reuses embedding stages for preparation and request building,
     /// but uses its own response processing for softmax + label mapping.
-    pub fn new_classify(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-    ) -> Self {
+    pub fn new_classify(strategy: Arc<dyn WorkerSelectorStrategy>) -> Self {
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(EmbeddingPreparationStage::new()),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular, // Classify is always single worker
-            )),
+            Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(EmbeddingRequestBuildingStage::new()),
             Box::new(DispatchMetadataStage),
@@ -625,8 +602,7 @@ impl RequestPipeline {
     /// processing. Shares worker selection, client acquisition, dispatch metadata,
     /// and request execution stages with other pipelines.
     pub fn new_messages(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
+        strategy: Arc<dyn WorkerSelectorStrategy>,
         tool_parser_factory: ToolParserFactory,
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
@@ -649,11 +625,7 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(MessagePreparationStage),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(MessageRequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
@@ -697,10 +669,9 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(MessagePreparationStage),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::PrefillDecode,
+            Box::new(WorkerSelectionStage::new_pd(
+                Arc::clone(&worker_registry),
+                Arc::clone(&policy_registry),
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(MessageRequestBuildingStage::new(true)), // Inject PD metadata
@@ -724,10 +695,7 @@ impl RequestPipeline {
     /// Uses Completion-specific stages for preparation, request building, and response
     /// processing. Shares worker selection, client acquisition, dispatch metadata,
     /// and request execution stages with other pipelines.
-    pub fn new_completion(
-        worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
-    ) -> Self {
+    pub fn new_completion(strategy: Arc<dyn WorkerSelectorStrategy>) -> Self {
         let processor = processor::ResponseProcessor::new(
             ToolParserFactory::default(),
             ReasoningParserFactory::default(),
@@ -745,11 +713,7 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(CompletionPreparationStage),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::Regular,
-            )),
+            Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(CompletionRequestBuildingStage::new(false)), // No PD metadata
             Box::new(DispatchMetadataStage),
@@ -789,10 +753,9 @@ impl RequestPipeline {
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
             Box::new(CompletionPreparationStage),
-            Box::new(WorkerSelectionStage::new(
-                worker_registry,
-                policy_registry,
-                WorkerSelectionMode::PrefillDecode,
+            Box::new(WorkerSelectionStage::new_pd(
+                Arc::clone(&worker_registry),
+                Arc::clone(&policy_registry),
             )),
             Box::new(ClientAcquisitionStage),
             Box::new(CompletionRequestBuildingStage::new(true)), // Inject PD metadata

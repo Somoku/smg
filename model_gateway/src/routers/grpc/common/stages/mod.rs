@@ -31,9 +31,11 @@ mod dispatch_metadata;
 pub(crate) mod helpers;
 mod request_execution;
 mod worker_selection;
+pub(crate) mod worker_selector;
 
 // Export stage implementations
 pub(crate) use client_acquisition::ClientAcquisitionStage;
 pub(crate) use dispatch_metadata::DispatchMetadataStage;
 pub(crate) use request_execution::{ExecutionMode, RequestExecutionStage};
-pub(crate) use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};
+pub(crate) use worker_selection::WorkerSelectionStage;
+pub(crate) use worker_selector::{build_strategy, WorkerSelectorStrategy};
