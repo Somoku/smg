@@ -32,6 +32,10 @@ service VllmEngine {
   // Subscribe to KV cache events (server-streaming)
   rpc SubscribeKvEvents(smg.grpc.common.SubscribeKvEventsRequest)
       returns (stream smg.grpc.common.KvEventBatch);
+
+  // Subscribe to preemption events (server-streaming)
+  rpc SubscribePreemptionEvents(SubscribePreemptionEventsRequest)
+      returns (stream PreemptionEvent);
 }
 
 // =====================
@@ -325,4 +329,22 @@ message GetServerInfoResponse {
   uint32 tensor_parallel_size = 8;
   uint32 data_parallel_size = 9;
   uint32 pipeline_parallel_size = 10;
+}
+
+// =====================
+// Preemption Events
+// =====================
+
+message SubscribePreemptionEventsRequest {}
+
+// PreemptionEvent carries one or more preempted request IDs in a single
+// stream message. Multiple IDs may be batched when several preemptions
+// occur within the same scheduler step.
+message PreemptionEvent {
+  // Request IDs that were preempted and crossed the gateway notification
+  // threshold on the originating vLLM instance.
+  repeated string request_ids = 1;
+  // Wall-clock time of the preemption event, nanoseconds since Unix epoch.
+  // int64 is used (not uint64) for compatibility with Rust's SystemTime APIs.
+  int64 timestamp_ns = 2;
 }

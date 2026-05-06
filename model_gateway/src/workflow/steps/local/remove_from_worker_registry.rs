@@ -60,7 +60,12 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
 
         let mut removed_count = 0;
         let mut removed_workers = Vec::with_capacity(worker_urls.len());
+        let mut removed_worker_ids = Vec::with_capacity(worker_urls.len());
         for worker_url in worker_urls {
+            if app_context.preemption_monitor.is_some() {
+                let worker_id = app_context.worker_registry.reserve_id_for_url(worker_url);
+                removed_worker_ids.push(worker_id);
+            }
             if let Some(worker) = app_context.worker_registry.remove_by_url(worker_url) {
                 removed_workers.push(worker);
                 removed_count += 1;
@@ -112,6 +117,13 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromWorkerRegistryStep {
                 model_id,
                 pool_size,
             );
+        }
+
+        // Notify PreemptionMonitor to stop subscribers for removed workers.
+        if let Some(ref preemption_monitor) = app_context.preemption_monitor {
+            for worker_id in &removed_worker_ids {
+                preemption_monitor.on_worker_removed(worker_id).await;
+            }
         }
 
         Ok(StepResult::Success)

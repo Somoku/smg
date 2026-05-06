@@ -26,6 +26,7 @@ use crate::{
         grpc::{
             multimodal::MultimodalConfigRegistry,
             routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
+            preemption_subscriber::PreemptionMonitor,
         },
         openai::realtime::RealtimeRegistry,
         router_manager::RouterManager,
@@ -72,6 +73,7 @@ pub struct AppContext {
     pub conversation_memory_writer: Arc<dyn ConversationMemoryWriter>,
     pub background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
     pub worker_monitor: Option<Arc<WorkerMonitor>>,
+    pub preemption_monitor: Option<Arc<PreemptionMonitor>>,
     pub configured_reasoning_parser: Option<String>,
     pub configured_tool_parser: Option<String>,
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
@@ -115,6 +117,7 @@ pub struct AppContextBuilder {
     conversation_memory_writer: Option<Arc<dyn ConversationMemoryWriter>>,
     background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
     worker_monitor: Option<Arc<WorkerMonitor>>,
+    preemption_monitor: Option<Arc<PreemptionMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_orchestrator: Option<Arc<OnceLock<Arc<McpOrchestrator>>>>,
@@ -171,6 +174,7 @@ impl AppContextBuilder {
             conversation_memory_writer: None,
             background_repository: None,
             worker_monitor: None,
+            preemption_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
             mcp_orchestrator: None,
@@ -271,6 +275,11 @@ impl AppContextBuilder {
 
     pub fn worker_monitor(mut self, worker_monitor: Option<Arc<WorkerMonitor>>) -> Self {
         self.worker_monitor = worker_monitor;
+        self
+    }
+
+    pub fn preemption_monitor(mut self, preemption_monitor: Option<Arc<PreemptionMonitor>>) -> Self {
+        self.preemption_monitor = preemption_monitor;
         self
     }
 
@@ -409,6 +418,7 @@ impl AppContextBuilder {
             )?,
             background_repository: self.background_repository,
             worker_monitor: self.worker_monitor,
+            preemption_monitor: self.preemption_monitor,
             configured_reasoning_parser,
             configured_tool_parser,
             worker_job_queue,
@@ -454,6 +464,7 @@ impl AppContextBuilder {
             .with_storage(&router_config)
             .await?
             .with_worker_monitor(&router_config)?
+            .with_preemption_monitor(&router_config)
             .with_worker_job_queue()
             .with_workflow_engines()
             .with_mcp_orchestrator(&router_config)
@@ -644,6 +655,13 @@ impl AppContextBuilder {
             config.load_monitor_interval_secs,
         )));
         Ok(self)
+    }
+
+    fn with_preemption_monitor(mut self, config: &RouterConfig) -> Self {
+        if config.enable_routing_loop {
+            self.preemption_monitor = Some(Arc::new(PreemptionMonitor::new()));
+        }
+        self
     }
 
     /// Create worker job queue OnceLock container

@@ -97,15 +97,10 @@ impl Drop for AbortOnDropStream {
                 "Stream dropped without completion for request {}, sending abort",
                 request_id
             );
-            // Clone request_id for the error message since abort_request takes ownership
-            let request_id_for_log = request_id.clone();
-            if let Err(e) = client
-                .abort_request(request_id, "Stream dropped".to_string())
-                .await
-            {
+            if let Err(e) = client.abort_request(vec![request_id.clone()]).await {
                 warn!(
                     "Failed to send abort on drop for request {}: {}",
-                    request_id_for_log, e
+                    request_id, e
                 );
             }
         });
@@ -216,21 +211,31 @@ impl VllmEngineClient {
         Ok(response.into_inner())
     }
 
-    /// Abort a request
+    /// Abort one or more requests in a single RPC.
     pub async fn abort_request(
         &self,
-        request_id: String,
-        _reason: String,
+        request_ids: Vec<String>,
     ) -> Result<(), tonic::Status> {
-        debug!("Sending abort request for {}", request_id);
-        let request = Request::new(proto::AbortRequest {
-            request_ids: vec![request_id.clone()],
-        });
-
+        if request_ids.is_empty() {
+            return Ok(());
+        }
+        debug!("Sending abort for {} request(s)", request_ids.len());
+        let request = Request::new(proto::AbortRequest { request_ids });
         let mut client = self.client.clone();
-        let _response = client.abort(request).await?;
-        debug!("Abort response received for {}", request_id);
+        client.abort(request).await?;
         Ok(())
+    }
+
+    /// Subscribe to preemption events from this vLLM instance.
+    /// Returns a streaming response that yields `PreemptionEvent` messages
+    /// whenever the scheduler preempts requests above the configured threshold.
+    pub async fn subscribe_preemption_events(
+        &self,
+    ) -> Result<Streaming<proto::PreemptionEvent>, tonic::Status> {
+        let request = Request::new(proto::SubscribePreemptionEventsRequest {});
+        let mut client = self.client.clone();
+        let response = client.subscribe_preemption_events(request).await?;
+        Ok(response.into_inner())
     }
 
     /// Get model information

@@ -116,6 +116,22 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             );
         }
 
+        // Notify PreemptionMonitor of newly added vLLM workers so it can subscribe
+        // to their preemption events. This covers both startup workers (which go through
+        // this step during server init) and dynamically added workers.
+        if let Some(ref preemption_monitor) = app_context.preemption_monitor {
+            for (worker, worker_id) in workers.iter().zip(worker_ids.iter()) {
+                if let Ok(Some(grpc_client)) = worker.get_grpc_client().await {
+                    if grpc_client.is_vllm() {
+                        let client = grpc_client.as_vllm().clone();
+                        preemption_monitor
+                            .on_worker_added(worker_id.clone(), client)
+                            .await;
+                    }
+                }
+            }
+        }
+
         // WorkerMonitor subscribes to registry events directly (see
         // `worker::monitor::WorkerMonitor::start_event_loop`), so this
         // step no longer has to push group-add notifications. The

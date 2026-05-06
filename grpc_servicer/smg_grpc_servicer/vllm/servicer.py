@@ -5,6 +5,7 @@ vLLM gRPC Servicer
 Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
+import asyncio
 import hashlib
 import itertools
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 import grpc
 import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
@@ -54,7 +56,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     """
     gRPC servicer implementing the VllmEngine service.
 
-    Handles 7 RPCs:
+    Handles 8 RPCs:
     - Generate: Streaming text generation
     - Embed: Embeddings
     - HealthCheck: Health probe
@@ -62,18 +64,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - GetModelInfo: Model metadata
     - GetServerInfo: Server state
     - GetTokenizer: Stream tokenizer artifacts
+    - SubscribePreemptionEvents: Stream scheduler-preempted request IDs to SMG
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float):
+    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None,):
         """
         Initialize the servicer.
 
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
+            preemption_queue: Optional queue for preemption events; if None,
+                a new empty queue is created (no events will be delivered
+                unless a PreemptionStatLogger is wired to the same queue)
         """
         self.engine = async_llm
         self.start_time = start_time
+        self.preemption_queue: asyncio.Queue[list[str]] = (
+            preemption_queue if preemption_queue is not None else asyncio.Queue()
+        )
         logger.info("VllmEngineServicer initialized")
 
     async def Generate(
@@ -359,7 +368,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_connector = kv_transfer_config.kv_connector or ""
             kv_role = kv_transfer_config.kv_role or ""
 
-        parallel_config = self.async_llm.vllm_config.parallel_config
+        parallel_config = self.engine.vllm_config.parallel_config
         data_parallel_size = parallel_config.data_parallel_size
         tensor_parallel_size = parallel_config.tensor_parallel_size
         pipeline_parallel_size = parallel_config.pipeline_parallel_size
@@ -423,6 +432,35 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 sha256=sha256 if is_last else "",
             )
             offset = end
+
+    async def SubscribePreemptionEvents(
+        self,
+        request: vllm_engine_pb2.SubscribePreemptionEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ):
+        """Stream preemption events to the SMG gateway.
+
+        Blocks until preempted request IDs are available, then yields a batched
+        ``PreemptionEvent``.  Runs indefinitely until the client disconnects.
+
+        ``drain_preemption_queue`` races the blocking ``queue.get()`` against
+        an abort event that is set when the gRPC context is cancelled.  This
+        guarantees the handler coroutine exits promptly on disconnect, preventing
+        the zombie-consumer / dual-consumer race that would arise if we awaited
+        the queue unconditionally.
+        """
+        abort_event = asyncio.Event()
+        context.add_done_callback(lambda _ctx: abort_event.set())
+
+        while not context.cancelled():
+            req_ids = await drain_preemption_queue(self.preemption_queue, abort_event)
+            if req_ids is None:
+                # abort_event fired — client disconnected.
+                break
+            yield vllm_engine_pb2.PreemptionEvent(
+                request_ids=req_ids,
+                timestamp_ns=time.time_ns(),
+            )
 
     # ========== Helper methods ==========
 

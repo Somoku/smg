@@ -13,6 +13,7 @@ pub(crate) mod proto_wrapper;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod routing_loop;
+pub mod preemption_subscriber;
 pub mod utils; // Used by routers/http and bindings/golang
 
 // Re-export for convenience

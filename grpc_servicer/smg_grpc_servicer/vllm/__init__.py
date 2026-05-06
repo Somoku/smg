@@ -4,6 +4,7 @@ import logging
 
 from smg_grpc_servicer.vllm.health_servicer import VllmHealthServicer
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger, drain_preemption_queue
 
 # Attach the top-level ``smg_grpc_servicer`` logger to the vllm logging
 # hierarchy so that INFO/DEBUG messages from any submodule use the same
@@ -14,4 +15,4 @@ _pkg_logger.handlers = list(_vllm_logger.handlers)
 _pkg_logger.setLevel(_vllm_logger.level)
 _pkg_logger.propagate = False
 
-__all__ = ["VllmEngineServicer", "VllmHealthServicer"]
+__all__ = ["VllmEngineServicer", "VllmHealthServicer", "PreemptionStatLogger", "drain_preemption_queue"]
