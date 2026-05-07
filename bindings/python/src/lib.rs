@@ -17,6 +17,7 @@ pub enum PolicyType {
     Manual,
     ConsistentHashing,
     PrefixHash,
+    RequestNumBalance,
     ThroughputOptimal,
     ThroughputOptimalWithBudget,
 }
@@ -564,6 +565,7 @@ impl Router {
                     prefix_token_count: 256,
                     load_factor: 1.25,
                 },
+                PolicyType::RequestNumBalance => ConfigPolicyConfig::RequestNumBalance,
                 PolicyType::ThroughputOptimal => ConfigPolicyConfig::ThroughputOptimal {
                     cost_model_path: self.cost_model_path.clone().unwrap_or_default(),
                     max_concurrent_seqs_per_instance: self.max_concurrent_seqs_per_instance,

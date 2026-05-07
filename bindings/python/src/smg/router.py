@@ -29,6 +29,7 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
         "manual": PolicyType.Manual,
         "consistent_hashing": PolicyType.ConsistentHashing,
         "prefix_hash": PolicyType.PrefixHash,
+        "request_num_balance": PolicyType.RequestNumBalance,
         "throughput_optimal": PolicyType.ThroughputOptimal,
         "throughput_optimal_with_budget": PolicyType.ThroughputOptimalWithBudget,
     }

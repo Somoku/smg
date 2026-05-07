@@ -95,6 +95,12 @@ class RouterArgs:
     routing_loop_receive_batch_size: int = 1024
     routing_loop_dispatch_batch_size: int = 1024
     routing_loop_max_running_dispatch_tasks: int = 4096
+    # PSRL worker selection configuration
+    worker_selection_strategy: str = "naive"
+    psrl_ps_manager_addr: str = ""
+    psrl_enable_mig_strategy: bool = False
+    psrl_candidate_sort_key: str = "version"
+    psrl_enable_group_sticky: bool = False
     # TITO configuration
     enable_tito: bool = False
     tito_debug: bool = False
@@ -785,6 +791,38 @@ class RouterArgs:
             default=RouterArgs.routing_loop_max_running_dispatch_tasks,
             help="Maximum in-flight dispatch tasks created by the routing loop",
         )
+        routing_loop_group.add_argument(
+            f"--{prefix}worker-selection-strategy",
+            type=str,
+            choices=["naive", "psrl"],
+            default=RouterArgs.worker_selection_strategy,
+            help="Worker selection strategy for gRPC request routing",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}psrl-ps-manager-addr",
+            type=str,
+            default=RouterArgs.psrl_ps_manager_addr,
+            help="PS Manager gRPC address used by the PSRL worker selection strategy",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}psrl-enable-mig-strategy",
+            action="store_true",
+            default=RouterArgs.psrl_enable_mig_strategy,
+            help="Enable PSRL migration-aware worker selection",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}psrl-candidate-sort-key",
+            type=str,
+            choices=["version", "reserve_capability"],
+            default=RouterArgs.psrl_candidate_sort_key,
+            help="Candidate ordering key for PSRL worker selection",
+        )
+        routing_loop_group.add_argument(
+            f"--{prefix}psrl-enable-group-sticky",
+            action="store_true",
+            default=RouterArgs.psrl_enable_group_sticky,
+            help="Keep requests with the same prompt group pinned to one worker instance",
+        )
 
         # TITO configuration
         tito_group.add_argument(
@@ -1384,6 +1422,16 @@ class RouterArgs:
         ):
             if getattr(self, field_name) < 1:
                 raise ValueError(f"{field_name} must be >= 1")
+        if self.worker_selection_strategy not in ("naive", "psrl"):
+            raise ValueError(
+                "Invalid worker_selection_strategy "
+                f"'{self.worker_selection_strategy}'. Must be 'naive' or 'psrl'."
+            )
+        if self.psrl_candidate_sort_key not in ("version", "reserve_capability"):
+            raise ValueError(
+                "Invalid psrl_candidate_sort_key "
+                f"'{self.psrl_candidate_sort_key}'. Must be 'version' or 'reserve_capability'."
+            )
 
         # Validate configuration based on mode
         if self.pd_disaggregation:

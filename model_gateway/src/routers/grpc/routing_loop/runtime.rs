@@ -1,7 +1,7 @@
 //! Runtime for request routing-loop dispatch.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, OnceLock,
@@ -96,8 +96,12 @@ pub(crate) struct RoutingLoopStatus {
     pub(crate) paused: bool,
     pub(crate) routing: bool,
     pub(crate) queue_len: usize,
+    pub(crate) pending_request_num: usize,
     pub(crate) running_tasks: usize,
+    pub(crate) running_request_num: usize,
+    pub(crate) max_running_dispatch_tasks: usize,
     pub(crate) queue_keys: Vec<i32>,
+    pub(crate) partition_queue_lens: HashMap<i32, usize>,
 }
 
 /// Lightweight metadata snapshot for a single queued request.
@@ -117,6 +121,7 @@ pub struct RoutingLoopRuntime {
     paused: AtomicBool,
     routing: AtomicBool,
     running_tasks: AtomicUsize,
+    running_requests: AtomicUsize,
     check_interval_ms: u64,
     receive_batch_size: usize,
     dispatch_batch_size: usize,
@@ -166,6 +171,7 @@ impl RoutingLoopRuntime {
             paused: AtomicBool::new(false),
             routing: AtomicBool::new(false),
             running_tasks: AtomicUsize::new(0),
+            running_requests: AtomicUsize::new(0),
             check_interval_ms: config.check_interval_ms,
             receive_batch_size: config.receive_batch_size.max(1),
             dispatch_batch_size: config.dispatch_batch_size.max(1),
@@ -212,6 +218,7 @@ impl RoutingLoopRuntime {
                 .or_default();
             if !entry.contains(&request_id) {
                 entry.push(request_id);
+                self.running_requests.fetch_add(1, Ordering::AcqRel);
             }
         }
     }
@@ -226,7 +233,11 @@ impl RoutingLoopRuntime {
                 .prompt_to_running_request_ids
                 .get_mut(&prompt_id)
                 .map(|mut ids| {
+                    let before = ids.len();
                     ids.retain(|rid| *rid != request_id);
+                    if ids.len() < before {
+                        self.running_requests.fetch_sub(1, Ordering::AcqRel);
+                    }
                     ids.is_empty()
                 })
                 .unwrap_or(false);
@@ -271,13 +282,18 @@ impl RoutingLoopRuntime {
 
     pub(crate) async fn status(&self) -> RoutingLoopStatus {
         let queue = self.queue.lock().await;
+        let queue_len = queue.len();
         RoutingLoopStatus {
             enabled: true,
             paused: self.is_paused(),
             routing: self.routing.load(Ordering::Acquire),
-            queue_len: queue.len(),
+            queue_len,
+            pending_request_num: queue_len,
             running_tasks: self.running_tasks.load(Ordering::Acquire),
+            running_request_num: self.running_requests.load(Ordering::Acquire),
+            max_running_dispatch_tasks: self.max_running_dispatch_tasks,
             queue_keys: queue.queue_keys(),
+            partition_queue_lens: queue.per_partition_sizes(),
         }
     }
 
