@@ -1,19 +1,22 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
 };
-use tracing::{debug, error};
+use smg_tito::{engine::TitoEngine, model_adapter, TitoStore, TITO_SESSION_HEADER, TITO_TRAJECTORY_ID_HEADER};
+use tracing::{debug, error, warn};
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::{PipelineStage, StagePhase},
-        context::{PreparationOutput, RequestContext},
-        multimodal, utils,
+        context::{PreparationOutput, RequestContext, RequestType, TitoRequestContext},
+        multimodal, utils, ProcessedMessages,
     },
 };
 
@@ -21,7 +24,15 @@ use crate::routers::{
 ///
 /// Extracts chat-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
-pub(crate) struct ChatPreparationStage;
+pub(crate) struct ChatPreparationStage {
+    tito_store: Option<Arc<TitoStore>>,
+}
+
+impl ChatPreparationStage {
+    pub fn new(tito_store: Option<Arc<TitoStore>>) -> Self {
+        Self { tito_store }
+    }
+}
 
 #[async_trait]
 impl PipelineStage for ChatPreparationStage {
@@ -60,12 +71,12 @@ impl ChatPreparationStage {
         let is_multimodal = multimodal::has_multimodal_content(&request.messages);
         let (image_placeholder, mm_context) = if is_multimodal {
             if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-                let model_id = ctx.input.model_id.as_str();
+                let model_id = ctx.input.model_id.clone();
                 let entry = ctx
                     .components
                     .tokenizer_registry
-                    .get_by_name(model_id)
-                    .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+                    .get_by_name(&model_id)
+                    .or_else(|| ctx.components.tokenizer_registry.get_by_id(&model_id));
 
                 let (tokenizer_id, tokenizer_source) = match entry {
                     Some(e) => (e.id.clone(), e.source.clone()),
@@ -83,7 +94,7 @@ impl ChatPreparationStage {
                 };
 
                 let placeholder = multimodal::resolve_placeholder_token(
-                    model_id,
+                    &model_id,
                     &*tokenizer,
                     mm_components,
                     &tokenizer_id,
@@ -105,7 +116,12 @@ impl ChatPreparationStage {
 
                 (
                     placeholder,
-                    Some((mm_components, model_id, tokenizer_id, tokenizer_source)),
+                    Some((
+                        Arc::clone(mm_components),
+                        model_id,
+                        tokenizer_id,
+                        tokenizer_source,
+                    )),
                 )
             } else {
                 error!(
@@ -121,42 +137,57 @@ impl ChatPreparationStage {
             (None, None)
         };
 
-        // Step 2: Process messages and apply chat template
-        let processed_messages = match utils::process_chat_messages(
-            &body_ref,
-            &*tokenizer,
-            image_placeholder.as_deref(),
-        ) {
-            Ok(msgs) => msgs,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                return Err(error::bad_request("process_messages_failed", e));
-            }
-        };
+        // Step 2: Attempt TITO incremental tokenization, do full tokenization if TITO fails
+        // TITO will ignore `original_text` field and only build `token_ids` field.
+        let tito_token_ids: Option<Vec<u32>> = self.try_tito(ctx, body_ref.as_ref(), &tokenizer)?;
 
-        // Step 3: Tokenize the processed text (no special tokens - chat template already handles them)
-        let encoding = match tokenizer.encode(&processed_messages.text, false) {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(
-                    "tokenization_failed",
-                    format!("Tokenization failed: {e}"),
-                ));
-            }
-        };
+        let (mut token_ids, processed_messages) = if let Some(ids) = tito_token_ids {
+            (
+                ids,
+                ProcessedMessages {
+                    text: String::new(),
+                    multimodal_intermediate: None,
+                    stop_sequences: body_ref.stop.clone(),
+                },
+            )
+        } else {
+            // Process messages and apply chat template
+            let processed_messages = match utils::process_chat_messages(
+                &body_ref,
+                &*tokenizer,
+                image_placeholder.as_deref(),
+            ) {
+                Ok(msgs) => msgs,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    return Err(error::bad_request("process_messages_failed", e));
+                }
+            };
 
-        let mut token_ids = encoding.token_ids().to_vec();
+            // Tokenize the processed text (no special tokens - chat template already handles them)
+            let encoding = match tokenizer.encode(&processed_messages.text, false) {
+                Ok(encoding) => encoding,
+                Err(e) => {
+                    error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
+                    return Err(error::internal_error(
+                        "tokenization_failed",
+                        format!("Tokenization failed: {e}"),
+                    ));
+                }
+            };
+
+            (encoding.token_ids().to_vec(), processed_messages)
+        };
 
         // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
         if let Some((mm_components, model_id, tokenizer_id, tokenizer_source)) = mm_context {
             match multimodal::process_multimodal(
                 &request.messages,
-                model_id,
+                &model_id,
                 &*tokenizer,
                 token_ids,
-                mm_components,
+                &mm_components,
                 &tokenizer_id,
                 &tokenizer_source,
             )
@@ -253,5 +284,138 @@ impl ChatPreparationStage {
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
         Ok(())
+    }
+
+    /// Attempt a TITO prefix lookup and incremental merge
+    #[expect(
+        clippy::result_large_err,
+        reason = "pipeline stages consistently return Axum Response errors"
+    )]
+    fn try_tito(
+        &self,
+        ctx: &mut RequestContext,
+        request: &ChatCompletionRequest,
+        tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
+    ) -> Result<Option<Vec<u32>>, Response> {
+        let store = match self.tito_store.as_ref() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Only Chat requests participate in TITO (already gated by caller, but be explicit)
+        if !matches!(ctx.input.request_type, RequestType::Chat(_)) {
+            return Ok(None);
+        }
+
+        // Read session-id header
+        let session_id = match ctx
+            .input
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(TITO_SESSION_HEADER))
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(id) => id.to_owned(),
+            None => return Ok(None),
+        };
+
+        // Read trajectory-id header (default 0 when absent or unparseable)
+        let trajectory_id: u64 = ctx
+            .input
+            .headers
+            .as_ref()
+            .and_then(|h| h.get(TITO_TRAJECTORY_ID_HEADER))
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        let request_arc = Arc::new(request.clone());
+        let messages = request.messages.as_slice();
+        let render_context = utils::get_render_context_from_request(request).map_err(|e| {
+            error!(function = "ChatPreparationStage::try_tito", error = %e, "Failed to build TITO render context");
+            error::bad_request("tito_render_context_failed", e)
+        })?;
+
+        ctx.state.tito_context = Some(TitoRequestContext {
+            session_id: session_id.clone(),
+            request: request_arc,
+            render_context: render_context.clone(),
+            is_tito_hit: false,
+            matched_message_num: 0,
+            trajectory_id,
+        });
+
+        // Attempt prefix lookup
+        let prefix_match = match store.find_prefix(&session_id, messages, &render_context) {
+            Ok(Some(pm)) => {
+                warn!(
+                    session_id = %session_id,
+                    matched_messages = pm.matched_message_num,
+                    prefix_token_len = pm.pretokenized_ids.len(),
+                    total_messages = messages.len(),
+                    "TITO HIT — found cached prefix"
+                );
+                pm
+            }
+            Ok(None) => {
+                warn!(
+                    session_id = %session_id,
+                    total_messages = messages.len(),
+                    "TITO MISS — no cached prefix found, falling through to full retokenize"
+                );
+                return Ok(None);
+            }
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
+                return Err(error::bad_request(
+                    "tito_invalid_appended_messages",
+                    e.to_string(),
+                ));
+            }
+        };
+
+        let matched_message_num = prefix_match.matched_message_num;
+        let prefix_token_len = prefix_match.pretokenized_ids.len();
+        if matched_message_num == 0 || prefix_token_len == 0 {
+            debug!(
+                session_id = %session_id,
+                matched_message_num = matched_message_num,
+                prefix_token_len = prefix_token_len,
+                "TITO pseudo-hit without reusable prefix tokens — falling through to full retokenize"
+            );
+            return Ok(None);
+        }
+
+        debug!(
+            session_id = %session_id,
+            matched_message_num = matched_message_num,
+            prefix_token_len = prefix_token_len,
+            "TITO hit — running merge_incremental"
+        );
+
+        // Select adapter using model_id
+        let model_id = ctx.input.model_id.as_str();
+        let adapter = model_adapter::select_adapter(model_id);
+
+        let appended = &messages[matched_message_num..];
+        let merged_ids = match TitoEngine::merge_incremental(
+            prefix_match,
+            appended,
+            &**tokenizer,
+            &*adapter,
+            &render_context,
+        ) {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "TITO merge_incremental failed — falling through");
+                return Ok(None);
+            }
+        };
+
+        if let Some(ref mut tc) = ctx.state.tito_context {
+            tc.is_tito_hit = true;
+            tc.matched_message_num = matched_message_num;
+        }
+        Ok(Some(merged_ids))
     }
 }

@@ -132,6 +132,9 @@ pub(crate) struct ProcessingState {
 
     /// Accumulated partial-rollout state across loopback iterations.
     pub partial_rollout_state: Option<PartialRolloutState>,
+
+    /// TITO context (set once in preparation, reused in response processing)
+    pub tito_context: Option<TitoRequestContext>,
 }
 
 /// Output from preparation stage (Step 1)
@@ -263,6 +266,21 @@ impl LoadGuards {
             },
         }
     }
+}
+
+/// Context set by ChatPreparationStage when the X-SMG-Tito-Session-Id header is present.
+/// Consumed by ChatResponseProcessingStage to store generation results.
+pub(crate) struct TitoRequestContext {
+    pub session_id: String,
+    pub request: Arc<ChatCompletionRequest>,
+    pub render_context: smg_tito::RenderContext,
+    pub is_tito_hit: bool,
+    /// Number of messages matched by TITO prefix (if is_tito_hit is true).
+    /// Used for rollback detection: if new request matches fewer messages, we truncate turn_records.
+    pub matched_message_num: usize,
+    /// Trajectory identifier from `x-smg-tito-trajectory-id` header (defaults to 0).
+    /// Within a session each unique trajectory ID tracks a separate leaf node.
+    pub trajectory_id: u64,
 }
 
 /// Response processing state (Step 6)

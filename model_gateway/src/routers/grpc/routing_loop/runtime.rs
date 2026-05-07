@@ -550,7 +550,6 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, entry: RoutingQueueEnt
     } else {
         dispatch_entry_with_partial_rollout(runtime, entry, request_id, prompt_id).await;
     }
-
 }
 
 /// Extract a `Response` from `ctx.state.response.final_response`

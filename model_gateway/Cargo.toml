@@ -79,6 +79,7 @@ smg-grpc-client.workspace = true
 smg-skills.workspace = true
 smg-blob-storage.workspace = true
 psrl-state.workspace = true
+smg-tito.workspace = true
 
 # External dependencies (not in workspace)
 bincode = "1.3"
@@ -148,6 +149,7 @@ wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.244"
 zip = "8.1"
+smg-tito = { workspace = true, features = ["test-utils"] }
 
 [[bench]]
 name = "wasm_middleware_latency"

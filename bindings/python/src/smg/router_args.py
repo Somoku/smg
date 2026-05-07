@@ -95,6 +95,10 @@ class RouterArgs:
     routing_loop_receive_batch_size: int = 1024
     routing_loop_dispatch_batch_size: int = 1024
     routing_loop_max_running_dispatch_tasks: int = 4096
+    # TITO configuration
+    enable_tito: bool = False
+    tito_debug: bool = False
+    tito_gc_threshold: int | None = None
     # CORS allowed origins
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
     # Retry configuration
@@ -222,6 +226,9 @@ class RouterArgs:
         )
         routing_loop_group = parser.add_argument_group(
             "Routing Loop", "Priority request routing loop configuration"
+        )
+        tito_group = parser.add_argument_group(
+            "TITO", "Token-In-Token-Out session management"
         )
         retry_group = parser.add_argument_group(
             "Retry Configuration", "Automatic retry behavior for failed requests"
@@ -777,6 +784,26 @@ class RouterArgs:
             type=int,
             default=RouterArgs.routing_loop_max_running_dispatch_tasks,
             help="Maximum in-flight dispatch tasks created by the routing loop",
+        )
+
+        # TITO configuration
+        tito_group.add_argument(
+            f"--{prefix}enable-tito",
+            action="store_true",
+            default=RouterArgs.enable_tito,
+            help="Enable TITO (Token-In-Token-Out) session management for multi-turn agentic requests",
+        )
+        tito_group.add_argument(
+            f"--{prefix}tito-debug",
+            action="store_true",
+            default=RouterArgs.tito_debug,
+            help="Enable TITO mismatch validation (debug/development only; adds CPU overhead)",
+        )
+        tito_group.add_argument(
+            f"--{prefix}tito-gc-threshold",
+            type=int,
+            default=RouterArgs.tito_gc_threshold,
+            help="Threshold for TITO session garbage collection (default: 1000)",
         )
 
         # Retry configuration

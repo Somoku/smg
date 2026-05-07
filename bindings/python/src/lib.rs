@@ -489,6 +489,10 @@ struct Router {
     psrl_enable_mig_strategy: bool,
     psrl_candidate_sort_key: String,
     psrl_enable_group_sticky: bool,
+    // TITO
+    enable_tito: bool,
+    tito_debug: bool,
+    tito_gc_threshold: Option<usize>,
 }
 
 impl Router {
@@ -955,6 +959,9 @@ impl Router {
         psrl_enable_mig_strategy = false,
         psrl_candidate_sort_key = String::from("version"),
         psrl_enable_group_sticky = false,
+        enable_tito = false,
+        tito_debug = false,
+        tito_gc_threshold = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1085,6 +1092,9 @@ impl Router {
         psrl_enable_mig_strategy: bool,
         psrl_candidate_sort_key: String,
         psrl_enable_group_sticky: bool,
+        enable_tito: bool,
+        tito_debug: bool,
+        tito_gc_threshold: Option<usize>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1228,6 +1238,9 @@ impl Router {
             psrl_enable_mig_strategy,
             psrl_candidate_sort_key,
             psrl_enable_group_sticky,
+            enable_tito,
+            tito_debug,
+            tito_gc_threshold,
         })
     }
 
@@ -1350,6 +1363,9 @@ impl Router {
                 } else {
                     None
                 },
+                enable_tito: self.enable_tito,
+                tito_debug: self.tito_debug,
+                tito_gc_threshold: self.tito_gc_threshold,
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
             }))

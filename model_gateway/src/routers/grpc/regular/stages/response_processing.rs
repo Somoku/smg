@@ -29,11 +29,13 @@ impl ChatGenerateResponseProcessingStage {
     pub fn new(
         processor: processor::ResponseProcessor,
         streaming_processor: Arc<streaming::StreamingProcessor>,
+        tito_store: Option<Arc<smg_tito::TitoStore>>,
     ) -> Self {
         Self {
             chat_stage: ChatResponseProcessingStage::new(
                 processor.clone(),
                 streaming_processor.clone(),
+                tito_store,
             ),
             generate_stage: GenerateResponseProcessingStage::new(processor, streaming_processor),
         }

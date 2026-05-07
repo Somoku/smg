@@ -714,6 +714,15 @@ struct CliArgs {
     #[arg(long, num_args = 0..)]
     mesh_peer_urls: Vec<String>,
 
+    #[arg(long, default_value_t = false, help_heading = "TITO")]
+    enable_tito: bool,
+
+    #[arg(long, default_value_t = false, help_heading = "TITO")]
+    tito_debug: bool,
+
+    #[arg(long, help_heading = "TITO")]
+    tito_gc_threshold: Option<usize>,
+
     // ==================== WebRTC ====================
     /// Bind address for WebRTC UDP sockets (client-facing ICE candidate IP).
     /// Default: 0.0.0.0 (auto-detect via routing table).
@@ -1421,6 +1430,9 @@ impl CliArgs {
             mesh_server_config,
             webrtc_bind_addr: self.webrtc_bind_addr,
             webrtc_stun_server: self.webrtc_stun_server.clone(),
+            enable_tito: self.enable_tito,
+            tito_debug: self.tito_debug,
+            tito_gc_threshold: self.tito_gc_threshold,
         })
     }
 }

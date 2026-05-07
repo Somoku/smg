@@ -214,20 +214,19 @@ impl ResponseProcessor {
         })
     }
 
-    /// Process non-streaming chat response (collects all responses and builds final response)
-    pub async fn process_non_streaming_chat_response(
+    /// Build a `ChatCompletionResponse` from pre-collected backend completes.
+    ///
+    /// Callers are responsible for draining the stream once via
+    /// `response_collection::collect_responses`
+    pub async fn process_chat_choices_from_completes(
         &self,
-        execution_result: ExecutionResult,
+        all_responses: &[ProtoGenerateComplete],
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-        request_logprobs: bool,
+        _request_logprobs: bool,
     ) -> Result<ChatCompletionResponse, axum::response::Response> {
-        // Collect all responses from the execution result
-        let all_responses =
-            response_collection::collect_responses(execution_result, request_logprobs).await?;
-
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
 
         // Check parser availability once upfront (not per choice)
@@ -293,7 +292,7 @@ impl ResponseProcessor {
         }
 
         // Build usage
-        let usage = response_formatting::build_usage(&all_responses);
+        let usage = response_formatting::build_usage(all_responses);
 
         // Build final ChatCompletionResponse
         Ok(

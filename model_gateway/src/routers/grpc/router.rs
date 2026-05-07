@@ -109,6 +109,7 @@ impl GrpcRouter {
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
+            ctx.tito_store.clone(),
         )
         .with_routing_loop(ctx.routing_loop_runtime.clone());
 

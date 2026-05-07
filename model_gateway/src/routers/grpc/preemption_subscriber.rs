@@ -12,11 +12,11 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use smg_grpc_client::VllmEngineClient;
 use tokio::{sync::Mutex, task::JoinHandle};
 use tracing::{debug, info, warn};
 
-use crate::core::worker_registry::WorkerId;
-use smg_grpc_client::VllmEngineClient;
+use crate::worker::registry::WorkerId;
 
 /// Tracks per-instance preemption subscriber tasks, handling dynamic
 /// worker registration and removal.
@@ -41,10 +41,7 @@ impl PreemptionMonitor {
         if handles.contains_key(&worker_id) {
             return; // already has a subscriber
         }
-        info!(
-            "PreemptionMonitor: starting subscriber for {:?}",
-            worker_id
-        );
+        info!("PreemptionMonitor: starting subscriber for {:?}", worker_id);
         #[expect(
             clippy::disallowed_methods,
             reason = "preemption subscriber runs for the lifetime of the worker"
@@ -58,10 +55,7 @@ impl PreemptionMonitor {
         let mut handles = self.handles.lock().await;
         if let Some(handle) = handles.remove(worker_id) {
             handle.abort();
-            info!(
-                "PreemptionMonitor: stopped subscriber for {:?}",
-                worker_id
-            );
+            info!("PreemptionMonitor: stopped subscriber for {:?}", worker_id);
         }
     }
 }
@@ -89,20 +83,21 @@ const EVENT_TTL: Duration = Duration::from_secs(30);
 ///
 /// This function runs indefinitely; cancel the spawned task to stop it.
 pub async fn subscribe_preemptions(instance_id: WorkerId, client: VllmEngineClient) {
-    info!("Starting preemption subscriber for instance {:?}", instance_id);
+    info!(
+        "Starting preemption subscriber for instance {:?}",
+        instance_id
+    );
     loop {
         match client.subscribe_preemption_events().await {
             Ok(mut stream) => {
-                info!(
-                    "Preemption stream connected for instance {:?}",
-                    instance_id
-                );
+                info!("Preemption stream connected for instance {:?}", instance_id);
                 loop {
                     match stream.message().await {
                         Ok(Some(event)) => {
                             // TTL filter: skip events that accumulated in the Python
                             // queue during a reconnect window — they are likely stale.
-                            let age_ns = current_time_ns().saturating_sub(event.timestamp_ns as u128);
+                            let age_ns =
+                                current_time_ns().saturating_sub(event.timestamp_ns as u128);
                             if age_ns > EVENT_TTL.as_nanos() {
                                 warn!(
                                     "Dropping stale preemption event ({} req(s), age {:.1}s) from {:?}",

@@ -3,8 +3,11 @@
 //! Dispatches to ChatPreparationStage or GeneratePreparationStage based on
 //! request type. Only used by new_regular() and new_pd() pipelines.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use axum::response::Response;
+use smg_tito::TitoStore;
 use tracing::error;
 
 use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
@@ -23,9 +26,9 @@ pub(crate) struct ChatGeneratePreparationStage {
 }
 
 impl ChatGeneratePreparationStage {
-    pub fn new() -> Self {
+    pub fn new(tito_store: Option<Arc<TitoStore>>) -> Self {
         Self {
-            chat_stage: ChatPreparationStage,
+            chat_stage: ChatPreparationStage::new(tito_store),
             generate_stage: GeneratePreparationStage,
         }
     }
@@ -33,7 +36,7 @@ impl ChatGeneratePreparationStage {
 
 impl Default for ChatGeneratePreparationStage {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 

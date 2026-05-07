@@ -926,6 +926,102 @@ async fn v1_skills_delete_version(
     skills::delete_skill_version(State(state), Path((skill_id, version)), query).await
 }
 
+/// POST /tito/sessions — create a new TITO session and return its ID.
+async fn tito_create_session(State(state): State<Arc<AppState>>) -> Response {
+    let store = match state.context.tito_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "TITO is not enabled on this server"
+                })),
+            )
+                .into_response();
+        }
+    };
+    let session_id = uuid::Uuid::now_v7().to_string();
+    store.create_session(&session_id);
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "session_id": session_id })),
+    )
+        .into_response()
+}
+
+/// DELETE /tito/sessions/{session_id} — delete a TITO session (idempotent).
+async fn tito_delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> StatusCode {
+    if let Some(store) = state.context.tito_store.as_ref() {
+        store.delete_session(&session_id);
+    }
+    StatusCode::NO_CONTENT
+}
+
+/// GET /tito/sessions/{session_id} — retrieve session training data.
+async fn tito_get_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Response {
+    let store = match state.context.tito_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "TITO is not enabled on this server"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Check session exists (it was created via POST /v1/tito/sessions)
+    if !store.session_exists(&session_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "session not found"})),
+        )
+            .into_response();
+    }
+
+    // Get all trajectories from session store
+    let trajectories = store.get_all_trajectories(&session_id);
+    let max_trim_tokens = store.get_session_max_trim_tokens(&session_id);
+
+    let mut resp = serde_json::json!({
+        "session_id": session_id,
+        "max_trim_tokens": max_trim_tokens,
+    });
+
+    if trajectories.len() == 1 {
+        // Single trajectory: backward-compatible flat format with trajectory_id added
+        if let Some(traj) = trajectories.into_iter().next() {
+            resp["trajectory_id"] = serde_json::json!(traj.trajectory_id);
+            resp["accumulated_token_ids"] = serde_json::json!(traj.accumulated_token_ids);
+            resp["records"] = serde_json::json!(traj.turn_records);
+        }
+    } else {
+        // Multi-trajectory: list of {trajectory_id, accumulated_token_ids, records},
+        // sorted ascending by trajectory_id (get_all_trajectories already guarantees this).
+        let traj_list: Vec<_> = trajectories
+            .into_iter()
+            .map(|traj| {
+                serde_json::json!({
+                    "trajectory_id": traj.trajectory_id,
+                    "accumulated_token_ids": traj.accumulated_token_ids,
+                    "records": traj.turn_records,
+                })
+            })
+            .collect();
+        resp["trajectories"] = serde_json::json!(traj_list);
+    }
+
+    Json(resp).into_response()
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -942,6 +1038,14 @@ pub struct ServerConfig {
     /// Control plane authentication configuration
     pub control_plane_auth: Option<smg_auth::ControlPlaneAuthConfig>,
     pub mesh_server_config: Option<MeshServerConfig>,
+    /// Enable TITO session management
+    pub enable_tito: bool,
+    /// Enable TITO mismatch validation (debug/development only; adds CPU overhead)
+    pub tito_debug: bool,
+    /// Minimum number of entries in a TITO session before GC is triggered.
+    ///
+    /// `None` (the default) means "always GC".
+    pub tito_gc_threshold: Option<usize>,
     /// Bind address for WebRTC UDP sockets.
     /// `None` means use the default (0.0.0.0, auto-detect candidate IP).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1206,6 +1310,14 @@ pub fn build_app(
             middleware::auth_middleware,
         ));
 
+    // TITO routes
+    let tito_routes = Router::new()
+        .route("/tito/sessions", post(tito_create_session))
+        .route(
+            "/tito/sessions/{session_id}",
+            get(tito_get_session).delete(tito_delete_session),
+        );
+
     Ok(Router::new()
         .merge(protected_routes)
         .merge(realtime_routes)
@@ -1214,6 +1326,7 @@ pub fn build_app(
         .merge(admin_routes)
         .merge(worker_routes)
         .merge(mesh_routes)
+        .merge(tito_routes)
         .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(
             max_payload_size,
@@ -1365,6 +1478,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 .routing_loop
                 .max_running_dispatch_tasks
         );
+    }
+
+    if config.enable_tito {
+        let tito_store = Arc::new(smg_tito::TitoStore::new());
+        tito_store.set_debug(config.tito_debug);
+        if let Some(threshold) = config.tito_gc_threshold {
+            tito_store.set_default_gc_threshold(threshold);
+        }
+        if let Some(ctx_mut) = Arc::get_mut(&mut app_context) {
+            ctx_mut.tito_store = Some(tito_store);
+            info!(
+                "TITO session store initialized (debug={}, gc_threshold={:?})",
+                config.tito_debug, config.tito_gc_threshold
+            );
+        } else {
+            error!("Failed to set tito_store: Arc::get_mut failed");
+            return Err("Failed to initialize TITO store".into());
+        }
     }
 
     if config.prometheus_config.is_some() {

@@ -212,10 +212,7 @@ impl VllmEngineClient {
     }
 
     /// Abort one or more requests in a single RPC.
-    pub async fn abort_request(
-        &self,
-        request_ids: Vec<String>,
-    ) -> Result<(), tonic::Status> {
+    pub async fn abort_request(&self, request_ids: Vec<String>) -> Result<(), tonic::Status> {
         if request_ids.is_empty() {
             return Ok(());
         }

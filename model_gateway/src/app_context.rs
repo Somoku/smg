@@ -25,8 +25,8 @@ use crate::{
     routers::{
         grpc::{
             multimodal::MultimodalConfigRegistry,
-            routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
             preemption_subscriber::PreemptionMonitor,
+            routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
         },
         openai::realtime::RealtimeRegistry,
         router_manager::RouterManager,
@@ -86,6 +86,7 @@ pub struct AppContext {
     pub kv_event_monitor: Option<Arc<KvEventMonitor>>,
     pub routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
     pub instance_to_version_after_sync: InstanceVersionMap,
+    pub tito_store: Option<Arc<smg_tito::TitoStore>>,
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -125,6 +126,7 @@ pub struct AppContextBuilder {
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
+    tito_store: Option<Arc<smg_tito::TitoStore>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
 }
@@ -182,6 +184,7 @@ impl AppContextBuilder {
             wasm_manager: None,
             kv_event_monitor: None,
             routing_loop_runtime: None,
+            tito_store: None,
             webrtc_bind_addr: None,
             webrtc_stun_server: None,
         }
@@ -278,7 +281,10 @@ impl AppContextBuilder {
         self
     }
 
-    pub fn preemption_monitor(mut self, preemption_monitor: Option<Arc<PreemptionMonitor>>) -> Self {
+    pub fn preemption_monitor(
+        mut self,
+        preemption_monitor: Option<Arc<PreemptionMonitor>>,
+    ) -> Self {
         self.preemption_monitor = preemption_monitor;
         self
     }
@@ -313,6 +319,11 @@ impl AppContextBuilder {
 
     pub fn routing_loop_runtime(mut self, runtime: Option<Arc<RoutingLoopRuntime>>) -> Self {
         self.routing_loop_runtime = runtime;
+        self
+    }
+
+    pub fn tito_store(mut self, tito_store: Option<Arc<smg_tito::TitoStore>>) -> Self {
+        self.tito_store = tito_store;
         self
     }
 
@@ -434,6 +445,7 @@ impl AppContextBuilder {
             inflight_tracker: InFlightRequestTracker::new(),
             kv_event_monitor: self.kv_event_monitor,
             routing_loop_runtime: self.routing_loop_runtime,
+            tito_store: self.tito_store,
             instance_to_version_after_sync,
             realtime_registry: Arc::new(RealtimeRegistry::new()),
             webrtc_bind_addr: self.webrtc_bind_addr,
@@ -658,7 +670,7 @@ impl AppContextBuilder {
     }
 
     fn with_preemption_monitor(mut self, config: &RouterConfig) -> Self {
-        if config.enable_routing_loop {
+        if config.routing_loop.enabled {
             self.preemption_monitor = Some(Arc::new(PreemptionMonitor::new()));
         }
         self

@@ -1,5 +1,5 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/skills", "crates/blob_storage", "crates/psrl_state", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "tui"]
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/skills", "crates/blob_storage", "crates/psrl_state", "crates/tito", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "tui"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -21,6 +21,7 @@ smg-skills = { version = "0.1.0", path = "crates/skills" }
 smg-blob-storage = { version = "0.1.0", path = "crates/blob_storage" }
 smg-tui = { version = "0.1.0", path = "tui" }
 psrl-state = { version = "0.1.0", path = "crates/psrl_state" }
+smg-tito = { version = "0.1.0", path = "crates/tito" }
 
 # Shared dependencies
 anyhow = "1.0"

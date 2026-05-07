@@ -16,6 +16,7 @@ use openai_protocol::{
     generate::GenerateFinishReason,
 };
 use serde_json::{json, Value};
+use smg_tito::RenderContext;
 use tokio::sync::mpsc;
 use tracing::error;
 use uuid::Uuid;
@@ -262,6 +263,46 @@ pub(crate) fn filter_chat_request_by_tool_choice(
     std::borrow::Cow::Borrowed(body)
 }
 
+pub(crate) fn get_render_context_from_request(
+    request: &ChatCompletionRequest,
+) -> Result<RenderContext, String> {
+    let tools_json: Option<Vec<Value>> = request
+        .tools
+        .as_ref()
+        .map(|tools| {
+            tools
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()
+        .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+
+    let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
+    let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
+
+    if let Some(reasoning_effort) = &request.reasoning_effort {
+        combined_template_kwargs.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.clone()),
+        );
+    }
+
+    if let Some(template_kwargs) = &request.chat_template_kwargs {
+        for (key, value) in template_kwargs {
+            combined_template_kwargs.insert(key.clone(), value.clone());
+        }
+    }
+
+    let template_kwargs = if combined_template_kwargs.is_empty() {
+        None
+    } else {
+        Some(combined_template_kwargs)
+    };
+
+    Ok(RenderContext::new(tools_json, template_kwargs))
+}
+
 /// Process chat messages and apply template (shared by both routers)
 /// Requires HuggingFace tokenizer with chat template support
 pub fn process_chat_messages(
@@ -279,46 +320,12 @@ pub fn process_chat_messages(
         process_tool_call_arguments(&mut transformed_messages)?;
 
         // Convert tools to JSON values for template processing
-        let tools_json: Option<Vec<Value>> = request
-            .tools
-            .as_ref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(serde_json::to_value)
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .transpose()
-            .map_err(|e| format!("Failed to serialize tools: {e}"))?;
-
-        let kwargs_capacity = 1 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
-        let mut combined_template_kwargs = HashMap::with_capacity(kwargs_capacity);
-
-        // Add reasoning_effort if present (like Python does)
-        if let Some(reasoning_effort) = &request.reasoning_effort {
-            combined_template_kwargs.insert(
-                "reasoning_effort".to_string(),
-                Value::String(reasoning_effort.clone()),
-            );
-        }
-
-        // Add any additional template kwargs from request
-        if let Some(template_kwargs) = &request.chat_template_kwargs {
-            for (key, value) in template_kwargs {
-                combined_template_kwargs.insert(key.clone(), value.clone());
-            }
-        }
-
-        let final_template_kwargs = if combined_template_kwargs.is_empty() {
-            None
-        } else {
-            Some(&combined_template_kwargs)
-        };
+        let render_context = get_render_context_from_request(request)?;
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,
-            tools: tools_json.as_deref(),
-            template_kwargs: final_template_kwargs,
+            tools: render_context.tools_ref(),
+            template_kwargs: render_context.template_kwargs_ref(),
             ..Default::default()
         };
 

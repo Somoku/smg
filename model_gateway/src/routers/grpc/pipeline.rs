@@ -491,6 +491,7 @@ impl RequestPipeline {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        tito_store: Option<Arc<smg_tito::TitoStore>>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
             tool_parser_factory.clone(),
@@ -508,7 +509,7 @@ impl RequestPipeline {
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(ChatGeneratePreparationStage::new()),
+            Box::new(ChatGeneratePreparationStage::new(tito_store.clone())),
             Box::new(WorkerSelectionStage::new_regular(strategy)),
             Box::new(ClientAcquisitionStage),
             Box::new(ChatGenerateRequestBuildingStage::new(false)), // No PD metadata
@@ -517,6 +518,7 @@ impl RequestPipeline {
             Box::new(ChatGenerateResponseProcessingStage::new(
                 processor,
                 streaming_processor,
+                tito_store,
             )),
         ];
 
@@ -590,6 +592,7 @@ impl RequestPipeline {
         reasoning_parser_factory: ReasoningParserFactory,
         configured_tool_parser: Option<String>,
         configured_reasoning_parser: Option<String>,
+        tito_store: Option<Arc<smg_tito::TitoStore>>,
     ) -> Self {
         let processor = processor::ResponseProcessor::new(
             tool_parser_factory.clone(),
@@ -607,7 +610,7 @@ impl RequestPipeline {
         ));
 
         let stages: Vec<Box<dyn PipelineStage>> = vec![
-            Box::new(ChatGeneratePreparationStage::new()),
+            Box::new(ChatGeneratePreparationStage::new(tito_store.clone())),
             Box::new(WorkerSelectionStage::new_pd(
                 Arc::clone(&worker_registry),
                 Arc::clone(&policy_registry),
@@ -619,6 +622,7 @@ impl RequestPipeline {
             Box::new(ChatGenerateResponseProcessingStage::new(
                 processor,
                 streaming_processor,
+                tito_store,
             )),
         ];
 
