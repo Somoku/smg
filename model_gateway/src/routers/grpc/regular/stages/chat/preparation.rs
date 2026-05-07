@@ -139,7 +139,8 @@ impl ChatPreparationStage {
 
         // Step 2: Attempt TITO incremental tokenization, do full tokenization if TITO fails
         // TITO will ignore `original_text` field and only build `token_ids` field.
-        let tito_token_ids: Option<Vec<u32>> = self.try_tito(ctx, body_ref.as_ref(), &tokenizer)?;
+        let tito_token_ids: Option<Vec<u32>> =
+            self.try_tito(ctx, body_ref.as_ref(), &tokenizer, image_placeholder.as_deref())?;
 
         let (mut token_ids, processed_messages) = if let Some(ids) = tito_token_ids {
             (
@@ -296,6 +297,7 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
         tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
+        image_placeholder: Option<&str>,
     ) -> Result<Option<Vec<u32>>, Response> {
         let store = match self.tito_store.as_ref() {
             Some(s) => s,
@@ -331,7 +333,7 @@ impl ChatPreparationStage {
 
         let request_arc = Arc::new(request.clone());
         let messages = request.messages.as_slice();
-        let render_context = utils::get_render_context_from_request(request).map_err(|e| {
+        let render_context = utils::get_render_context_from_request(request, image_placeholder).map_err(|e| {
             error!(function = "ChatPreparationStage::try_tito", error = %e, "Failed to build TITO render context");
             error::bad_request("tito_render_context_failed", e)
         })?;

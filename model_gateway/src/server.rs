@@ -1357,7 +1357,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         let tito_store = Arc::new(smg_tito::TitoStore::new());
         tito_store.set_debug(config.tito_debug);
         if let Some(threshold) = config.tito_gc_threshold {
-            tito_store.set_default_gc_threshold(threshold);
+            tito_store.set_gc_threshold(threshold);
         }
         if let Some(ctx_mut) = Arc::get_mut(&mut app_context) {
             ctx_mut.tito_store = Some(tito_store);

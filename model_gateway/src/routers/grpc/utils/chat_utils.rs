@@ -265,6 +265,7 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 
 pub(crate) fn get_render_context_from_request(
     request: &ChatCompletionRequest,
+    image_placeholder: Option<&str>,
 ) -> Result<RenderContext, String> {
     let tools_json: Option<Vec<Value>> = request
         .tools
@@ -300,7 +301,11 @@ pub(crate) fn get_render_context_from_request(
         Some(combined_template_kwargs)
     };
 
-    Ok(RenderContext::new(tools_json, template_kwargs))
+    Ok(RenderContext::with_image_placeholder(
+        tools_json,
+        template_kwargs,
+        image_placeholder.map(String::from),
+    ))
 }
 
 /// Process chat messages and apply template (shared by both routers)
@@ -320,7 +325,7 @@ pub fn process_chat_messages(
         process_tool_call_arguments(&mut transformed_messages)?;
 
         // Convert tools to JSON values for template processing
-        let render_context = get_render_context_from_request(request)?;
+        let render_context = get_render_context_from_request(request, image_placeholder)?;
 
         let params = ChatTemplateParams {
             add_generation_prompt: true,

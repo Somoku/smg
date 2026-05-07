@@ -11,6 +11,7 @@ pub type PrefixHash = [u8; 32];
 pub struct RenderContext {
     pub tools: Option<Vec<Value>>,
     pub template_kwargs: Option<HashMap<String, Value>>,
+    pub image_placeholder: Option<String>,
 }
 
 impl RenderContext {
@@ -18,6 +19,20 @@ impl RenderContext {
         Self {
             tools,
             template_kwargs,
+            image_placeholder: None,
+        }
+    }
+
+    /// Convenience constructor that also captures the image placeholder.
+    pub fn with_image_placeholder(
+        tools: Option<Vec<Value>>,
+        template_kwargs: Option<HashMap<String, Value>>,
+        image_placeholder: Option<String>,
+    ) -> Self {
+        Self {
+            tools,
+            template_kwargs,
+            image_placeholder,
         }
     }
 
@@ -27,6 +42,10 @@ impl RenderContext {
 
     pub fn template_kwargs_ref(&self) -> Option<&HashMap<String, Value>> {
         self.template_kwargs.as_ref()
+    }
+
+    pub fn image_placeholder_ref(&self) -> Option<&str> {
+        self.image_placeholder.as_deref()
     }
 }
 

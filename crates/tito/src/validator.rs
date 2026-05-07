@@ -76,6 +76,7 @@ impl TokenSeqValidator {
         let values = match messages_to_template_values(
             messages,
             self.tokenizer.chat_template_content_format(),
+            render_context.image_placeholder_ref(),
         ) {
             Ok(v) => v,
             Err(_) => return vec![],
@@ -347,6 +348,7 @@ fn describe_structure(segments: &[Segment], tokenizer: &dyn Tokenizer) -> String
 pub(crate) fn messages_to_template_values(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
+    image_placeholder: Option<&str>,
 ) -> Result<Vec<Value>, serde_json::Error> {
     let mut values = messages
         .iter()
@@ -354,7 +356,7 @@ pub(crate) fn messages_to_template_values(
             let mut value = serde_json::to_value(message)?;
             if let Some(obj) = value.as_object_mut() {
                 if let Some(content_value) = obj.get_mut("content") {
-                    transform_content_field(content_value, content_format);
+                    transform_content_field(content_value, content_format, image_placeholder);
                 }
             }
             Ok(value)
@@ -364,7 +366,11 @@ pub(crate) fn messages_to_template_values(
     Ok(values)
 }
 
-fn transform_content_field(content_value: &mut Value, content_format: ChatTemplateContentFormat) {
+fn transform_content_field(
+    content_value: &mut Value,
+    content_format: ChatTemplateContentFormat,
+    image_placeholder: Option<&str>,
+) {
     let Some(content_array) = content_value.as_array() else {
         return;
     };
@@ -374,12 +380,16 @@ fn transform_content_field(content_value: &mut Value, content_format: ChatTempla
             let text_parts: Vec<String> = content_array
                 .iter()
                 .filter_map(|part| {
-                    part.as_object()?
-                        .get("type")?
-                        .as_str()
-                        .filter(|&t| t == "text")
-                        .and_then(|_| part.as_object()?.get("text")?.as_str())
-                        .map(String::from)
+                    let obj = part.as_object()?;
+                    let type_str = obj.get("type")?.as_str()?;
+                    match type_str {
+                        "text" => obj.get("text")?.as_str().map(String::from),
+                        // Inject the model-specific placeholder (e.g. "<|image|>") when
+                        // available; otherwise silently drop the image part (pre-existing
+                        // behavior, only reached in non-multimodal or legacy contexts).
+                        "image_url" => image_placeholder.map(String::from),
+                        _ => None,
+                    }
                 })
                 .collect();
 
@@ -454,6 +464,7 @@ mod tests {
         let values = messages_to_template_values(
             &messages,
             llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            None,
         )
         .unwrap();
 
@@ -474,6 +485,7 @@ mod tests {
         let values = messages_to_template_values(
             &messages,
             llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            None,
         )
         .unwrap();
 
@@ -504,6 +516,7 @@ mod tests {
         let values = messages_to_template_values(
             &messages,
             llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            None,
         )
         .unwrap();
 
@@ -526,6 +539,7 @@ mod tests {
         let values = messages_to_template_values(
             &messages,
             llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            None,
         )
         .unwrap();
 
@@ -548,6 +562,7 @@ mod tests {
         let values = messages_to_template_values(
             &messages,
             llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            None,
         )
         .unwrap();
 
@@ -558,6 +573,52 @@ mod tests {
     // -----------------------------------------------------------------------
     // Tests for the new segment-based algorithm helpers
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn transform_content_injects_image_placeholder_string_format() {
+        use openai_protocol::{chat::ChatMessage, common::ContentPart};
+
+        let messages: Vec<ChatMessage> = vec![ChatMessage::User {
+            content: openai_protocol::chat::MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "describe this".to_string(),
+                },
+                ContentPart::ImageUrl {
+                    image_url: openai_protocol::common::ImageUrl {
+                        url: "http://example.com/img.png".to_string(),
+                        detail: None,
+                    },
+                },
+            ]),
+            name: None,
+        }];
+
+        // Without placeholder: image parts are silently dropped.
+        let values_no_placeholder = messages_to_template_values(
+            &messages,
+            llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            None,
+        )
+        .unwrap();
+        let content_no_ph = values_no_placeholder[0]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(content_no_ph, "describe this");
+
+        // With placeholder: image part is replaced by the placeholder token.
+        let values_with_placeholder = messages_to_template_values(
+            &messages,
+            llm_tokenizer::chat_template::ChatTemplateContentFormat::String,
+            Some("<|image|>"),
+        )
+        .unwrap();
+        let content_with_ph = values_with_placeholder[0]
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(content_with_ph, "describe this <|image|>");
+    }
 
     #[test]
     fn trim_trailing_removes_matching_tokens() {

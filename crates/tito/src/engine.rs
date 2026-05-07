@@ -138,7 +138,7 @@ fn tokenize_segment_incremental(
 
     let content_format = tokenizer.chat_template_content_format();
 
-    let base_values = messages_to_template_values(&base, content_format)
+    let base_values = messages_to_template_values(&base, content_format, None)
         .map_err(|e| TitoError::EngineFailed(format!("serialize base: {e}")))?;
     let base_params = ChatTemplateParams {
         add_generation_prompt: false,
@@ -152,7 +152,7 @@ fn tokenize_segment_incremental(
 
     let mut full_msgs = base;
     full_msgs.extend_from_slice(segment);
-    let full_values = messages_to_template_values(&full_msgs, content_format)
+    let full_values = messages_to_template_values(&full_msgs, content_format, render_context.image_placeholder_ref())
         .map_err(|e| TitoError::EngineFailed(format!("serialize full: {e}")))?;
     let full_params = ChatTemplateParams {
         add_generation_prompt,

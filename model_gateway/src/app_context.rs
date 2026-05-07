@@ -28,7 +28,7 @@ use crate::{
             preemption_subscriber::PreemptionMonitor,
             routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
         },
-        common::openai_bridge::FormatRegistry, grpc::multimodal::MultimodalConfigRegistry,
+        common::openai_bridge::FormatRegistry,
         openai::realtime::RealtimeRegistry, router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
