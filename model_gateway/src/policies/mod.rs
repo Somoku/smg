@@ -28,7 +28,7 @@ mod throughput_optimal;
 pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
-pub use cache_aware::CacheAwarePolicy;
+pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use completion_guard::PolicyCompletionGuard;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;

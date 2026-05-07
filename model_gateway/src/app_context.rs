@@ -28,8 +28,8 @@ use crate::{
             preemption_subscriber::PreemptionMonitor,
             routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
         },
-        openai::realtime::RealtimeRegistry,
-        router_manager::RouterManager,
+        common::openai_bridge::FormatRegistry, grpc::multimodal::MultimodalConfigRegistry,
+        openai::realtime::RealtimeRegistry, router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{KvEventMonitor, WorkerMonitor, WorkerRegistry, WorkerService},
@@ -79,6 +79,7 @@ pub struct AppContext {
     pub worker_job_queue: Arc<OnceLock<Arc<JobQueue>>>,
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
+    pub mcp_format_registry: FormatRegistry,
     pub skill_service: Option<Arc<SkillService>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
@@ -90,7 +91,7 @@ pub struct AppContext {
     pub realtime_registry: Arc<RealtimeRegistry>,
     /// Bind address for WebRTC UDP sockets (`None` = `0.0.0.0`, auto-detect).
     pub webrtc_bind_addr: Option<std::net::IpAddr>,
-    /// STUN server for ICE candidate gathering (`None` = `stun.l.google.com:19302`).
+    /// STUN server for ICE candidate gathering. Defaults to `stun.l.google.com:19302`; `"none"` to disable.
     pub webrtc_stun_server: Option<String>,
 }
 
@@ -122,6 +123,7 @@ pub struct AppContextBuilder {
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_orchestrator: Option<Arc<OnceLock<Arc<McpOrchestrator>>>>,
+    mcp_format_registry: Option<FormatRegistry>,
     skill_service: Option<Arc<SkillService>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
@@ -180,6 +182,7 @@ impl AppContextBuilder {
             worker_job_queue: None,
             workflow_engines: None,
             mcp_orchestrator: None,
+            mcp_format_registry: None,
             skill_service: None,
             wasm_manager: None,
             kv_event_monitor: None,
@@ -304,6 +307,11 @@ impl AppContextBuilder {
         mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
     ) -> Self {
         self.mcp_orchestrator = Some(mcp_orchestrator);
+        self
+    }
+
+    pub fn mcp_format_registry(mut self, registry: FormatRegistry) -> Self {
+        self.mcp_format_registry = Some(registry);
         self
     }
 
@@ -439,6 +447,7 @@ impl AppContextBuilder {
             mcp_orchestrator: self
                 .mcp_orchestrator
                 .ok_or(AppContextBuildError::MissingField("mcp_orchestrator"))?,
+            mcp_format_registry: self.mcp_format_registry.unwrap_or_default(),
             skill_service: self.skill_service,
             wasm_manager: self.wasm_manager,
             worker_service,
@@ -485,7 +494,9 @@ impl AppContextBuilder {
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
             .webrtc_bind_addr(webrtc_bind_addr)
-            .webrtc_stun_server(webrtc_stun_server)
+            .webrtc_stun_server(
+                webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
+            )
             .router_config(router_config))
     }
 
@@ -721,6 +732,7 @@ impl AppContextBuilder {
             .map_err(|_| "Failed to set MCP orchestrator in OnceLock".to_string())?;
 
         self.mcp_orchestrator = Some(mcp_orchestrator_lock);
+        self.mcp_format_registry = Some(FormatRegistry::new());
         Ok(self)
     }
 
