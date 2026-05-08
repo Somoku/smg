@@ -467,11 +467,11 @@ impl ConfigValidator {
                 }
             }
             PolicyConfig::RequestNumBalance | PolicyConfig::ThroughputOptimal { .. } => {}
-            PolicyConfig::ThroughputOptimalWithBudget { budget, .. } => {
-                if *budget == 0 {
+            PolicyConfig::ThroughputOptimalWithBudget { request_budget, .. } => {
+                if *request_budget == 0 {
                     return Err(ConfigError::InvalidValue {
-                        field: "budget".to_string(),
-                        value: budget.to_string(),
+                        field: "request_budget".to_string(),
+                        value: request_budget.to_string(),
                         reason: "Must be >= 1 (0 is treated as 1 at runtime, but explicit 0 in config is rejected to surface misconfiguration)".to_string(),
                     });
                 }

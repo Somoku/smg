@@ -41,7 +41,6 @@ class RouterArgs:
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
     bucket_adjust_interval_secs: int = 5
-    budget: int = 1  # Token-budget for throughput_optimal_with_budget policy (KV-cache page granularity)
     cost_model_path: str | None = None  # Path to cost model JSON for throughput_optimal / throughput_optimal_with_budget policy
     max_concurrent_seqs_per_instance: int = 100  # Max concurrent sequences per instance (throughput_optimal policy)
     delta_throughput_threshold: float = 0.5  # Throughput delta threshold for throughput_optimal policy
@@ -385,16 +384,6 @@ class RouterArgs:
             type=int,
             default=RouterArgs.bucket_adjust_interval_secs,
             help="Interval in seconds between bucket boundary adjustment operations",
-        )
-        routing_group.add_argument(
-            f"--{prefix}budget",
-            type=int,
-            default=RouterArgs.budget,
-            help=(
-                "Token-budget page granularity for throughput_optimal_with_budget policy."
-                " Response tokens are rounded up to the nearest multiple of budget before summing."
-                " Must be >= 1 (default: 1, which gives exact token counts)."
-            ),
         )
         routing_group.add_argument(
             f"--{prefix}cost-model-path",

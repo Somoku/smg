@@ -551,15 +551,15 @@ pub enum PolicyConfig {
     /// Throughput-optimal-with-budget policy.
     ///
     /// Like `throughput_optimal`, but each request's response tokens are
-    /// rounded up to the nearest multiple of `budget` before summing.  This
-    /// accounts for KV-cache page granularity.  `budget = 1` degrades to
+    /// rounded up to the nearest multiple of `request_budget` before summing.  This
+    /// accounts for KV-cache page granularity.  `request_budget = 1` degrades to
     /// exact token counts (same as `throughput_optimal`).
     #[serde(rename = "throughput_optimal_with_budget")]
     ThroughputOptimalWithBudget {
-        /// KV-cache page size in tokens.  Response tokens are rounded up to
-        /// the nearest multiple of this value (default: 1).
-        #[serde(default = "default_token_budget")]
-        budget: usize,
+        /// KV-cache page size in tokens.  Used by [`ThroughputOptimalWithBudgetPolicy`]
+        /// to round response tokens up to the nearest page boundary.
+        #[serde(default = "default_request_budget")]
+        request_budget: usize,
         /// Path to a JSON cost-model file (keyed by `"TP{n}_PP{m}"`).
         cost_model_path: String,
         /// Workers with this many or more queued requests are skipped.
@@ -574,10 +574,6 @@ pub enum PolicyConfig {
         /// Overridden per-worker by the `max_model_len` / `max_total_tokens` label.
         #[serde(default = "default_max_prompt_length")]
         max_prompt_length: usize,
-        /// KV-cache page size in tokens.  Used by [`ThroughputOptimalWithBudgetPolicy`]
-        /// to round response tokens up to the nearest page boundary.
-        #[serde(default = "default_request_budget")]
-        request_budget: usize,
         /// Workers are assumed to have at most this many waiting requests after
         /// preemption; used in the `max_model_len` fallback calculation.
         #[serde(default = "default_max_num_waiting_reqs_after_preemption")]
@@ -595,10 +591,6 @@ fn default_prefix_token_count() -> usize {
 
 fn default_load_factor() -> f64 {
     1.25
-}
-
-fn default_token_budget() -> usize {
-    1
 }
 
 fn default_max_concurrent_seqs_per_instance() -> usize {

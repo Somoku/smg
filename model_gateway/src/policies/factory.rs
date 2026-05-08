@@ -94,19 +94,18 @@ impl PolicyFactory {
                 Ok(Arc::new(policy))
             }
             PolicyConfig::ThroughputOptimalWithBudget {
-                budget,
+                request_budget,
                 cost_model_path,
                 max_concurrent_seqs_per_instance,
                 delta_throughput_threshold,
                 max_prompt_length,
-                request_budget: _request_budget,
                 max_num_waiting_reqs_after_preemption,
             } => {
-                // `budget` is the KV-cache page granularity used by the WithBudget
+                // `request_budget` is the KV-cache page granularity used by the WithBudget
                 // variant; it maps to `request_budget` in the shared config.
                 let policy =
                     ThroughputOptimalWithBudgetPolicy::with_config(ThroughputOptimalConfig {
-                        request_budget: *budget,
+                        request_budget: *request_budget,
                         cost_model_path: cost_model_path.clone(),
                         max_concurrent_seqs_per_instance: *max_concurrent_seqs_per_instance,
                         delta_throughput_threshold: *delta_throughput_threshold,
@@ -218,12 +217,11 @@ mod tests {
 
         let result =
             PolicyFactory::create_from_config(&PolicyConfig::ThroughputOptimalWithBudget {
-                budget: 16,
+                request_budget: 1024,
                 cost_model_path: "/nonexistent/cost_model.json".to_string(),
                 max_concurrent_seqs_per_instance: 100,
                 delta_throughput_threshold: 0.5,
                 max_prompt_length: 8192,
-                request_budget: 1024,
                 max_num_waiting_reqs_after_preemption: 1000,
             });
         assert!(result.is_err(), "should fail with invalid cost model path");
