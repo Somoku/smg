@@ -13,6 +13,7 @@ pub mod monitor;
 pub mod registry;
 pub mod resilience;
 pub mod routing_control;
+pub mod sampling_defaults;
 pub mod service;
 pub mod stats;
 pub mod weight_version;
@@ -47,6 +48,7 @@ pub use routing_control::{
     DpRankInput, WorkerRoutingControlRequest, WorkerRoutingControlResult,
     WorkerRoutingControlResultItem, WorkerRoutingControlTargetRequest,
 };
+pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
 pub use stats::{
     EngineSchedulerStats, EngineStats, EngineStatsUpdateOutcome, WorkerStatsUpdateRequest,
