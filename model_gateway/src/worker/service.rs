@@ -35,7 +35,7 @@ use crate::{
 pub enum WorkerServiceError {
     /// Worker with given ID was not found
     NotFound { worker_id: String },
-    /// Invalid worker ID format (expected UUID)
+    /// Invalid worker ID format.
     InvalidId { raw: String, message: String },
     /// Bad request (e.g., URL mismatch in PUT)
     BadRequest { message: String },
@@ -76,10 +76,7 @@ impl std::fmt::Display for WorkerServiceError {
         match self {
             Self::NotFound { worker_id } => write!(f, "Worker {worker_id} not found"),
             Self::InvalidId { raw, message } => {
-                write!(
-                    f,
-                    "Invalid worker_id '{raw}' (expected UUID). Error: {message}"
-                )
+                write!(f, "Invalid worker_id '{raw}'. Error: {message}")
             }
             Self::BadRequest { message } => write!(f, "{message}"),
             Self::Conflict { url, worker_id } => {
@@ -267,14 +264,15 @@ impl WorkerService {
         self
     }
 
-    /// Parse and validate a worker ID string
+    /// Parse and validate a worker ID string.
     pub fn parse_worker_id(raw: &str) -> Result<WorkerId, WorkerServiceError> {
-        uuid::Uuid::parse_str(raw)
-            .map(|_| WorkerId::from_string(raw.to_string()))
-            .map_err(|e| WorkerServiceError::InvalidId {
+        if raw.trim().is_empty() {
+            return Err(WorkerServiceError::InvalidId {
                 raw: raw.to_string(),
-                message: e.to_string(),
-            })
+                message: "worker_id cannot be empty".to_string(),
+            });
+        }
+        Ok(WorkerId::from_string(raw.to_string()))
     }
 
     /// Get the job queue, returning an error if not initialized
@@ -302,7 +300,26 @@ impl WorkerService {
         // Reserve (or retrieve) a stable ID for the 202 response.
         // If this URL already has an active worker, reject with 409.
         let worker_id = if let Some(ref manual_id) = config.id {
-            WorkerId::from_string(manual_id.clone())
+            let manual_worker_id = Self::parse_worker_id(manual_id)?;
+            if let Some(existing_url) = self.worker_registry.get_url_by_id(&manual_worker_id) {
+                if existing_url != worker_url {
+                    return Err(WorkerServiceError::Conflict {
+                        url: existing_url,
+                        worker_id: manual_worker_id,
+                    });
+                }
+            }
+
+            let reserved_id = self
+                .worker_registry
+                .reserve_id_for_url_as(&worker_url, manual_worker_id.clone());
+            if reserved_id != manual_worker_id {
+                return Err(WorkerServiceError::Conflict {
+                    url: worker_url,
+                    worker_id: reserved_id,
+                });
+            }
+            manual_worker_id
         } else {
             self.worker_registry.reserve_id_for_url(&worker_url)
         };

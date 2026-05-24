@@ -857,6 +857,22 @@ impl WorkerRegistry {
         self.url_to_id.entry(url.to_string()).or_default().clone()
     }
 
+    /// Reserve a caller-provided worker ID for a worker URL.
+    ///
+    /// If the URL is already reserved, returns the existing ID without
+    /// changing the mapping. Callers must treat a different returned ID as a
+    /// conflict. This mirrors [`Self::reserve_id_for_url`] so the later
+    /// workflow `register_or_replace()` observes the same URL → ID mapping.
+    pub fn reserve_id_for_url_as(&self, url: &str, worker_id: WorkerId) -> WorkerId {
+        match self.url_to_id.entry(url.to_string()) {
+            Entry::Occupied(entry) => entry.get().clone(),
+            Entry::Vacant(entry) => {
+                entry.insert(worker_id.clone());
+                worker_id
+            }
+        }
+    }
+
     /// Set (or clear) the mesh sync manager after initialisation.
     ///
     /// Thread-safe via an internal `RwLock`. The registry forwards worker
@@ -1436,6 +1452,38 @@ mod tests {
 
         registry.remove(&worker_id);
         assert!(registry.get(&worker_id).is_none());
+    }
+
+    #[test]
+    fn test_manual_id_reservation_registers_worker_under_manual_id() {
+        let registry = WorkerRegistry::new();
+        let manual_id = WorkerId::from_string("replica-0".to_string());
+        let worker_url = "http://manual-worker:8080";
+
+        let reserved_id = registry.reserve_id_for_url_as(worker_url, manual_id.clone());
+        assert_eq!(reserved_id.as_str(), "replica-0");
+
+        let worker = Arc::new(BasicWorkerBuilder::new(worker_url).build());
+        let registered_id = registry.register(worker).unwrap();
+
+        assert_eq!(registered_id.as_str(), "replica-0");
+        assert_eq!(
+            registry.get_url_by_id(&manual_id),
+            Some(worker_url.to_string())
+        );
+    }
+
+    #[test]
+    fn test_manual_id_reservation_keeps_existing_url_mapping() {
+        let registry = WorkerRegistry::new();
+        let worker_url = "http://manual-worker:8080";
+        let first_id = WorkerId::from_string("replica-0".to_string());
+        let second_id = WorkerId::from_string("replica-1".to_string());
+
+        registry.reserve_id_for_url_as(worker_url, first_id.clone());
+        let reserved_id = registry.reserve_id_for_url_as(worker_url, second_id);
+
+        assert_eq!(reserved_id, first_id);
     }
 
     #[test]

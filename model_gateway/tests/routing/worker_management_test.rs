@@ -16,7 +16,7 @@ use axum::{
 use chrono::{TimeZone, Utc};
 use openai_protocol::worker::HealthCheckConfig;
 use serde_json::json;
-use smg::worker::{BasicWorkerBuilder, Worker, WorkerType};
+use smg::worker::{registry::WorkerId, BasicWorkerBuilder, Worker, WorkerType};
 use tower::ServiceExt;
 
 use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
@@ -321,6 +321,46 @@ mod worker_management_tests {
         .await;
         assert_eq!(rejected["rejected"], 1);
         assert_eq!(dp_worker.engine_stats().running_queue_size(), 7);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_stats_resolves_manual_base_id_and_dp_rank() {
+        let config = TestRouterConfig::round_robin(3916);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+
+        let base_id = WorkerId::from_string("replica-0".to_string());
+        ctx.app_context
+            .worker_registry
+            .reserve_id_for_url_as("http://manual-worker:8080", base_id.clone());
+        let dp_worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://manual-worker:8080")
+                .dp_config(1, 2)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let dp_worker_id = ctx
+            .app_context
+            .worker_registry
+            .register(dp_worker.clone())
+            .unwrap();
+
+        let body = post_worker_stats(
+            app,
+            stats_update_payload(base_id.as_str(), Some(1), 1_700_000_000_000, 4, 6),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 1);
+        assert_eq!(body["results"][0]["worker_id"], dp_worker_id.as_str());
+        assert_eq!(dp_worker.engine_stats().running_queue_size(), 4);
+        assert_eq!(dp_worker.engine_stats().waiting_queue_size(), 6);
 
         ctx.shutdown().await;
     }
