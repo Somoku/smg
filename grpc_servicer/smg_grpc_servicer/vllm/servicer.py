@@ -21,8 +21,8 @@ from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
 from vllm.engine.protocol import EngineClient
-from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
-from vllm.inputs.engine import mm_input, tokens_input
+from vllm.multimodal.inputs import MultiModalInputs as VllmMultiModalInput
+from vllm.multimodal.inputs import mm_inputs, tokens_input
 from vllm.logger import init_logger
 from vllm.logprobs import PromptLogprobs, SampleLogprobs
 from vllm.multimodal.inputs import (
@@ -577,7 +577,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 )
             mm_placeholders["image"] = placeholders
 
-        return mm_input(
+        return mm_inputs(
             prompt_token_ids=prompt_token_ids,
             mm_kwargs=mm_kwargs,
             mm_hashes=mm_hashes,

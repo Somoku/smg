@@ -281,6 +281,10 @@ pub(crate) struct TitoRequestContext {
     /// Trajectory identifier from `x-smg-tito-trajectory-id` header (defaults to 0).
     /// Within a session each unique trajectory ID tracks a separate leaf node.
     pub trajectory_id: u64,
+    /// Prompt token IDs computed during preparation (set in ChatPreparationStage, read in
+    /// ChatResponseProcessingStage for TITO capture).
+    /// Consumed by `ChatRequestBuildingStage::execute()` before response processing runs.
+    pub prompt_token_ids: Vec<u32>,
 }
 
 /// Response processing state (Step 6)

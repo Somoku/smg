@@ -1096,12 +1096,15 @@ impl Worker for BasicWorker {
                     .grpc_client
                     .get_or_try_init(|| async {
                         let runtime_str = self.metadata.spec.runtime_type.to_string();
+                        // Use base_url() instead of spec.url for the actual connection.
+                        let connect_url = self.metadata.base_url();
                         tracing::info!(
-                            "Lazily initializing gRPC client ({}) for worker: {}",
+                            "Lazily initializing gRPC client ({}) for worker: {} (connect_url: {})",
                             runtime_str,
-                            self.metadata.spec.url
+                            self.metadata.spec.url,
+                            connect_url
                         );
-                        match GrpcClient::connect(&self.metadata.spec.url, &runtime_str).await {
+                        match GrpcClient::connect(connect_url, &runtime_str).await {
                             Ok(client) => {
                                 tracing::info!(
                                     "Successfully connected gRPC client ({}) for worker: {}",

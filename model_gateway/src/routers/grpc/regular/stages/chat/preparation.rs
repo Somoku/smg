@@ -8,7 +8,9 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
 };
-use smg_tito::{engine::TitoEngine, model_adapter, TitoStore, TITO_SESSION_HEADER, TITO_TRAJECTORY_ID_HEADER};
+use smg_tito::{
+    engine::TitoEngine, model_adapter, TitoStore, TITO_SESSION_HEADER, TITO_TRAJECTORY_ID_HEADER,
+};
 use tracing::{debug, error, warn};
 
 use crate::routers::{
@@ -139,8 +141,12 @@ impl ChatPreparationStage {
 
         // Step 2: Attempt TITO incremental tokenization, do full tokenization if TITO fails
         // TITO will ignore `original_text` field and only build `token_ids` field.
-        let tito_token_ids: Option<Vec<u32>> =
-            self.try_tito(ctx, body_ref.as_ref(), &tokenizer, image_placeholder.as_deref())?;
+        let tito_token_ids: Option<Vec<u32>> = self.try_tito(
+            ctx,
+            body_ref.as_ref(),
+            &tokenizer,
+            image_placeholder.as_deref(),
+        )?;
 
         let (mut token_ids, processed_messages) = if let Some(ids) = tito_token_ids {
             (
@@ -271,6 +277,12 @@ impl ChatPreparationStage {
         let mut processed_messages = processed_messages;
         processed_messages.multimodal_intermediate = multimodal_intermediate;
 
+        // Persist prompt token IDs into tito_context before PreparationOutput is consumed
+        // by request_building (which .take()s preparation).
+        if let Some(ref mut tc) = ctx.state.tito_context {
+            tc.prompt_token_ids = token_ids.clone();
+        }
+
         // Store results in context
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
@@ -345,6 +357,7 @@ impl ChatPreparationStage {
             is_tito_hit: false,
             matched_message_num: 0,
             trajectory_id,
+            prompt_token_ids: Vec::new(),
         });
 
         // Attempt prefix lookup

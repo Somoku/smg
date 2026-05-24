@@ -86,17 +86,7 @@ impl Ord for WorkerSelectionKey {
 /// Read the version tag used by PSRL selection.
 fn worker_version_tag(worker: &Arc<dyn Worker>) -> Option<i64> {
     let dyn_version = worker.dyn_weight_version();
-    if dyn_version > 0 {
-        return i64::try_from(dyn_version).ok();
-    }
-
-    worker
-        .metadata()
-        .spec
-        .labels
-        .get("version_tag")
-        .or_else(|| worker.metadata().spec.labels.get("weight_version"))
-        .and_then(|v| v.parse().ok())
+    i64::try_from(dyn_version).ok()
 }
 
 pub(crate) struct PsrlWorkerSelector {

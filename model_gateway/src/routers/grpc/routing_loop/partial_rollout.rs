@@ -90,6 +90,9 @@ pub(crate) async fn drain_stream_for_partial_rollout(
                 }
             }
             ProtoResponseVariant::Complete(complete) => {
+                if new_token_ids.is_empty() {
+                    new_token_ids = complete.output_ids().to_vec();
+                }
                 let finish_reason = complete.finish_reason().to_owned();
                 return Ok(DrainedStreamResult {
                     new_token_ids,

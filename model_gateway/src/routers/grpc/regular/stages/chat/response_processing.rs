@@ -240,12 +240,7 @@ impl ChatResponseProcessingStage {
         store.set_session_max_trim_tokens(&tito_ctx.session_id, max_trim);
 
         let output_ids = first_complete.output_ids();
-        let prompt_ids = ctx
-            .state
-            .preparation
-            .as_ref()
-            .map(|p| p.token_ids())
-            .unwrap_or_default();
+        let prompt_ids = &tito_ctx.prompt_token_ids;
         let mut full_ids = Vec::with_capacity(prompt_ids.len() + output_ids.len());
         full_ids.extend_from_slice(prompt_ids);
         full_ids.extend_from_slice(output_ids);
