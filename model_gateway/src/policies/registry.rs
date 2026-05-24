@@ -404,15 +404,19 @@ impl PolicyRegistry {
         power_of_two_policies
     }
 
-    /// Get all ThroughputOptimal policies (both variants) that need engine-stats
-    /// notifications and completion callbacks (lock-free).
+    /// Get all stateful policies that maintain per-worker optimistic local
+    /// state and need engine-stats notifications and completion callbacks.
     ///
     /// Returns a deduplicated list covering the default policy, PD prefill/decode
     /// policies, and per-model policies.  The caller can iterate over this to
     /// invoke [`LoadBalancingPolicy::on_engine_stats_updated`] after a fresh
     /// engine-stats snapshot is applied for a worker.
-    pub fn get_all_throughput_optimal_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        const NAMES: [&str; 2] = ["throughput_optimal", "throughput_optimal_with_budget"];
+    pub fn get_all_stateful_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
+        const NAMES: [&str; 3] = [
+            "throughput_optimal",
+            "throughput_optimal_with_budget",
+            "request_num_balance",
+        ];
 
         let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
 

@@ -8,18 +8,34 @@
 //! or KV-cache state, making it suitable for workloads where request latency
 //! does not vary dramatically with input/output length.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 use crate::worker::Worker;
 
-/// Selects the worker with the minimum number of running + waiting requests.
-#[derive(Debug, Default)]
-pub struct RequestNumBalancePolicy;
+/// Selects the worker with the minimum number of running + waiting requests,
+/// including an optimistic local delta for requests routed since the last
+/// engine-stats snapshot.
+#[derive(Debug)]
+pub struct RequestNumBalancePolicy {
+    /// Per-worker optimistic request-count delta, keyed by worker URL.
+    local_delta: Mutex<HashMap<String, i64>>,
+}
 
 impl RequestNumBalancePolicy {
     pub fn new() -> Self {
-        Self
+        Self {
+            local_delta: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Default for RequestNumBalancePolicy {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -34,9 +50,43 @@ impl LoadBalancingPolicy for RequestNumBalancePolicy {
             return None;
         }
 
-        healthy
-            .into_iter()
-            .min_by_key(|&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
+        // Hold the lock for both read and increment so that two concurrent
+        // callers cannot observe the same delta and pick the same worker.
+        // The critical section is a HashMap lookup + i64 increment — sub-μs.
+        let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
+
+        let idx = healthy.into_iter().min_by_key(|&idx| {
+            let engine_queue =
+                workers[idx].engine_stats().waiting_and_running_queue_size() as i64;
+            let pending = guard.get(workers[idx].url()).copied().unwrap_or(0).max(0);
+            engine_queue + pending
+        })?;
+
+        // Optimistic increment — the request hasn't reached the engine yet.
+        *guard
+            .entry(workers[idx].url().to_string())
+            .or_insert(0) += 1;
+
+        Some(idx)
+    }
+
+    fn on_request_complete_with_tokens(
+        &self,
+        worker_url: &str,
+        _token_delta: Option<i64>,
+        _success: bool,
+    ) {
+        let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = guard.get_mut(worker_url) {
+            *count = (*count - 1).max(0);
+        }
+    }
+
+    fn on_engine_stats_updated(&self, worker_url: &str) {
+        let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = guard.get_mut(worker_url) {
+            *count = 0;
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -218,5 +268,147 @@ mod tests {
         let workers: Vec<Arc<dyn Worker>> = vec![w0, w1];
         let selected = policy.select_worker(&workers, &SelectWorkerInfo::default());
         assert_eq!(selected, Some(1));
+    }
+
+    // -- Optimistic local delta tests ------------------------------------------
+
+    #[test]
+    fn optimistic_counter_distributes_across_idle_workers() {
+        // Three idle workers with zero engine stats.  Without the optimistic
+        // counter all three calls would return index 0 (the min_by_key tie-break).
+        // With the counter, each successive call picks the next worker.
+        let policy = RequestNumBalancePolicy::new();
+        let w0 = build_worker("http://w0:8000");
+        let w1 = build_worker("http://w1:8000");
+        let w2 = build_worker("http://w2:8000");
+
+        set_queue(&w0, 0, 0);
+        set_queue(&w1, 0, 0);
+        set_queue(&w2, 0, 0);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![w0, w1, w2];
+        let info = SelectWorkerInfo::default();
+
+        let first = policy.select_worker(&workers, &info);
+        let second = policy.select_worker(&workers, &info);
+        let third = policy.select_worker(&workers, &info);
+
+        assert_eq!(first, Some(0));
+        assert_eq!(second, Some(1));
+        assert_eq!(third, Some(2));
+    }
+
+    #[test]
+    fn optimistic_counter_wraps_around() {
+        // After distributing one request to each of 2 workers, the 3rd request
+        // should go back to the first worker (both have delta = 1, tie-break
+        // picks lowest index).
+        let policy = RequestNumBalancePolicy::new();
+        let w0 = build_worker("http://w0:8000");
+        let w1 = build_worker("http://w1:8000");
+
+        set_queue(&w0, 0, 0);
+        set_queue(&w1, 0, 0);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![w0, w1];
+        let info = SelectWorkerInfo::default();
+
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+        // Both at delta 1 → tie broken by lowest index.
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+    }
+
+    #[test]
+    fn engine_stats_reset_clears_delta() {
+        let policy = RequestNumBalancePolicy::new();
+        let w0 = build_worker("http://w0:8000");
+        let w1 = build_worker("http://w1:8000");
+
+        set_queue(&w0, 0, 0);
+        set_queue(&w1, 0, 0);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![w0.clone(), w1];
+        let info = SelectWorkerInfo::default();
+
+        // Route to w0, accumulating delta = 1 for w0.
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        // Next request goes to w1 (w0 has delta 1).
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+
+        // Simulate a fresh engine-stats snapshot for w0 — reset delta to 0.
+        policy.on_engine_stats_updated(w0.url());
+
+        // Now w0 (engine 0 + delta 0 = 0) beats w1 (engine 0 + delta 1 = 1).
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+    }
+
+    #[test]
+    fn request_complete_decrements_delta() {
+        let policy = RequestNumBalancePolicy::new();
+        let w0 = build_worker("http://w0:8000");
+        let w1 = build_worker("http://w1:8000");
+
+        set_queue(&w0, 0, 0);
+        set_queue(&w1, 0, 0);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![w0.clone(), w1];
+        let info = SelectWorkerInfo::default();
+
+        // Route two requests to w0 (delta 1), then w1 (delta 1).
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+        assert_eq!(policy.select_worker(&workers, &info), Some(1));
+
+        // Complete the request on w0 — delta drops from 1 to 0.
+        policy.on_request_complete_with_tokens(w0.url(), None, true);
+
+        // w0 (engine 0 + delta 0 = 0) beats w1 (engine 0 + delta 1 = 1).
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+    }
+
+    #[test]
+    fn delta_does_not_go_negative() {
+        let policy = RequestNumBalancePolicy::new();
+        let w = build_worker("http://w0:8000");
+        set_queue(&w, 0, 0);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![w.clone()];
+        let info = SelectWorkerInfo::default();
+
+        // Route one request → delta = 1.
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+
+        // Two completions should clamp at 0, not go to -1.
+        policy.on_request_complete_with_tokens(w.url(), None, true);
+        policy.on_request_complete_with_tokens(w.url(), None, true);
+
+        // Delta is clamped at 0, so another route still picks idx 0.
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
+    }
+
+    #[test]
+    fn optimistic_delta_combined_with_engine_stats() {
+        // w0 has engine queue 3 + delta 0 = 3
+        // w1 has engine queue 0 + delta 2 = 2  (routed twice before stats push)
+        // → w1 should be picked (2 < 3)
+        let policy = RequestNumBalancePolicy::new();
+        let w0 = build_worker("http://w0:8000");
+        let w1 = build_worker("http://w1:8000");
+
+        set_queue(&w0, 3, 0);
+        set_queue(&w1, 0, 0);
+
+        let workers: Vec<Arc<dyn Worker>> = vec![w0, w1];
+        let info = SelectWorkerInfo::default();
+
+        // Two requests go to w1 (it's idle) → delta = 2 for w1.
+        assert_eq!(policy.select_worker(&workers, &info), Some(1)); // w1: 0+0 < 3+0
+        assert_eq!(policy.select_worker(&workers, &info), Some(1)); // w1: 0+1 < 3+0
+
+        // Now w0=3+0=3, w1=0+2=2 → w1 still wins.
+        assert_eq!(policy.select_worker(&workers, &info), Some(1)); // w1: 0+2 < 3+0
+
+        // w0=3+0=3, w1=0+3=3 → tie broken by lowest index → w0.
+        assert_eq!(policy.select_worker(&workers, &info), Some(0));
     }
 }

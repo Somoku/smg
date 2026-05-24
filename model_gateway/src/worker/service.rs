@@ -512,11 +512,11 @@ impl WorkerService {
                     let dp_rank = item.dp_rank;
                     let outcome = worker.update_engine_stats(item.stats, staleness_threshold_ms);
 
-                    // Notify throughput-optimal policies that a fresh snapshot has
+                    // Notify stateful policies that a fresh snapshot has
                     // been applied so they can reset their optimistic local delta.
                     if matches!(outcome, EngineStatsUpdateOutcome::Applied) {
                         if let Some(ref pr) = self.policy_registry {
-                            for policy in pr.get_all_throughput_optimal_policies() {
+                            for policy in pr.get_all_stateful_policies() {
                                 policy.on_engine_stats_updated(&url);
                             }
                         }
