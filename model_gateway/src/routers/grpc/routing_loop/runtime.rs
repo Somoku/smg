@@ -299,7 +299,7 @@ impl RoutingLoopRuntime {
 
     /// Return metadata for all queued entries whose `version_tag ≤ max_version_tag`.
     ///
-    /// Used by `GET /routing_loop/filter` to let the Python coordinator check
+    /// Used by `GET /routing_loop/filter` to let the sync coordinator check
     /// whether old-version requests have fully drained from the queue.
     pub(crate) async fn filter_queue_by_version_tag(
         &self,

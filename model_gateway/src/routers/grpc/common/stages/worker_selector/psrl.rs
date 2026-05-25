@@ -36,15 +36,21 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerSelectionKey {
-    /// Sort descending by version tag.
+    /// Version ordering indicator.
+    ///
+    /// New requests use `-version` so ascending order tries newer versions
+    /// first; versioned requests use `version` so ascending order tries the
+    /// lowest acceptable version first.
     Version(i64),
-    /// Sort by PS Manager reserve score (higher is better), with version as
-    /// tiebreaker.  `reserve_bits` is the bit-representation of the `f64`
-    /// score so that we can use `Ord` without floating-point concerns.
+    /// Sort by PS Manager reserve indicator, with version as tiebreaker.
+    ///
+    /// Lower reserve indicator is better (`-inf` best, `inf` worst), then
+    /// lower `version_indicator` wins.
+    /// `reserve_bits` stores the `f64` bit pattern for deterministic ordering.
     Reserve {
-        /// Bits of the `f64` reserve score for `total_cmp`-style ordering.
+        /// Bits of the `f64` reserve indicator for `total_cmp`-style ordering.
         reserve_bits: u64,
-        /// Version tag as tiebreaker (higher is better).
+        /// Version indicator used as the tiebreaker.
         version_indicator: i64,
     },
 }
@@ -303,7 +309,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                 .map(|w| {
                     let v = self.version_after_sync(w);
                     // When version_tag == -1 use negative version so higher
-                    // versions sort last (we want "any version" semantics).
+                    // versions sort first.
                     WorkerSelectionKey::Version(if meta.version_tag == -1 { -v } else { v })
                 })
                 .collect(),
@@ -367,9 +373,9 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             }
         };
 
-        // Sort candidates by key descending (best first).
+        // Sort candidates by key ascending (smallest indicator first).
         let mut indexed: Vec<(usize, &WorkerSelectionKey)> = sort_keys.iter().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.cmp(a.1));
+        indexed.sort_by(|a, b| a.1.cmp(b.1));
 
         let sorted_candidates: Vec<Arc<dyn Worker>> = indexed
             .iter()
@@ -635,22 +641,65 @@ mod tests {
         assert_eq!(pinned[0], &hint);
     }
 
-    /// WorkerSelectionKey ordering: higher version sorts before lower.
+    /// WorkerSelectionKey ordering follows ascending indicator order.
     #[test]
     fn worker_selection_key_ordering() {
-        let high = WorkerSelectionKey::Version(10);
-        let low = WorkerSelectionKey::Version(5);
-        assert!(high > low);
+        let new_high_version = WorkerSelectionKey::Version(-10);
+        let new_low_version = WorkerSelectionKey::Version(-5);
+        assert!(new_high_version < new_low_version);
 
-        let hi_reserve = WorkerSelectionKey::Reserve {
-            reserve_bits: 1.0_f64.to_bits(),
-            version_indicator: 5,
+        let existing_low_version = WorkerSelectionKey::Version(5);
+        let existing_high_version = WorkerSelectionKey::Version(10);
+        assert!(existing_low_version < existing_high_version);
+
+        let best_reserve = WorkerSelectionKey::Reserve {
+            reserve_bits: f64::NEG_INFINITY.to_bits(),
+            version_indicator: -10,
         };
-        let lo_reserve = WorkerSelectionKey::Reserve {
-            reserve_bits: 0.5_f64.to_bits(),
-            version_indicator: 5,
+        let worst_reserve = WorkerSelectionKey::Reserve {
+            reserve_bits: f64::INFINITY.to_bits(),
+            version_indicator: -10,
         };
-        assert!(hi_reserve > lo_reserve);
+        assert!(best_reserve < worst_reserve);
+    }
+
+    #[test]
+    fn worker_selection_key_sort_matches_indicator_order() {
+        let mut version_keys = vec![
+            (5_i64, WorkerSelectionKey::Version(-5)),
+            (10_i64, WorkerSelectionKey::Version(-10)),
+            (7_i64, WorkerSelectionKey::Version(-7)),
+        ];
+        version_keys.sort_by(|a, b| a.1.cmp(&b.1));
+        let ordered_versions: Vec<i64> = version_keys.iter().map(|(version, _)| *version).collect();
+        assert_eq!(ordered_versions, vec![10, 7, 5]);
+
+        let mut reserve_keys = vec![
+            (
+                5_i64,
+                WorkerSelectionKey::Reserve {
+                    reserve_bits: 1.0_f64.to_bits(),
+                    version_indicator: -5,
+                },
+            ),
+            (
+                10_i64,
+                WorkerSelectionKey::Reserve {
+                    reserve_bits: f64::NEG_INFINITY.to_bits(),
+                    version_indicator: -10,
+                },
+            ),
+            (
+                7_i64,
+                WorkerSelectionKey::Reserve {
+                    reserve_bits: f64::INFINITY.to_bits(),
+                    version_indicator: -7,
+                },
+            ),
+        ];
+        reserve_keys.sort_by(|a, b| a.1.cmp(&b.1));
+        let ordered_versions: Vec<i64> = reserve_keys.iter().map(|(version, _)| *version).collect();
+        assert_eq!(ordered_versions, vec![10, 5, 7]);
     }
 
     /// Unused import lint: ensure HashMap is used.

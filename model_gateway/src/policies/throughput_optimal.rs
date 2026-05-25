@@ -51,8 +51,9 @@ static REPORTED_MISSING_TOKENS: AtomicBool = AtomicBool::new(false);
 /// (via [`ThroughputRuntime::reset_delta`]) the delta is zeroed because the
 /// engine snapshot already incorporates the request.
 ///
-/// This mirrors the Python `instance_to_token_num` / `instance_to_running_request_num`
-/// local state (diff 1 and diff 3 in policy_diff.md).
+/// This keeps routing decisions aware of requests admitted after the latest
+/// engine snapshot, so concurrent selection does not repeatedly choose the same
+/// stale-low-load worker.
 #[derive(Debug, Default, Clone)]
 struct WorkerLocalDeltaState {
     /// Extra tokens not yet reflected in the latest engine snapshot.
@@ -177,8 +178,7 @@ impl ThroughputRuntime {
         let prompt_tokens = Self::request_token_num(info);
         let response_tokens = info.response_token_count.unwrap_or(0) as i64;
         let budget = self.cfg.request_budget.max(1) as i64;
-        // Round (response_tokens + 1) up to the nearest budget multiple, mirroring
-        // the Python formula:  ceil((response_tokens + 1) / budget) * budget
+        // Round (response_tokens + 1) up to the nearest budget multiple.
         let budget_aligned_response = ((response_tokens + 1 + budget - 1) / budget) * budget;
         prompt_tokens + budget_aligned_response
     }
@@ -336,8 +336,7 @@ impl ThroughputRuntime {
         // tried in ascending order.  The policy returns the best worker from the
         // first group that contains at least one eligible candidate.  If no
         // worker in the highest-priority group is eligible, it falls through to
-        // the next group — mirroring the Python `candidates_group_by_priority`
-        // loop.
+        // the next group.
         //
         // When `info.priority_groups` is `None` all healthy workers are treated
         // as a single group, preserving the existing behaviour exactly.
