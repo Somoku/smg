@@ -83,10 +83,13 @@ impl Ord for WorkerSelectionKey {
     }
 }
 
-/// Read the version tag used by PSRL selection.
-fn worker_version_tag(worker: &Arc<dyn Worker>) -> Option<i64> {
+/// Read the worker runtime version used by PSRL when the sync map has no entry.
+///
+/// Unknown or out-of-range versions default to `0`, matching PSRL's initial
+/// rollout-instance version.
+fn worker_version_tag(worker: &Arc<dyn Worker>) -> i64 {
     let dyn_version = worker.dyn_weight_version();
-    i64::try_from(dyn_version).ok()
+    i64::try_from(dyn_version).unwrap_or(0)
 }
 
 pub(crate) struct PsrlWorkerSelector {
@@ -125,6 +128,15 @@ impl PsrlWorkerSelector {
             .to_string();
         (base_worker_id, worker.dp_rank().unwrap_or(0))
     }
+
+    fn version_after_sync(&self, worker: &Arc<dyn Worker>) -> i64 {
+        let instance = self.worker_instance_id(worker);
+        self.runtime
+            .instance_to_version_after_sync
+            .get(&instance)
+            .map(|v| *v)
+            .unwrap_or_else(|| worker_version_tag(worker))
+    }
 }
 
 #[async_trait]
@@ -162,17 +174,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         let meta = routing_meta?;
 
         // ── Stage 1: version filter ─────────────────────────────────────────
-        candidates.retain(|w| {
-            // Try the runtime map first; fall back to the worker label.
-            let instance = self.worker_instance_id(w);
-            let synced = self
-                .runtime
-                .instance_to_version_after_sync
-                .get(&instance)
-                .map(|v| *v)
-                .or_else(|| worker_version_tag(w));
-            synced.is_some_and(|v| v >= meta.version_tag)
-        });
+        candidates.retain(|w| self.version_after_sync(w) >= meta.version_tag);
 
         if candidates.is_empty() {
             warn!(
@@ -242,10 +244,12 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
 
         if meta.version_tag == -1 {
             if let Some(ps_client) = self.runtime.ps_manager_client.get() {
-                // Collect unique version tags from worker labels.
+                // Collect unique synced version tags.
                 let unique_versions: Vec<i64> = {
-                    let mut v: Vec<i64> =
-                        candidates.iter().filter_map(worker_version_tag).collect();
+                    let mut v: Vec<i64> = candidates
+                        .iter()
+                        .map(|w| self.version_after_sync(w))
+                        .collect();
                     v.sort_unstable();
                     v.dedup();
                     v
@@ -269,9 +273,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                                 .filter_map(|(&v, &ok)| if ok { Some(v) } else { None })
                                 .collect();
 
-                            candidates.retain(|w| {
-                                worker_version_tag(w).is_none_or(|v| reservable.contains(&v))
-                            });
+                            candidates.retain(|w| reservable.contains(&self.version_after_sync(w)));
 
                             if candidates.is_empty() {
                                 warn!(
@@ -299,7 +301,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             CandidateSortKey::Version => candidates
                 .iter()
                 .map(|w| {
-                    let v = worker_version_tag(w).unwrap_or(-1);
+                    let v = self.version_after_sync(w);
                     // When version_tag == -1 use negative version so higher
                     // versions sort last (we want "any version" semantics).
                     WorkerSelectionKey::Version(if meta.version_tag == -1 { -v } else { v })
@@ -310,8 +312,10 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                 let indicators: Vec<f64> =
                     if let Some(ps_client) = self.runtime.ps_manager_client.get() {
                         let unique_versions: Vec<i64> = {
-                            let mut v: Vec<i64> =
-                                candidates.iter().filter_map(worker_version_tag).collect();
+                            let mut v: Vec<i64> = candidates
+                                .iter()
+                                .map(|w| self.version_after_sync(w))
+                                .collect();
                             v.sort_unstable();
                             v.dedup();
                             v
@@ -328,8 +332,9 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                                 candidates
                                     .iter()
                                     .map(|w| {
-                                        worker_version_tag(w)
-                                            .and_then(|v| version_to_indicator.get(&v).copied())
+                                        version_to_indicator
+                                            .get(&self.version_after_sync(w))
+                                            .copied()
                                             .unwrap_or(0.0_f64)
                                     })
                                     .collect()
@@ -352,7 +357,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                     .iter()
                     .zip(indicators.iter())
                     .map(|(w, &ind)| {
-                        let v = worker_version_tag(w).unwrap_or(-1);
+                        let v = self.version_after_sync(w);
                         WorkerSelectionKey::Reserve {
                             reserve_bits: ind.to_bits(),
                             version_indicator: if meta.version_tag == -1 { -v } else { v },
@@ -407,7 +412,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         {
             let instance = &selected_instance;
             if let Some(ps_client) = self.runtime.ps_manager_client.get() {
-                let version = worker_version_tag(&selected).unwrap_or(-1);
+                let version = self.version_after_sync(&selected);
 
                 if meta.rollout_instance_hint.is_none() {
                     // First placement — reserve and record.
@@ -489,8 +494,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::RoutingLoopConfig, routers::grpc::routing_loop::runtime::RoutingLoopRuntime,
-        worker::WorkerRegistry,
+        config::{PolicyConfig, RoutingLoopConfig},
+        policies::PolicyRegistry,
+        routers::grpc::routing_loop::runtime::RoutingLoopRuntime,
+        worker::{BasicWorkerBuilder, WorkerRegistry},
     };
 
     fn make_runtime() -> Arc<RoutingLoopRuntime> {
@@ -577,6 +584,43 @@ mod tests {
         assert_eq!(ids, vec![43]);
     }
 
+    #[test]
+    fn worker_version_tag_defaults_unknown_to_zero() {
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-a:8000")
+                .label(
+                    "weight_version",
+                    (u64::try_from(i64::MAX).unwrap() + 1).to_string(),
+                )
+                .build(),
+        );
+
+        assert_eq!(worker_version_tag(&worker), 0);
+    }
+
+    #[test]
+    fn version_after_sync_prefers_runtime_map_over_worker_version() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let runtime = make_runtime();
+        let selector = PsrlWorkerSelector::new(
+            Arc::clone(&worker_registry),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            Arc::clone(&runtime),
+            false,
+            CandidateSortKey::Version,
+            true,
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-a:8000")
+                .label("weight_version", "7")
+                .build(),
+        );
+        let instance = selector.worker_instance_id(&worker);
+        runtime.instance_to_version_after_sync.insert(instance, 3);
+
+        assert_eq!(selector.version_after_sync(&worker), 3);
+    }
+
     /// Stage 2 pin: rollout_instance_hint (mig disabled) should pin to the hinted instance.
     #[test]
     fn stage2_partial_hint_pin_logic() {
@@ -614,9 +658,8 @@ mod tests {
     fn stage1_empty_version_map_passes_all() {
         let map: HashMap<(String, usize), i64> = HashMap::new();
         let version_tag: i64 = 2;
-        // With no synced version in the map, fallback returns None → we do not
-        // retain (the worker_version_tag fallback would be used in production).
-        // This just verifies the HashMap type compiles and is functional.
+        // With no synced version in the map, the selector falls back to the
+        // worker runtime version, whose unknown value defaults to 0.
         let has_entry = map.contains_key(&("worker-a".to_string(), 0));
         assert!(!has_entry);
         let _ = version_tag;

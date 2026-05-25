@@ -622,7 +622,7 @@ async fn dispatch_entry_with_partial_rollout(
     loop {
         // ── Step 1: publish accumulated response-token count for selection ───
         let headers = ctx.input.headers.get_or_insert_with(Default::default);
-        if let Ok(v) = HeaderValue::from_str(&token_count.to_string()) {
+        if let Ok(v) = HeaderValue::from_str(&partial_state.response_token_count().to_string()) {
             headers.insert("x-response-token-count", v);
         }
 
