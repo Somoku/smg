@@ -56,16 +56,13 @@ impl LoadBalancingPolicy for RequestNumBalancePolicy {
         let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
 
         let idx = healthy.into_iter().min_by_key(|&idx| {
-            let engine_queue =
-                workers[idx].engine_stats().waiting_and_running_queue_size() as i64;
+            let engine_queue = workers[idx].engine_stats().waiting_and_running_queue_size() as i64;
             let pending = guard.get(workers[idx].url()).copied().unwrap_or(0).max(0);
             engine_queue + pending
         })?;
 
         // Optimistic increment — the request hasn't reached the engine yet.
-        *guard
-            .entry(workers[idx].url().to_string())
-            .or_insert(0) += 1;
+        *guard.entry(workers[idx].url().to_string()).or_insert(0) += 1;
 
         Some(idx)
     }

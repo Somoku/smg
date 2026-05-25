@@ -175,7 +175,6 @@ impl TestRouterConfig {
                     1024, // max_concurrent_seqs_per_instance
                     0.5,  // delta_throughput_threshold
                     8192, // max_prompt_length
-                    1024, // request_budget
                     1000, // max_num_waiting_reqs_after_preemption
                 )
                 .host(defaults::HOST)

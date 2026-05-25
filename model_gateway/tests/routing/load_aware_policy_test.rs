@@ -331,7 +331,6 @@ mod throughput_optimal_with_budget_tests {
                 1024, // max_concurrent_seqs_per_instance
                 0.5,  // delta_throughput_threshold
                 8192, // max_prompt_length
-                1024, // request_budget
                 1000, // max_num_waiting_reqs_after_preemption
             )
             .host("127.0.0.1")
@@ -391,7 +390,6 @@ mod throughput_optimal_with_budget_tests {
                 1024, // max_concurrent_seqs_per_instance
                 0.5,  // delta_throughput_threshold
                 8192, // max_prompt_length
-                1024, // request_budget
                 1000, // max_num_waiting_reqs_after_preemption
             )
             .host("127.0.0.1")
@@ -400,8 +398,11 @@ mod throughput_optimal_with_budget_tests {
             .expect("valid config");
 
         match config.policy {
-            PolicyConfig::ThroughputOptimalWithBudget { budget, .. } => {
-                assert_eq!(budget, 32, "budget should be preserved through builder");
+            PolicyConfig::ThroughputOptimalWithBudget { request_budget, .. } => {
+                assert_eq!(
+                    request_budget, 32,
+                    "budget should be preserved through builder"
+                );
             }
             other => panic!("unexpected policy: {other:?}"),
         }

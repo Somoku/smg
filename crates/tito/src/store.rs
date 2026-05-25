@@ -136,8 +136,7 @@ impl TitoStore {
 
     /// Set the default GC threshold applied to all **newly created** sessions.
     pub fn set_gc_threshold(&self, threshold: usize) {
-        self.gc_threshold
-            .store(threshold, Ordering::Release);
+        self.gc_threshold.store(threshold, Ordering::Release);
     }
 
     /// Returns the default GC threshold used for newly created sessions.
@@ -155,10 +154,7 @@ impl TitoStore {
     /// Look up or lazily create a session and return a cloned Arc to its state.
     /// The DashMap shard lock is dropped before returning.
     #[inline]
-    fn get_or_create_session_arc(
-        &self,
-        session_id: &str,
-    ) -> Arc<parking_lot::Mutex<SessionState>> {
+    fn get_or_create_session_arc(&self, session_id: &str) -> Arc<parking_lot::Mutex<SessionState>> {
         let threshold = self.gc_threshold.load(Ordering::Acquire);
         Arc::clone(
             &*self
@@ -528,7 +524,14 @@ mod tests {
         render_context: &RenderContext,
     ) {
         store
-            .store(session_id, messages, token_ids, turn_record, render_context, 0)
+            .store(
+                session_id,
+                messages,
+                token_ids,
+                turn_record,
+                render_context,
+                0,
+            )
             .unwrap();
     }
 
@@ -941,14 +944,7 @@ mod tests {
         // and add trajectory 1 pointing at an independent turn1-variant.
         let turn1_b = vec![user_msg("hi"), assistant_msg("v1")];
         store
-            .store(
-                "s1",
-                &turn1_b,
-                vec![10, 20],
-                record(2, "t1b"),
-                &ctx,
-                1,
-            )
+            .store("s1", &turn1_b, vec![10, 20], record(2, "t1b"), &ctx, 1)
             .unwrap();
 
         // Because threshold > entries, GC is skipped and both entries survive.
@@ -1042,14 +1038,7 @@ mod tests {
 
         // Trajectory 1 advances independently to branch_b.
         store
-            .store(
-                "s1",
-                &branch_b,
-                vec![1, 2, 5, 6],
-                record(4, "a2"),
-                &ctx,
-                1,
-            )
+            .store("s1", &branch_b, vec![1, 2, 5, 6], record(4, "a2"), &ctx, 1)
             .unwrap();
 
         let arc = Arc::clone(&*store.sessions.get("s1").unwrap());

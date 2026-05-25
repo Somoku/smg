@@ -170,10 +170,6 @@ impl RouterConfigBuilder {
         self
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "config builder requires all parameters"
-    )]
     pub fn throughput_optimal_with_budget_policy(
         mut self,
         request_budget: usize,

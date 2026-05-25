@@ -313,17 +313,35 @@ mod tests {
 
     #[test]
     fn adapter_assistant_start_str() {
-        assert_eq!(Qwen3Adapter::new(151645, 198).assistant_start_str(), Some("<|im_start|>assistant"));
-        assert_eq!(Qwen35Adapter::new(151645, 198).assistant_start_str(), Some("<|im_start|>assistant"));
-        assert_eq!(QwenNextAdapter::new(151645, 198).assistant_start_str(), Some("<|im_start|>assistant"));
-        assert_eq!(Glm47Adapter::new(64795, 64796).assistant_start_str(), Some("<|assistant|>"));
+        assert_eq!(
+            Qwen3Adapter::new(151645, 198).assistant_start_str(),
+            Some("<|im_start|>assistant")
+        );
+        assert_eq!(
+            Qwen35Adapter::new(151645, 198).assistant_start_str(),
+            Some("<|im_start|>assistant")
+        );
+        assert_eq!(
+            QwenNextAdapter::new(151645, 198).assistant_start_str(),
+            Some("<|im_start|>assistant")
+        );
+        assert_eq!(
+            Glm47Adapter::new(64795, 64796).assistant_start_str(),
+            Some("<|assistant|>")
+        );
         assert_eq!(DefaultAdapter.assistant_start_str(), None);
     }
 
     #[test]
     fn adapter_trailing_token_ids() {
-        assert_eq!(Qwen3Adapter::new(151645, 198).trailing_token_ids(), &[198u32]);
-        assert_eq!(Glm47Adapter::new(64795, 64796).trailing_token_ids(), &[64795u32, 64796]);
+        assert_eq!(
+            Qwen3Adapter::new(151645, 198).trailing_token_ids(),
+            &[198u32]
+        );
+        assert_eq!(
+            Glm47Adapter::new(64795, 64796).trailing_token_ids(),
+            &[64795u32, 64796]
+        );
         assert_eq!(DefaultAdapter.trailing_token_ids(), &[] as &[u32]);
     }
 

@@ -8,7 +8,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::chat::{ChatCompletionMessage, ChatMessage, MessageContent};
-
 use smg_tito::{RenderContext, TitoStore};
 use tracing::{debug, error, warn};
 

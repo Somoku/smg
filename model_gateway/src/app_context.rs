@@ -23,13 +23,14 @@ use crate::{
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
     routers::{
+        common::openai_bridge::FormatRegistry,
         grpc::{
             multimodal::MultimodalConfigRegistry,
             preemption_subscriber::PreemptionMonitor,
             routing_loop::runtime::{run_routing_loop, InstanceVersionMap, RoutingLoopRuntime},
         },
-        common::openai_bridge::FormatRegistry,
-        openai::realtime::RealtimeRegistry, router_manager::RouterManager,
+        openai::realtime::RealtimeRegistry,
+        router_manager::RouterManager,
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{KvEventMonitor, WorkerMonitor, WorkerRegistry, WorkerService},
