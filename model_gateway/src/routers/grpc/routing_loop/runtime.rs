@@ -620,10 +620,11 @@ async fn dispatch_entry_with_partial_rollout(
     let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
 
     loop {
-        // ── Step 1: write current accumulated state into ctx ─────────────────
-        // The PSRL worker selector reads `partial_rollout_state.response_token_count()`
-        // during Stage 5 to route to the KV-cache-warm instance.
-        ctx.state.partial_rollout_state = Some(partial_state.clone());
+        // ── Step 1: publish accumulated response-token count for selection ───
+        let headers = ctx.input.headers.get_or_insert_with(Default::default);
+        if let Ok(v) = HeaderValue::from_str(&token_count.to_string()) {
+            headers.insert("x-response-token-count", v);
+        }
 
         // ── Step 2: run execution-phase stages (worker select → dispatch) ────
         if let Err(response) = pipeline.execute_through_execution(&mut ctx).await {
@@ -672,14 +673,15 @@ async fn dispatch_entry_with_partial_rollout(
                 // Emit completion metrics.
                 histogram!("smg_partial_rollout_loopback_count")
                     .record(partial_state.iteration_count as f64);
+                let accumulated_tokens = partial_state.token_ids.len();
                 histogram!("smg_partial_rollout_accumulated_tokens")
-                    .record(partial_state.token_ids.len() as f64);
+                    .record(accumulated_tokens as f64);
                 counter!("smg_partial_rollout_completed_total").increment(1);
 
                 // Override the output_ids in the final complete frame with the
                 // full accumulated token sequence from all loopback iterations.
                 let mut complete = drained.complete;
-                complete.set_output_ids(partial_state.token_ids.clone());
+                complete.set_output_ids(std::mem::take(&mut partial_state.token_ids));
 
                 // Place the assembled complete frame back for PostExecution stages.
                 ctx.state.response.execution_result = Some(ExecutionResult::Complete(complete));
@@ -729,13 +731,7 @@ async fn dispatch_entry_with_partial_rollout(
                 if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
                     headers.insert("x-target-dp-rank", v);
                 }
-                let token_count = partial_state.response_token_count();
-                if let Ok(v) = HeaderValue::from_str(&token_count.to_string()) {
-                    headers.insert("x-response-token-count", v);
-                }
 
-                // Carry the accumulated state forward to the next iteration.
-                ctx.state.partial_rollout_state = Some(partial_state.clone());
                 // continue loop
             }
             other => {

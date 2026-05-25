@@ -280,7 +280,7 @@ impl ChatPreparationStage {
         // Persist prompt token IDs into tito_context before PreparationOutput is consumed
         // by request_building (which .take()s preparation).
         if let Some(ref mut tc) = ctx.state.tito_context {
-            tc.prompt_token_ids = token_ids.clone();
+            tc.prompt_token_ids.clone_from(&token_ids);
         }
 
         // Store results in context

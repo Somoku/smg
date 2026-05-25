@@ -174,10 +174,8 @@ impl ThroughputRuntime {
 
     #[inline]
     fn request_token_num_with_budget(&self, info: &SelectWorkerInfo<'_>) -> i64 {
-        let total_tokens = Self::request_token_num(info);
+        let prompt_tokens = Self::request_token_num(info);
         let response_tokens = info.response_token_count.unwrap_or(0) as i64;
-        // Clamp in case response_token_count somehow exceeds total (e.g. stale info).
-        let prompt_tokens = (total_tokens - response_tokens).max(0);
         let budget = self.cfg.request_budget.max(1) as i64;
         // Round (response_tokens + 1) up to the nearest budget multiple, mirroring
         // the Python formula:  ceil((response_tokens + 1) / budget) * budget
@@ -760,6 +758,21 @@ mod tests {
         let tokens: Vec<u32> = vec![1, 2, 3, 4, 5];
         let info = info_with_tokens(&tokens);
         assert_eq!(ThroughputRuntime::request_token_num(&info), 5);
+    }
+
+    #[test]
+    fn request_token_num_with_budget_adds_response_tokens_to_prompt_tokens() {
+        let rt = ThroughputRuntime::new(budget_config_with_cost_model(64, 0.5))
+            .expect("runtime creation should succeed");
+        let tokens: Vec<u32> = (0..10).collect();
+        let info = SelectWorkerInfo {
+            tokens: Some(&tokens),
+            response_token_count: Some(130),
+            ..Default::default()
+        };
+
+        // 10 prompt tokens + ceil((130 response tokens + 1) / 64) * 64.
+        assert_eq!(rt.request_token_num_with_budget(&info), 202);
     }
 
     // ── ThroughputOptimalPolicy ──────────────────────────────────────────
