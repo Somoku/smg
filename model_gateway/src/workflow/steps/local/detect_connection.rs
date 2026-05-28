@@ -16,9 +16,11 @@ use crate::{
     },
 };
 
-/// Step 1: Detect connection mode (HTTP vs gRPC).
+/// Step 1: Verify the declared connection mode (HTTP vs gRPC).
 ///
-/// Probes both protocols in parallel. HTTP takes priority if both succeed.
+/// Validates that the worker is reachable via the `connection_mode` explicitly
+/// provided in the registration payload. Auto-detection is not performed —
+/// callers must supply the mode manually.
 /// Does NOT detect backend runtime — that's handled by DetectBackendStep.
 pub struct DetectConnectionModeStep;
 
@@ -51,30 +53,45 @@ impl StepExecutor<WorkerWorkflowData> for DetectConnectionModeStep {
             .unwrap_or(app_context.router_config.health_check.timeout_secs);
         let client = &app_context.client;
 
-        let (http_result, grpc_result) = tokio::join!(
-            try_http_reachable(&url, timeout, client),
-            try_grpc_reachable(&url, timeout)
-        );
+        let connection_mode = config.connection_mode;
 
-        let connection_mode = match (http_result, grpc_result) {
-            (Ok(()), _) => {
-                debug!("{} detected as HTTP", config.url);
-                ConnectionMode::Http
+        // Verify the declared connection mode.
+        match connection_mode {
+            ConnectionMode::Http => {
+                try_http_reachable(&url, timeout, client).await.map_err(|e| {
+                    WorkflowError::StepFailed {
+                        step_id: StepId::new("detect_connection_mode"),
+                        message: format!(
+                            "HTTP health check failed for {} \
+                                (connection_mode=http was explicitly declared in the \
+                                registration payload): {e}",
+                            config.url
+                        ),
+                    }
+                })?;
+                debug!(
+                    "{} confirmed reachable via HTTP (as declared in payload)",
+                    config.url
+                );
             }
-            (_, Ok(())) => {
-                debug!("{} detected as gRPC", config.url);
-                ConnectionMode::Grpc
+            ConnectionMode::Grpc => {
+                try_grpc_reachable(&url, timeout).await.map_err(|e| {
+                    WorkflowError::StepFailed {
+                        step_id: StepId::new("detect_connection_mode"),
+                        message: format!(
+                            "gRPC health check failed for {} \
+                                (connection_mode=grpc was explicitly declared in the \
+                                registration payload): {e}",
+                            config.url
+                        ),
+                    }
+                })?;
+                debug!(
+                    "{} confirmed reachable via gRPC (as declared in payload)",
+                    config.url
+                );
             }
-            (Err(http_err), Err(grpc_err)) => {
-                return Err(WorkflowError::StepFailed {
-                    step_id: StepId::new("detect_connection_mode"),
-                    message: format!(
-                        "Both HTTP and gRPC health checks failed for {}: HTTP: {}, gRPC: {}",
-                        config.url, http_err, grpc_err
-                    ),
-                });
-            }
-        };
+        }
 
         context.data.connection_mode = Some(connection_mode);
         Ok(StepResult::Success)
