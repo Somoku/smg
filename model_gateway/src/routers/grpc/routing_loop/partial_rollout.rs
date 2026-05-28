@@ -149,7 +149,12 @@ pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext) {
     ctx.state.proto_request = None;
     ctx.state.dispatch = None;
     ctx.state.load_guards = None;
-    ctx.state.response = Default::default();
+    // Clear only per-iteration response fields; keep preparation-stage
+    // products (`stop_decoder`, `skip_special_tokens`) intact so the final
+    // post-execution stage can use them after the last loopback iteration.
+    ctx.state.response.execution_result = None;
+    ctx.state.response.final_response = None;
+    ctx.state.response.responses_iteration_result = None;
 }
 
 #[cfg(test)]
@@ -285,9 +290,80 @@ mod tests {
     }
 
     // ─── reset_ctx_for_loopback ──────────────────────────────────────────────
-    // NOTE: reset_ctx_for_loopback operates on live RequestContext instances
-    // that require a full set of initialised fields (non-Default types).
-    // The logic is trivial field-clearing; coverage is provided by the
-    // integration test in tests_partial_rollout.rs where a full RequestContext
-    // is available.
+    #[test]
+    fn reset_preserves_preparation_products_in_response_state() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::{stop::StopSequenceDecoderBuilder, MockTokenizer};
+        use openai_protocol::chat::ChatCompletionRequest;
+        use reasoning_parser::ParserFactory as ReasoningParserFactory;
+        use tool_parser::ParserFactory as ToolParserFactory;
+
+        use crate::routers::grpc::context::{
+            FinalResponse, ProcessingState, RequestContext, RequestInput, RequestType,
+            SharedComponents,
+        };
+
+        // Minimal RequestContext built directly so the test stays inside the
+        // crate (no dependency on the integration test helpers).  We use a
+        // Chat request because `ChatCompletionRequest` derives `Default`
+        // whereas `GenerateRequest` does not — the field-clearing logic under
+        // test does not depend on the request variant.
+        let components = Arc::new(SharedComponents {
+            tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            configured_tool_parser: None,
+            multimodal: None,
+        });
+        let mut ctx = RequestContext {
+            input: RequestInput {
+                request_type: RequestType::Chat(Arc::new(ChatCompletionRequest::default())),
+                headers: None,
+                model_id: "test-model".to_string(),
+                tenant_request_meta: None,
+            },
+            components,
+            state: ProcessingState::default(),
+        };
+
+        // Simulate Preparation stage outputs that live in `ResponseState`.
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(MockTokenizer::new());
+        let stop_decoder = StopSequenceDecoderBuilder::new(tokenizer)
+            .skip_special_tokens(true)
+            .build();
+        ctx.state.response.stop_decoder = Some(stop_decoder);
+        ctx.state.response.skip_special_tokens = Some(true);
+
+        // Simulate a per-iteration response field being populated; reset must
+        // clear it so the next iteration starts clean.
+        ctx.state.response.final_response = Some(FinalResponse::Generate(vec![]));
+
+        reset_ctx_for_loopback(&mut ctx);
+
+        // Preparation-stage products preserved.
+        assert!(
+            ctx.state.response.stop_decoder.is_some(),
+            "stop_decoder must survive loopback reset (set once during preparation)"
+        );
+        assert_eq!(
+            ctx.state.response.skip_special_tokens,
+            Some(true),
+            "skip_special_tokens must survive loopback reset"
+        );
+
+        // Per-iteration response fields cleared.
+        assert!(
+            ctx.state.response.execution_result.is_none(),
+            "execution_result must be cleared between iterations"
+        );
+        assert!(
+            ctx.state.response.final_response.is_none(),
+            "final_response must be cleared between iterations"
+        );
+        assert!(
+            ctx.state.response.responses_iteration_result.is_none(),
+            "responses_iteration_result must be cleared between iterations"
+        );
+    }
 }
