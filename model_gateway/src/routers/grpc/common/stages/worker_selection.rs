@@ -96,11 +96,13 @@ impl PipelineStage for WorkerSelectionStage {
                 {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
-                        error!(
+                        // No worker available — the routing loop will re-enqueue
+                        // this request; log at debug level only to avoid noise.
+                        tracing::debug!(
                             function = "WorkerSelectionStage::execute",
                             mode = "Regular",
                             model_id = %model_id,
-                            "No available workers for model"
+                            "No available workers for model; request will be re-enqueued"
                         );
                         return Err(error::model_not_found(model_id));
                     }
@@ -124,11 +126,13 @@ impl PipelineStage for WorkerSelectionStage {
                         runtime_type,
                     },
                     None => {
-                        error!(
+                        // No PD pair available — the routing loop will re-enqueue
+                        // this request; log at debug level only to avoid noise.
+                        tracing::debug!(
                             function = "WorkerSelectionStage::execute",
                             mode = "PrefillDecode",
                             model_id = %model_id,
-                            "No available PD worker pairs for model"
+                            "No available PD worker pairs for model; request will be re-enqueued"
                         );
                         return Err(error::model_not_found(model_id));
                     }

@@ -341,9 +341,7 @@ impl RoutingLoopRuntime {
         let mut queue = self.queue.lock().await;
         let mut entries = Vec::with_capacity(max_entries);
         for _ in 0..max_entries {
-            let Some(entry) = queue.pop() else {
-                break;
-            };
+            let Some(entry) = queue.pop() else { break };
             entries.push(entry);
         }
         queue.remove_empty_partitions();
@@ -530,35 +528,97 @@ fn send_aborted(entry: RoutingQueueEntry) {
     }
 }
 
-async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, entry: RoutingQueueEntry) {
+async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueueEntry) {
     let request_id = entry.routing_meta.as_ref().map(|meta| meta.request_id);
     let prompt_id = entry.routing_meta.as_ref().map(|meta| meta.prompt_id);
 
     if entry.routing_meta.is_none() {
+        // ── Run execution-phase stages (worker select → dispatch) ────────────
+        if let Err(response) = entry.pipeline.execute_through_execution(&mut entry.ctx).await {
+            if entry.ctx.state.workers.is_none() {
+                // Worker selection found no available worker — re-enqueue so
+                // the next routing-loop tick can retry.
+                runtime.push_entries(vec![entry]).await;
+            } else {
+                // A post-selection execution stage failed — propagate to caller.
+                match entry.completion {
+                    RoutingLoopCompletion::Http(tx) => {
+                        let _ = tx.send(response);
+                    }
+                    RoutingLoopCompletion::ChatForResponses(tx) => {
+                        let _ = tx.send(Err(response));
+                    }
+                    RoutingLoopCompletion::HarmonyResponses(tx) => {
+                        let _ = tx.send(Err(response));
+                    }
+                    RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
+                        let _ = tx.send(Err(response));
+                    }
+                }
+                runtime.cleanup_tracking(request_id, prompt_id);
+            }
+            return;
+        }
+
+        // ── Execution succeeded — run post-execution stages and send result ──
         match entry.completion {
             RoutingLoopCompletion::Http(tx) => {
-                let response = entry.pipeline.execute_after_preparation(entry.ctx).await;
+                let response = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                    Ok(Some(r)) => r,
+                    Ok(None) => extract_final_response(&mut entry.ctx),
+                    Err(r) => r,
+                };
                 let _ = tx.send(response);
             }
             RoutingLoopCompletion::ChatForResponses(tx) => {
-                let result = entry
-                    .pipeline
-                    .execute_chat_for_responses_after_preparation(entry.ctx)
-                    .await;
+                let result = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                    Ok(_) => match entry.ctx.state.response.final_response.take() {
+                        Some(FinalResponse::Chat(r)) => Ok(r),
+                        Some(_) => Err(router_error::internal_error(
+                            "wrong_response_type",
+                            "Wrong response type for ChatForResponses",
+                        )),
+                        None => Err(router_error::internal_error(
+                            "no_response_produced",
+                            "No response produced",
+                        )),
+                    },
+                    Err(r) => Err(r),
+                };
                 let _ = tx.send(result);
             }
             RoutingLoopCompletion::HarmonyResponses(tx) => {
-                let result = entry
-                    .pipeline
-                    .execute_harmony_responses_after_preparation(entry.ctx)
-                    .await;
+                let result = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                    Ok(_) => entry
+                        .ctx
+                        .state
+                        .response
+                        .responses_iteration_result
+                        .take()
+                        .ok_or_else(|| {
+                            router_error::internal_error(
+                                "no_responses_iteration_result",
+                                "No ResponsesIterationResult produced",
+                            )
+                        }),
+                    Err(r) => Err(r),
+                };
                 let _ = tx.send(result);
             }
             RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
-                let result = entry
-                    .pipeline
-                    .execute_harmony_responses_streaming_after_preparation(entry.ctx)
-                    .await;
+                let result = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                    Ok(_) => match entry.ctx.state.response.execution_result.take() {
+                        Some(execution_result) => {
+                            let load_guards = entry.ctx.state.load_guards.take();
+                            Ok((execution_result, load_guards))
+                        }
+                        None => Err(router_error::internal_error(
+                            "no_execution_result",
+                            "No execution result produced",
+                        )),
+                    },
+                    Err(r) => Err(r),
+                };
                 let _ = tx.send(result);
             }
         }
@@ -614,7 +674,7 @@ async fn dispatch_entry_with_partial_rollout(
         mut ctx,
         pipeline,
         completion,
-        ..
+        routing_meta,
     } = entry;
 
     let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
@@ -628,8 +688,22 @@ async fn dispatch_entry_with_partial_rollout(
 
         // ── Step 2: run execution-phase stages (worker select → dispatch) ────
         if let Err(response) = pipeline.execute_through_execution(&mut ctx).await {
-            send_http_completion(completion, response);
-            runtime.cleanup_tracking(request_id, prompt_id);
+            if ctx.state.workers.is_none() {
+                // Worker selection found no available worker — restore accumulated
+                // partial-rollout state and re-enqueue for the next tick.
+                ctx.state.partial_rollout_state = Some(partial_state);
+                runtime
+                    .push_entries(vec![RoutingQueueEntry {
+                        ctx,
+                        pipeline,
+                        completion,
+                        routing_meta,
+                    }])
+                    .await;
+            } else {
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+            }
             return;
         }
 

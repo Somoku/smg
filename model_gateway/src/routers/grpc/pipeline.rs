@@ -139,185 +139,6 @@ impl RequestPipeline {
         Ok(ctx)
     }
 
-    pub(crate) async fn execute_after_preparation(&self, mut ctx: RequestContext) -> Response {
-        let request_type = ctx.input.request_type.to_string();
-
-        for stage in self.stages.iter().skip(1) {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => return response,
-                Ok(None) => continue,
-                Err(response) => {
-                    error!(
-                        request_type = %request_type,
-                        "Stage {} failed with status {}",
-                        stage.name(),
-                        response.status()
-                    );
-                    return response;
-                }
-            }
-        }
-
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => axum::Json(response).into_response(),
-            Some(FinalResponse::Generate(response)) => axum::Json(response).into_response(),
-            Some(FinalResponse::Completion(response)) => axum::Json(response).into_response(),
-            Some(FinalResponse::Embedding(response)) => axum::Json(response).into_response(),
-            Some(FinalResponse::Classify(response)) => axum::Json(response).into_response(),
-            Some(FinalResponse::Messages(response)) => axum::Json(response).into_response(),
-            None => {
-                error!(
-                    request_type = %request_type,
-                    "No final response produced after routing-loop dispatch"
-                );
-                error::internal_error("no_response_produced", "No response produced")
-            }
-        }
-    }
-
-    pub(crate) async fn execute_chat_for_responses_after_preparation(
-        &self,
-        mut ctx: RequestContext,
-    ) -> Result<ChatCompletionResponse, Response> {
-        for (idx, stage) in self.stages.iter().enumerate().skip(1) {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(_response)) => {
-                    error!(
-                        function = "execute_chat_for_responses_after_preparation",
-                        "Streaming attempted in responses context"
-                    );
-                    return Err(error::bad_request(
-                        "streaming_not_supported",
-                        "Streaming is not supported in this context".to_string(),
-                    ));
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
-                    );
-                    return Err(response);
-                }
-            }
-        }
-
-        match ctx.state.response.final_response {
-            Some(FinalResponse::Chat(response)) => Ok(response),
-            Some(FinalResponse::Generate(_))
-            | Some(FinalResponse::Completion(_))
-            | Some(FinalResponse::Embedding(_))
-            | Some(FinalResponse::Classify(_))
-            | Some(FinalResponse::Messages(_)) => {
-                error!(
-                    function = "execute_chat_for_responses_after_preparation",
-                    "Wrong response type: expected Chat, got another response type"
-                );
-                Err(error::internal_error(
-                    "wrong_response_type",
-                    "Internal error: wrong response type",
-                ))
-            }
-            None => {
-                error!(
-                    function = "execute_chat_for_responses_after_preparation",
-                    "No response produced by pipeline"
-                );
-                Err(error::internal_error(
-                    "no_response_produced",
-                    "No response produced",
-                ))
-            }
-        }
-    }
-
-    pub(crate) async fn execute_harmony_responses_after_preparation(
-        &self,
-        mut ctx: RequestContext,
-    ) -> Result<harmony::ResponsesIterationResult, Response> {
-        for (idx, stage) in self.stages.iter().enumerate().skip(1) {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    error!(
-                        "Stage {} ({}) returned unexpected response during Responses iteration",
-                        idx + 1,
-                        stage.name()
-                    );
-                    return Err(response);
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
-                    );
-                    return Err(response);
-                }
-            }
-        }
-
-        ctx.state
-            .response
-            .responses_iteration_result
-            .take()
-            .ok_or_else(|| {
-                error!(
-                    function = "execute_harmony_responses_after_preparation",
-                    "No ResponsesIterationResult produced by pipeline"
-                );
-                error::internal_error(
-                    "no_responses_iteration_result",
-                    "No ResponsesIterationResult produced by pipeline",
-                )
-            })
-    }
-
-    pub(crate) async fn execute_harmony_responses_streaming_after_preparation(
-        &self,
-        mut ctx: RequestContext,
-    ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
-        for (idx, stage) in self.stages.iter().enumerate().skip(1) {
-            match stage.execute(&mut ctx).await {
-                Ok(Some(response)) => {
-                    error!(
-                        "Stage {} ({}) returned unexpected response during streaming Responses",
-                        idx + 1,
-                        stage.name()
-                    );
-                    return Err(response);
-                }
-                Ok(None) => continue,
-                Err(response) => {
-                    error!(
-                        "Stage {} ({}) failed with status {}",
-                        idx + 1,
-                        stage.name(),
-                        response.status()
-                    );
-                    return Err(response);
-                }
-            }
-        }
-
-        let execution_result = ctx.state.response.execution_result.take().ok_or_else(|| {
-            error!(
-                function = "execute_harmony_responses_streaming_after_preparation",
-                "No ExecutionResult produced by pipeline"
-            );
-            error::internal_error(
-                "no_execution_result_produced",
-                "No ExecutionResult produced by pipeline",
-            )
-        })?;
-
-        let load_guards = ctx.state.load_guards.take();
-        Ok((execution_result, load_guards))
-    }
-
     /// Run execution-phase stages only (worker selection → request execution).
     ///
     /// Used by partial-rollout dispatch: called once per loopback iteration.
@@ -347,12 +168,22 @@ impl RequestPipeline {
                 }
                 Ok(None) => continue,
                 Err(response) => {
-                    error!(
-                        function = "execute_through_execution",
-                        stage = stage.name(),
-                        status = %response.status(),
-                        "Execution stage failed"
-                    );
+                    if ctx.state.workers.is_none() {
+                        // Worker selection found no available worker — routing loop
+                        // will re-enqueue this request; suppress noisy error log.
+                        tracing::debug!(
+                            function = "execute_through_execution",
+                            stage = stage.name(),
+                            "Worker selection found no available worker; request will be re-enqueued"
+                        );
+                    } else {
+                        error!(
+                            function = "execute_through_execution",
+                            stage = stage.name(),
+                            status = %response.status(),
+                            "Execution stage failed"
+                        );
+                    }
                     return Err(response);
                 }
             }
