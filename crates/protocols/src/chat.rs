@@ -707,6 +707,9 @@ pub struct ChatChoice {
     /// Hidden states from the model (SGLang extension)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_states: Option<Vec<f32>>,
+    /// Base64-encoded numpy `.npy` bytes for routed experts (MoE only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }
 
 #[serde_with::skip_serializing_none]
@@ -751,4 +754,8 @@ pub struct ChatStreamChoice {
     pub finish_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>,
+    /// Only attached on the terminal stream chunk (`finish_reason != None`);
+    /// intermediate chunks always have `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }

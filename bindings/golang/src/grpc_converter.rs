@@ -392,6 +392,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                         logprobs: None,
                         finish_reason: None,
                         matched_stop: None,
+                        routed_experts: None,
                     }],
                     usage: None,
                 };
@@ -473,6 +474,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                                         logprobs: None,
                                         finish_reason: None,
                                         matched_stop: None,
+                                        routed_experts: None,
                                     }],
                                     usage: None,
                                 };
@@ -505,6 +507,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     logprobs: None,
                     finish_reason: None,
                     matched_stop: None,
+                    routed_experts: None,
                 }],
                 usage: None,
             };
@@ -611,6 +614,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
                     logprobs: None,
                     finish_reason: Some(finish_reason),
                     matched_stop,
+                    routed_experts: None,
                 }],
                 usage,
             };

@@ -46,6 +46,8 @@ pub(crate) struct SessionState {
     /// node.  After updating, any `leaf_hashes` entry that is no longer reachable from
     /// this map is eligible for GC.
     pub trajectory_leaves: HashMap<u64, PrefixHash>,
+    /// Per-trajectory cross-turn `routed_experts_prompt_start` offset.
+    pub trajectory_re_offsets: HashMap<u64, u32>,
     /// Maximum number of trailing boundary tokens that may be trimmed per non-last turn
     /// during training data construction.  `0` means no trimming is allowed (identity adapter
     /// such as `DefaultAdapter`).  Set once from the model adapter; `1` for Qwen3 and GLM4.7.
@@ -61,6 +63,7 @@ impl SessionState {
             entries: HashMap::new(),
             leaf_hashes: HashSet::new(),
             trajectory_leaves: HashMap::new(),
+            trajectory_re_offsets: HashMap::new(),
             max_trim_tokens: 0,
             gc_threshold: 0,
         }
@@ -74,6 +77,48 @@ pub struct TurnRecord {
     pub output_logprobs: Option<Vec<(f32, u32)>>,
     pub finish_reason: String,
     pub mismatch_report: Vec<MismatchEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<TurnRoutedExperts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight_version: Option<String>,
+}
+
+/// Compact NumPy-style dtype descriptor for TITO-tracked routed-experts.
+/// Mirrors the gateway-side `RoutedExpertsDtype` enum so converting between
+/// the two is a `match`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum TurnRoutedExpertsDtype {
+    U8,
+    U16,
+}
+
+impl TurnRoutedExpertsDtype {
+    /// Bytes per element.
+    pub const fn size(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+        }
+    }
+
+    /// String form mirroring `numpy.dtype.str` (used in JSON exports).
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            Self::U8 => "uint8",
+            Self::U16 => "uint16",
+        }
+    }
+}
+
+/// Routed-experts payload attached to a single turn record.
+#[derive(Clone, Debug, Serialize)]
+pub struct TurnRoutedExperts {
+    #[serde(skip)]
+    pub data: Arc<Vec<u8>>,
+    pub num_layers: u32,
+    pub top_k: u32,
+    pub dtype: TurnRoutedExpertsDtype,
+    pub prompt_start: u32,
 }
 
 /// A single mismatch between TITO accumulated tokens and canonical retokenization.
@@ -462,6 +507,50 @@ impl TitoStore {
             })
             .collect()
     }
+
+    /// Look up the next-turn dispatch's `routed_experts_prompt_start` for
+    /// the given trajectory.  Returns 0 when the (session, trajectory) pair
+    /// is new — turn 1 captures the full prompt by default.
+    ///
+    /// Called by chat preparation before dispatching turn k.  The store
+    /// returns an *advisory* value; the caller may still override it with
+    /// a partial-rollout-injected loopback offset.
+    pub fn next_routed_experts_prompt_start(
+        &self,
+        session_id: &str,
+        trajectory_id: u64,
+    ) -> u32 {
+        let Some(arc) = self.get_session_arc(session_id) else {
+            return 0;
+        };
+        let state = arc.lock();
+        state
+            .trajectory_re_offsets
+            .get(&trajectory_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record the position upper-bound captured by this turn so the next
+    /// turn can pick up where it left off.
+    pub fn advance_routed_experts_offset(
+        &self,
+        session_id: &str,
+        trajectory_id: u64,
+        captured_upper_bound: u32,
+    ) {
+        let arc = self
+            .sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(parking_lot::Mutex::new(SessionState::new())))
+            .clone();
+        let mut state = arc.lock();
+        let slot = state
+            .trajectory_re_offsets
+            .entry(trajectory_id)
+            .or_insert(0);
+        *slot = captured_upper_bound;
+    }
 }
 
 /// Compute the hash of the prefix that ends at the second-to-last assistant turn.
@@ -601,6 +690,8 @@ mod tests {
             output_logprobs: None,
             finish_reason: finish_reason.to_string(),
             mismatch_report: vec![],
+            routed_experts: None,
+            weight_version: None,
         }
     }
 
@@ -931,6 +1022,8 @@ mod tests {
                         position: 3,
                         detail: "expected 10, got 11".to_string(),
                     }],
+                    routed_experts: None,
+                    weight_version: None,
                 },
                 &ctx,
                 0,

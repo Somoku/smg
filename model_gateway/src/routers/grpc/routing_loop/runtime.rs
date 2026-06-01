@@ -698,6 +698,20 @@ async fn dispatch_entry_with_partial_rollout(
 
     let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
 
+    if partial_state.iteration_count == 0 {
+        partial_state.first_iter_prompt_start = ctx
+            .state
+            .partial_rollout_overrides
+            .routed_experts_prompt_start
+            .unwrap_or_else(|| ctx.input.request_type.routed_experts_prompt_start());
+        partial_state.prompt_len = ctx
+            .state
+            .preparation
+            .as_ref()
+            .map(|p| p.token_ids().len() as u32)
+            .unwrap_or(0);
+    }
+
     // Snapshot `preparation` before the loop starts
     ctx.state.preparation_snapshot = ctx.state.preparation.clone();
 
@@ -769,7 +783,15 @@ async fn dispatch_entry_with_partial_rollout(
         match drained.finish_reason.as_str() {
             "stop" | "length" => {
                 // ── ROLLOUT_COMPLETED ────────────────────────────────────────
-                merge_into_partial_state(&mut partial_state, &drained);
+                if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
+                    let response = router_error::internal_error(
+                        re_err.error_code(),
+                        re_err.to_string().as_str(),
+                    );
+                    send_http_completion(completion, response);
+                    runtime.cleanup_tracking(request_id, prompt_id);
+                    return;
+                }
 
                 // Emit completion metrics.
                 histogram!("smg_partial_rollout_loopback_count")
@@ -782,27 +804,33 @@ async fn dispatch_entry_with_partial_rollout(
                 // Override the output_ids in the final complete frame with the
                 // full accumulated token sequence from all loopback iterations.
                 //
-                // Multi-iteration: also rewrite `output_logprobs` so the frame
-                // is internally consistent — without this, downstream TITO
-                // turn-record extraction sees `output_ids = merged` but
-                // `output_logprobs = last_iteration_only`, which surfaces in
-                // PSRL training-array construction as a "trailing trim
-                // overflow" because the per-token logprobs no longer line up
-                // with the accumulated token sequence.
-                //
-                // Single-iteration: the complete frame already carries
-                // aligned outputs from its sole iteration, so we keep the
-                // (cheaper) `set_output_ids` path. `iteration_count == 1` is
-                // guaranteed by `merge_into_partial_state` incrementing
-                // exactly once per drained segment (including the final
-                // non-abort one).
+                // Multi-iteration *or* RE opt-in: rewrite `output_logprobs`
+                // and `routed_experts` together so the frame is internally
+                // consistent.
                 let mut complete = drained.complete;
                 let merged_token_ids = std::mem::take(&mut partial_state.token_ids);
-                if partial_state.iteration_count > 1 {
-                    complete.set_partial_rollout_outputs(
+                let needs_full_rewrite =
+                    partial_state.iteration_count > 1 || partial_state.routed_experts.is_some();
+                if needs_full_rewrite {
+                    let merged_re = partial_state
+                        .routed_experts
+                        .take()
+                        .map(|acc| acc.into_proto());
+                    if let Err(re_err) = complete.set_partial_rollout_outputs(
                         merged_token_ids,
                         partial_state.logprobs.take(),
-                    );
+                        merged_re,
+                        partial_state.prompt_len,
+                        partial_state.first_iter_prompt_start,
+                    ) {
+                        let response = router_error::internal_error(
+                            re_err.error_code(),
+                            re_err.to_string().as_str(),
+                        );
+                        send_http_completion(completion, response);
+                        runtime.cleanup_tracking(request_id, prompt_id);
+                        return;
+                    }
                 } else {
                     complete.set_output_ids(merged_token_ids);
                 }
@@ -821,7 +849,15 @@ async fn dispatch_entry_with_partial_rollout(
             }
             "abort" => {
                 // ── ROLLOUT_INTERRUPTED — loopback to newly-synced instance ──
-                merge_into_partial_state(&mut partial_state, &drained);
+                if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
+                    let response = router_error::internal_error(
+                        re_err.error_code(),
+                        re_err.to_string().as_str(),
+                    );
+                    send_http_completion(completion, response);
+                    runtime.cleanup_tracking(request_id, prompt_id);
+                    return;
+                }
                 counter!("smg_partial_rollout_abort_total").increment(1);
 
                 // Determine the instance that was just used so we can pin the
@@ -845,6 +881,19 @@ async fn dispatch_entry_with_partial_rollout(
                 // Reset ctx for the next iteration (clears workers, clients,
                 // proto_request, dispatch, load_guards, and execution_result).
                 reset_ctx_for_loopback(&mut ctx);
+
+                // Inject the loopback `routed_experts_prompt_start` override
+                // so the next iteration's vLLM `SamplingParams` only captures
+                // RE for token positions not already covered by prior
+                // iterations' segments.
+                let prompt_start_next = partial_state.first_iter_prompt_start
+                    + partial_state
+                        .routed_experts
+                        .as_ref()
+                        .map(|acc| acc.num_tokens() as u32)
+                        .unwrap_or(0);
+                ctx.state.partial_rollout_overrides.routed_experts_prompt_start =
+                    Some(prompt_start_next);
 
                 // Inject loopback routing headers so that on the next iteration
                 // `parse_routing_request_meta_from_context` picks up the hint.

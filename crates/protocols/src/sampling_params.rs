@@ -40,6 +40,7 @@ pub struct SamplingParams {
     pub no_stop_trim: Option<bool>,
     pub n: Option<u32>,
     pub sampling_seed: Option<u64>,
+    pub routed_experts_prompt_start: Option<u32>,
 }
 
 // ============================================================================

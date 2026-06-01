@@ -190,12 +190,25 @@ impl ChatResponseProcessingStage {
                     "No completion available for TITO assistant capture",
                 )
             })?;
+            let dispatched_prompt_start = ctx
+                .state
+                .partial_rollout_state
+                .as_ref()
+                .map(|s| s.first_iter_prompt_start)
+                .or(ctx
+                    .state
+                    .partial_rollout_overrides
+                    .routed_experts_prompt_start)
+                .unwrap_or_else(|| ctx.input.request_type.routed_experts_prompt_start());
+            let weight_version = dispatch.weight_version.clone();
             do_tito_capture_non_streaming(
                 Arc::clone(store),
                 &tc,
                 &tokenizer,
                 &all_completes,
                 assistant_message,
+                dispatched_prompt_start,
+                weight_version,
             );
         }
 
@@ -217,6 +230,8 @@ fn do_tito_capture_non_streaming(
     tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
     all_completes: &[ProtoGenerateComplete],
     assistant_message: &ChatCompletionMessage,
+    dispatched_prompt_start: u32,
+    weight_version: Option<String>,
 ) {
     let Some(first_complete) = all_completes.first() else {
         // Caller guarantees a non-empty `choices` list, so this is unreachable.
@@ -315,7 +330,13 @@ fn do_tito_capture_non_streaming(
         mismatch_count = mismatch_report.len(),
         "do_tito_capture_non_streaming: storing tokens"
     );
-    let turn_record = extract_turn_record(first_complete, prompt_ids.len(), mismatch_report);
+    let turn_record = extract_turn_record(
+        first_complete,
+        prompt_ids.len(),
+        dispatched_prompt_start,
+        weight_version,
+        mismatch_report,
+    );
 
     match store.store_with_hashes(
         &tito_ctx.session_id,
@@ -325,7 +346,23 @@ fn do_tito_capture_non_streaming(
         turn_record,
         tito_ctx.trajectory_id,
     ) {
-        Ok(()) => debug!(session_id = %tito_ctx.session_id, "TITO stored generation result"),
+        Ok(()) => {
+            debug!(session_id = %tito_ctx.session_id, "TITO stored generation result");
+            // Advance the trajectory's RE offset only on successful store.
+            // `prompt_token_count + completion_len - 1` is the absolute
+            // position of the last RE row vLLM emitted on this turn — the
+            // next turn must start its capture immediately *after* this
+            // boundary.
+            if !output_ids.is_empty() {
+                let captured_upper_bound =
+                    (prompt_ids.len() + output_ids.len()).saturating_sub(1) as u32;
+                store.advance_routed_experts_offset(
+                    &tito_ctx.session_id,
+                    tito_ctx.trajectory_id,
+                    captured_upper_bound,
+                );
+            }
+        }
         Err(e) => {
             warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
         }
@@ -362,10 +399,17 @@ fn build_mismatch_report(
 
 /// Build a `TurnRecord` from the selected completed generation.
 ///
-/// Extracts logprobs and finish_reason once, avoiding per-site boilerplate.
+/// Extracts logprobs, finish_reason, and routed-experts metadata once,
+/// avoiding per-site boilerplate.
+///
+/// `dispatched_prompt_start` is the absolute token position vLLM was told
+/// to start RE capture from on this turn — the same value that shipped on
+/// the wire as `SamplingParams.routed_experts_prompt_start`.
 fn extract_turn_record(
     complete: &ProtoGenerateComplete,
     prompt_token_count: usize,
+    dispatched_prompt_start: u32,
+    weight_version: Option<String>,
     mismatch_report: Vec<smg_tito::MismatchEntry>,
 ) -> smg_tito::TurnRecord {
     let output_logprobs: Vec<(f32, u32)> = complete
@@ -379,6 +423,23 @@ fn extract_turn_record(
         })
         .unwrap_or_default();
     let finish_reason = complete.finish_reason().to_string();
+    let routed_experts = complete.routed_experts().map(|re| {
+        let dtype = match re.dtype {
+            crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U8 => {
+                smg_tito::TurnRoutedExpertsDtype::U8
+            }
+            crate::routers::grpc::proto_wrapper::RoutedExpertsDtype::U16 => {
+                smg_tito::TurnRoutedExpertsDtype::U16
+            }
+        };
+        smg_tito::TurnRoutedExperts {
+            data: Arc::new(re.data.to_vec()),
+            num_layers: re.num_layers,
+            top_k: re.top_k,
+            dtype,
+            prompt_start: dispatched_prompt_start,
+        }
+    });
     smg_tito::TurnRecord {
         prompt_token_count,
         output_logprobs: if output_logprobs.is_empty() {
@@ -388,6 +449,8 @@ fn extract_turn_record(
         },
         finish_reason,
         mismatch_report,
+        routed_experts,
+        weight_version,
     }
 }
 

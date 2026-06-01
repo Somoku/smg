@@ -832,6 +832,11 @@ impl VllmEngineClient {
             sampling.n = n;
         }
 
+        // Routed-experts capture offset
+        if let Some(start) = p.routed_experts_prompt_start {
+            sampling.routed_experts_prompt_start = start;
+        }
+
         // Handle constraints (exactly one allowed)
         sampling.constraint = Self::build_single_constraint_from_plain(p)?;
 

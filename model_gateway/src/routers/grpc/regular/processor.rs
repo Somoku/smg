@@ -222,6 +222,10 @@ impl ResponseProcessor {
             finish_reason: Some(final_finish_reason_str.to_string()),
             matched_stop,
             hidden_states: None,
+            routed_experts: complete
+                .routed_experts()
+                .as_ref()
+                .and_then(utils::encode_routed_experts_for_response),
         })
     }
 
@@ -475,6 +479,10 @@ impl ResponseProcessor {
                 cached_tokens: complete.cached_tokens(),
                 e2e_latency: start_time.elapsed().as_secs_f64(),
                 matched_stop,
+                routed_experts: complete
+                    .routed_experts()
+                    .as_ref()
+                    .and_then(utils::encode_routed_experts_for_response),
             };
 
             result_array.push(GenerateResponse {
@@ -865,6 +873,10 @@ impl ResponseProcessor {
                 logprobs: None, // TODO: wire legacy LogProbs from backend token_logprobs
                 finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
                 matched_stop,
+                routed_experts: complete
+                    .routed_experts()
+                    .as_ref()
+                    .and_then(utils::encode_routed_experts_for_response),
             });
         }
 

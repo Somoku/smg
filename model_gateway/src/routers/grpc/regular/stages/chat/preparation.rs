@@ -391,6 +391,14 @@ impl ChatPreparationStage {
             parent_hash,
         });
 
+        // The gateway picks `prompt_start` for every turn from the
+        // trajectory's RE offset store, so each turn captures only
+        // the *new* token positions appended since the previous turn.
+        let re_prompt_start =
+            store.next_routed_experts_prompt_start(&session_id, trajectory_id);
+        ctx.state.partial_rollout_overrides.routed_experts_prompt_start =
+            Some(re_prompt_start);
+
         let prefix_match = match lookup.matched {
             Some(pm) => {
                 debug!(

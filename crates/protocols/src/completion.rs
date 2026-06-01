@@ -251,6 +251,9 @@ pub struct CompletionChoice {
     /// Information about which stop condition was matched
     #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_stop: Option<Value>, // Can be string or integer
+    /// Base64-encoded numpy `.npy` bytes for routed experts (MoE only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -273,4 +276,7 @@ pub struct CompletionStreamChoice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logprobs: Option<LogProbs>,
     pub finish_reason: Option<String>,
+    /// Only attached on the terminal stream chunk; intermediate chunks are `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routed_experts: Option<String>,
 }

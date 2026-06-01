@@ -21,6 +21,7 @@ pub mod model_card;
 pub mod model_type;
 pub mod models;
 pub mod multipart;
+pub mod npy;
 pub mod parser;
 pub mod realtime_conversation;
 pub mod realtime_events;

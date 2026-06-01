@@ -77,6 +77,31 @@ impl std::fmt::Display for RequestType {
     }
 }
 
+impl RequestType {
+    /// User-supplied `routed_experts_prompt_start`, read from the request's
+    /// sampling parameters.  Defaults to 0 when the field is absent.
+    ///
+    /// Only the vLLM-native [`GenerateRequest`] exposes this knob via its nested
+    /// [`SamplingParams`]; OpenAI-shaped chat/completion requests have no
+    /// equivalent and always return 0 here, relying on TITO
+    /// auto-management for non-zero values.
+    pub fn routed_experts_prompt_start(&self) -> u32 {
+        match self {
+            Self::Generate(req) => req
+                .sampling_params
+                .as_ref()
+                .and_then(|p| p.routed_experts_prompt_start)
+                .unwrap_or(0),
+            Self::Chat(_)
+            | Self::Completion(_)
+            | Self::Responses(_)
+            | Self::Embedding(_)
+            | Self::Classify(_)
+            | Self::Messages(_) => 0,
+        }
+    }
+}
+
 impl std::fmt::Display for FinalResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -140,8 +165,30 @@ pub(crate) struct ProcessingState {
     /// Accumulated partial-rollout state across loopback iterations.
     pub partial_rollout_state: Option<PartialRolloutState>,
 
+    /// Per-loopback overrides injected by `dispatch_entry_with_partial_rollout`
+    /// into the next iteration's backend request build.  Empty on iter 1; the
+    /// abort branch populates it before re-dispatch so vLLM only captures
+    /// routed experts for *new* token positions.
+    pub partial_rollout_overrides: PartialRolloutOverrides,
+
     /// TITO context (set once in preparation, reused in response processing)
     pub tito_context: Option<TitoRequestContext>,
+}
+
+/// Sampling-parameter overrides applied on the next loopback dispatch.
+///
+/// Kept as a small `Default`-able struct so adding future per-iteration
+/// override knobs (e.g., for cooperative aborts on different signals) does
+/// not churn `ProcessingState` shape.
+/// 
+/// All fields are `None` outside the PSRL loopback branch and on iter 1.
+#[derive(Default, Debug, Clone)]
+pub(crate) struct PartialRolloutOverrides {
+    /// Set by `dispatch_entry_with_partial_rollout`'s abort branch
+    /// using `first_iter_prompt_start + accumulator.num_tokens()`
+    /// so vLLM does not re-capture RE for tokens already covered by prior
+    /// iterations.
+    pub routed_experts_prompt_start: Option<u32>,
 }
 
 /// Output from preparation stage (Step 1)

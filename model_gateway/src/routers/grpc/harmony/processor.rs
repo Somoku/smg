@@ -118,6 +118,7 @@ impl HarmonyResponseProcessor {
                 finish_reason: Some(finish_reason),
                 matched_stop,
                 hidden_states: None,
+                routed_experts: None,
             });
         }
 

@@ -5,6 +5,7 @@ mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
+mod routed_experts;
 pub(crate) mod tonic_ext;
 
 // Re-export all public items so consumer imports stay unchanged.
@@ -24,3 +25,4 @@ pub(crate) use parsers::{
     create_tool_parser, extract_thinking_from_kwargs, get_reasoning_parser, get_tool_parser,
     should_mark_reasoning_started,
 };
+pub(crate) use routed_experts::encode_routed_experts_for_response;

@@ -1075,6 +1075,7 @@ impl ChatResponseAccumulator {
                 logprobs: None,
                 matched_stop: None,
                 hidden_states: None,
+                routed_experts: None,
             }])
             .maybe_usage(self.usage)
             .build()

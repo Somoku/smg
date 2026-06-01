@@ -74,6 +74,10 @@ message SamplingParams {
   map<int32, float> logit_bias = 26;  // Token ID to bias mapping (-100 to 100)
   optional int32 truncate_prompt_tokens = 27;  // Prompt truncation (-1 for model max)
 
+  // Routed-experts capture: skip the first N prompt tokens from the
+  // returned routing data.
+  uint32 routed_experts_prompt_start = 28;
+
   // Structured outputs (one of) - matches vLLM's StructuredOutputsParams
   oneof constraint {
     string json_schema = 16;  // JSON schema for structured output
@@ -208,6 +212,30 @@ message TopLogProbs {
 }
 
 // =====================
+// Routed Experts (MoE)
+// =====================
+
+// Compact MoE expert routing tensor.
+//
+// Layout is C-contiguous, shape [num_tokens, num_layers, top_k]; num_tokens
+// is implicit (data.len() / (num_layers * top_k * dtype_size)).
+//
+// vLLM produces this only on `finished=True` (including finish_reason="abort"),
+// so it appears only on `GenerateComplete`, not on streaming chunks.
+//
+// Tokens correspond to absolute token positions [prompt_start, total_tokens - 1]
+// in the dispatched sequence.  The last sampled token has no RE because it is
+// not forwarded.
+message RoutedExpertsTensor {
+  bytes  data        = 1;   // raw little-endian bytes (numpy .tobytes())
+  uint32 num_layers  = 2;
+  uint32 top_k       = 3;
+  // "uint8" (num_experts ≤ 256) or "uint16".  Future: "uint32".
+  string dtype       = 4;
+  uint32 index       = 5;   // sequence index for n>1; default 0
+}
+
+// =====================
 // Generate Response
 // =====================
 
@@ -255,6 +283,11 @@ message GenerateComplete {
     uint32 matched_token_id = 10;
     string matched_stop_str = 11;
   }
+
+  // Routed experts captured by the MoE worker, aligned to absolute token
+  // positions [routed_experts_prompt_start, prompt_len + completion_len - 1].
+  // Present only when the engine was started with --enable-return-routed-experts.
+  RoutedExpertsTensor routed_experts = 12;
 }
 
 // =====================

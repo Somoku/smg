@@ -189,6 +189,207 @@ pub struct ProtoTopLogProbs {
     pub token_ids: Vec<u32>,
 }
 
+// =====================
+// Routed Experts (MoE)
+// =====================
+
+/// dtype of the routed-experts tensor.  Picked by the worker based on
+/// `num_experts` (uint8 fits ≤256 distinct experts; uint16 covers up to 65536).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RoutedExpertsDtype {
+    U8,
+    U16,
+}
+
+impl RoutedExpertsDtype {
+    /// Bytes per element.
+    pub const fn size(self) -> usize {
+        match self {
+            Self::U8 => 1,
+            Self::U16 => 2,
+        }
+    }
+
+    /// Parse the wire dtype string (matches `str(numpy.dtype)`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "uint8" | "|u1" => Some(Self::U8),
+            "uint16" | "<u2" => Some(Self::U16),
+            _ => None,
+        }
+    }
+
+    /// String form written back into proto / npy headers.
+    pub const fn wire_str(self) -> &'static str {
+        match self {
+            Self::U8 => "uint8",
+            Self::U16 => "uint16",
+        }
+    }
+
+    /// `openai_protocol::npy::NpyDtype` for npy serialisation.
+    pub const fn as_npy(self) -> openai_protocol::npy::NpyDtype {
+        match self {
+            Self::U8 => openai_protocol::npy::NpyDtype::U8,
+            Self::U16 => openai_protocol::npy::NpyDtype::U16,
+        }
+    }
+}
+
+/// Compact (num_layers, top_k, dtype) shape descriptor used for cross-iteration
+/// compatibility checks during partial-rollout merge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProtoRoutedExpertsShape {
+    pub num_layers: u32,
+    pub top_k: u32,
+    pub dtype: RoutedExpertsDtype,
+    pub index: u32,
+}
+
+/// Backend-neutral routed-experts payload.
+///
+/// Layout: C-contiguous bytes whose row stride is
+/// `num_layers * top_k * dtype.size()`.  `data` uses `bytes::Bytes` so cloning
+/// in fan-out (e.g., partial rollout accumulator + final formatter) is
+/// reference-counted; the only unavoidable copy is the `extend_from_slice`
+/// performed when extending the gateway-side accumulator.
+#[derive(Clone, Debug)]
+pub struct ProtoRoutedExperts {
+    pub data: bytes::Bytes,
+    pub num_layers: u32,
+    pub top_k: u32,
+    pub dtype: RoutedExpertsDtype,
+    /// Sequence index for n>1.  Defaults to 0 for single-sequence requests.
+    pub index: u32,
+}
+
+impl ProtoRoutedExperts {
+    /// Construct from the proto wire type.
+    /// Returns `None` if `dtype` is unrecognised or `data` is empty.
+    pub fn from_proto(p: &vllm::RoutedExpertsTensor) -> Option<Self> {
+        if p.data.is_empty() {
+            return None;
+        }
+        let dtype = RoutedExpertsDtype::parse(&p.dtype)?;
+        Some(Self {
+            data: bytes::Bytes::copy_from_slice(&p.data),
+            num_layers: p.num_layers,
+            top_k: p.top_k,
+            dtype,
+            index: p.index,
+        })
+    }
+
+    /// Convert to wire form
+    pub fn into_proto(self) -> vllm::RoutedExpertsTensor {
+        vllm::RoutedExpertsTensor {
+            data: self.data.to_vec(),
+            num_layers: self.num_layers,
+            top_k: self.top_k,
+            dtype: self.dtype.wire_str().to_owned(),
+            index: self.index,
+        }
+    }
+
+    /// Bytes per token (constant across iterations of the same request).
+    pub const fn token_bytes(&self) -> usize {
+        self.num_layers as usize * self.top_k as usize * self.dtype.size()
+    }
+
+    /// Number of tokens in the tensor (= number of token positions covered).
+    pub fn num_tokens(&self) -> usize {
+        let r = self.token_bytes();
+        if r == 0 {
+            0
+        } else {
+            self.data.len() / r
+        }
+    }
+
+    /// Shape descriptor for cross-iteration compatibility checks.
+    pub const fn shape(&self) -> ProtoRoutedExpertsShape {
+        ProtoRoutedExpertsShape {
+            num_layers: self.num_layers,
+            top_k: self.top_k,
+            dtype: self.dtype,
+            index: self.index,
+        }
+    }
+
+    /// Whether `other` is shape-compatible so its tokens can be appended to
+    /// an accumulator seeded by `self`.
+    pub fn shape_compatible(&self, other: &Self) -> bool {
+        self.shape() == other.shape()
+    }
+}
+
+/// Errors raised by the partial-rollout merge / final-frame setter when
+/// the gateway-side routed-experts contract is violated.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RoutedExpertsError {
+    #[error(
+        "routed_experts shape mismatch: accumulator={accumulator:?}, segment={segment:?}"
+    )]
+    ShapeMismatch {
+        accumulator: ProtoRoutedExpertsShape,
+        segment: ProtoRoutedExpertsShape,
+    },
+
+    #[error(
+        "routed_experts late arrival: {prior_completion_tokens} prior tokens were emitted \
+         without RE; cannot backfill prompt segment, current segment has {current_segment_tokens} tokens"
+    )]
+    LateArrival {
+        prior_completion_tokens: usize,
+        current_segment_tokens: usize,
+    },
+
+    #[error(
+        "routed_experts missing segment: accumulator has {accumulator_tokens_so_far} tokens but \
+         iteration produced {tokens_in_segment} tokens with no RE"
+    )]
+    MissingSegment {
+        accumulator_tokens_so_far: usize,
+        tokens_in_segment: usize,
+    },
+
+    #[error(
+        "routed_experts alignment mismatch: actual={actual} expected={expected} \
+         (prompt_len={prompt_len}, first_iter_prompt_start={first_iter_prompt_start}, \
+          completion_len={completion_len})"
+    )]
+    AlignmentMismatch {
+        actual: usize,
+        expected: usize,
+        prompt_len: u32,
+        first_iter_prompt_start: u32,
+        completion_len: usize,
+    },
+}
+
+impl RoutedExpertsError {
+    /// Stable error_code emitted in HTTP responses and metric labels.
+    pub const fn error_code(&self) -> &'static str {
+        match self {
+            Self::ShapeMismatch { .. } => "routed_experts_shape_mismatch",
+            Self::LateArrival { .. } => "routed_experts_late_arrival",
+            Self::MissingSegment { .. } => "routed_experts_missing_segment",
+            Self::AlignmentMismatch { .. } => "routed_experts_alignment_mismatch",
+        }
+    }
+
+    /// Metric `reason` label without the `routed_experts_` prefix.
+    pub const fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::ShapeMismatch { .. } => "shape_mismatch",
+            Self::LateArrival { .. } => "late_arrival",
+            Self::MissingSegment { .. } => "missing_segment",
+            Self::AlignmentMismatch { .. } => "alignment_mismatch",
+        }
+    }
+}
+
 /// Unified input (prompt) logprobs
 #[derive(Clone, Debug)]
 pub struct ProtoInputLogProbs {
@@ -398,6 +599,26 @@ impl ProtoGenerateRequest {
             Self::Sglang(req) => req.stream = stream,
             Self::Trtllm(req) => req.streaming = stream,
             Self::Mlx(req) => req.stream = stream,
+        }
+    }
+
+    /// Override the vLLM `routed_experts_prompt_start` SamplingParam in-place.
+    pub fn set_routed_experts_prompt_start(&mut self, prompt_start: u32) {
+        match self {
+            Self::Vllm(req) => {
+                if let Some(ref mut params) = req.sampling_params {
+                    params.routed_experts_prompt_start = prompt_start;
+                } else {
+                    req.sampling_params = Some(vllm::SamplingParams {
+                        routed_experts_prompt_start: prompt_start,
+                        ..Default::default()
+                    });
+                }
+            }
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+                // Non-vLLM backends do not capture routed experts; silently
+                // ignore (keeps the call site backend-agnostic).
+            }
         }
     }
 
@@ -850,8 +1071,9 @@ impl ProtoGenerateComplete {
         }
     }
 
-    /// Override `output_ids` *and* `output_logprobs` with the accumulated
-    /// partial-rollout sequence in a single, internally-consistent write.
+    /// Override `output_ids`, `output_logprobs`, and `routed_experts`
+    /// of the terminal complete frame so it is fully
+    /// internally-consistent after partial-rollout merge.
     ///
     /// Without this, downstream consumers (TITO turn-record extraction,
     /// OpenAI `ChatLogProbs` payload building) would observe a complete frame
@@ -859,13 +1081,13 @@ impl ProtoGenerateComplete {
     /// still reflects only the *last* loopback iteration — a misalignment that
     /// surfaces in PSRL as a TITO trim overflow on the next turn.
     ///
-    /// Length contract: `logprobs.len() == token_ids.len()` when `logprobs` is
-    /// `Some(_)`. On mismatch the logprobs are dropped to keep the frame
-    /// strictly aligned (mirrors `merge_into_partial_state`'s "prefer no
-    /// logprobs over misaligned ones" policy). When `logprobs` is `None` the
-    /// existing `output_logprobs` is also cleared so downstream code never
-    /// observes a stale, last-iteration-only logprobs vector alongside the
-    /// merged token IDs.
+    /// # Length contracts
+    ///
+    /// - `logprobs`: `len() == token_ids.len()` when `Some(_)`; on mismatch
+    ///   the logprobs are dropped
+    /// - `routed_experts`:
+    ///     `num_tokens() == (prompt_len - first_iter_prompt_start) + token_ids.len() - 1`
+    ///   On violation returns `Err(RoutedExpertsError::AlignmentMismatch)`.
     ///
     /// `top_logprobs` is reset to per-position empty entries because the
     /// partial-rollout drain only retains per-sample `(logprob, token_id)`
@@ -876,11 +1098,15 @@ impl ProtoGenerateComplete {
         &mut self,
         token_ids: Vec<u32>,
         logprobs: Option<Vec<f32>>,
-    ) {
-        // Drop logprobs that are missing or misaligned with `token_ids` —
-        // mirrors `merge_into_partial_state`'s "prefer no logprobs over
-        // misaligned ones" policy.
-        let token_logprobs = logprobs.filter(|lp| lp.len() == token_ids.len());
+        routed_experts: Option<ProtoRoutedExperts>,
+        prompt_len: u32,
+        first_iter_prompt_start: u32,
+    ) -> Result<(), RoutedExpertsError> {
+        let completion_len = token_ids.len();
+
+        // ── output_logprobs ──────────────────────────────────────────────
+        // Drop logprobs that are missing or misaligned with `token_ids`.
+        let token_logprobs = logprobs.filter(|lp| lp.len() == completion_len);
 
         if let Some(token_logprobs) = token_logprobs {
             let token_ids_for_logprobs = token_ids.clone();
@@ -928,6 +1154,7 @@ impl ProtoGenerateComplete {
             }
         }
 
+        // ── output_ids ───────────────────────────────────────────────────
         // Move `token_ids` into the top-level slot last, so the backing
         // allocation transfers without an extra copy.
         match self {
@@ -935,6 +1162,47 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.output_ids = token_ids,
             Self::Trtllm(c) => c.output_token_ids = token_ids,
             Self::Mlx(c) => c.output_ids = token_ids,
+        }
+
+        // ── routed_experts ───────────────────────────────────────────────
+        let prompt_tokens = prompt_len.saturating_sub(first_iter_prompt_start) as usize;
+        let expected = prompt_tokens
+            .saturating_add(completion_len)
+            .saturating_sub(1);
+
+        match routed_experts {
+            Some(re) if re.num_tokens() == expected => {
+                self.set_routed_experts(Some(re));
+                Ok(())
+            }
+            Some(re) => Err(RoutedExpertsError::AlignmentMismatch {
+                actual: re.num_tokens(),
+                expected,
+                prompt_len,
+                first_iter_prompt_start,
+                completion_len,
+            }),
+            None => {
+                // Engine isn't capturing RE (or produced 0 completion tokens);
+                // both are legitimate terminal states.
+                self.set_routed_experts(None);
+                Ok(())
+            }
+        }
+    }
+
+    /// Get routed experts
+    pub fn routed_experts(&self) -> Option<ProtoRoutedExperts> {
+        match self {
+            Self::Vllm(c) => c.routed_experts.as_ref().and_then(ProtoRoutedExperts::from_proto),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+        }
+    }
+
+    /// Overwrite routed experts
+    pub fn set_routed_experts(&mut self, re: Option<ProtoRoutedExperts>) {
+        if let Self::Vllm(c) = self {
+            c.routed_experts = re.map(ProtoRoutedExperts::into_proto);
         }
     }
 

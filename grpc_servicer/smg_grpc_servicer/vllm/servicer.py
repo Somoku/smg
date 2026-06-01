@@ -14,6 +14,7 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 
 import grpc
+import numpy as np
 import torch
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
@@ -674,6 +675,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # detokenize must be True if stop strings are used
             detokenize=bool(stop),
             output_kind=RequestOutputKind.DELTA if stream else RequestOutputKind.FINAL_ONLY,
+            routed_experts_prompt_start=params.routed_experts_prompt_start,
         )
 
     @staticmethod
@@ -688,6 +690,50 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 top.token_ids.append(tid)
                 top.values.append(lp.logprob)
         return top
+
+    @staticmethod
+    def _build_routed_experts_tensor(
+        routed_experts: "np.ndarray | None",
+        index: int = 0,
+    ) -> "vllm_engine_pb2.RoutedExpertsTensor | None":
+        """Convert vLLM's routed_experts ndarray into the proto tensor.
+
+        vLLM populates ``CompletionOutput.routed_experts`` only on
+        ``finished=True`` (including the abort path); it is an
+        ``np.ndarray`` of shape ``[num_tokens, num_layers, top_k]`` with
+        dtype ``uint8``/``uint16``, C-contiguous (built from
+        ``np.concatenate(..., axis=0)`` over per-step chunks).
+
+        We pass the raw bytes through a single ``.tobytes()`` call so the
+        proto carries the layout exactly as the GPU produced it; the SMG
+        gateway and downstream trainers reuse the same ``np.frombuffer``/
+        ``np.load`` decoders without reshaping.  Returns ``None`` for
+        engines started without ``--enable-return-routed-experts`` (the
+        attribute is absent or ``None``) and for empty arrays.
+        """
+        if routed_experts is None:
+            return None
+        # Defensive: the engine should never hand us a 0-row array, but
+        # guard anyway so the gateway sees a missing field rather than an
+        # empty-but-present payload.
+        if getattr(routed_experts, "size", 0) == 0:
+            return None
+        if routed_experts.ndim != 3:
+            logger.warning(
+                "routed_experts has unexpected ndim=%d; dropping",
+                routed_experts.ndim,
+            )
+            return None
+        if not routed_experts.flags["C_CONTIGUOUS"]:
+            routed_experts = np.ascontiguousarray(routed_experts)
+        _, num_layers, top_k = routed_experts.shape
+        return vllm_engine_pb2.RoutedExpertsTensor(
+            data=routed_experts.tobytes(),
+            num_layers=int(num_layers),
+            top_k=int(top_k),
+            dtype=str(routed_experts.dtype),
+            index=int(index),
+        )
 
     @staticmethod
     def _build_output_logprobs(
@@ -911,6 +957,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             else:
                 stop_kwargs["matched_stop_str"] = str(completion.stop_reason)
 
+        routed_experts_kwargs = {}
+        re_tensor = VllmEngineServicer._build_routed_experts_tensor(
+            getattr(completion, "routed_experts", None),
+            index=completion.index,
+        )
+        if re_tensor is not None:
+            routed_experts_kwargs["routed_experts"] = re_tensor
+
         # Build complete response
         # When streaming (DELTA mode): completion.token_ids will be empty/last delta
         # When non-streaming (FINAL_ONLY mode): completion.token_ids has all tokens
@@ -927,5 +981,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 index=completion.index,
                 kv_transfer_params=kv_transfer_params,
                 **stop_kwargs,
+                **routed_experts_kwargs,
             ),
         )

@@ -427,6 +427,7 @@ impl HarmonyStreamingProcessor {
                     logprobs,
                     finish_reason: None,
                     matched_stop: None,
+                    routed_experts: None,
                 })
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();

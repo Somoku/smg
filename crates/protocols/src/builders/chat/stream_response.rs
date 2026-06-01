@@ -114,6 +114,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -137,6 +138,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -154,6 +156,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -184,6 +187,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -201,6 +205,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -231,6 +236,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -253,6 +259,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         });
         self
     }
@@ -276,6 +283,7 @@ impl ChatCompletionStreamResponseBuilder {
             logprobs: None,
             finish_reason: Some(finish_reason.into()),
             matched_stop,
+            routed_experts: None,
         });
         self
     }

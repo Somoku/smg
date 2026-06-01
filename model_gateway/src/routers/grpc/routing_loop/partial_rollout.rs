@@ -11,31 +11,154 @@
 //! 2. After each execution, `drain_stream_for_partial_rollout` consumes the
 //!    raw gRPC stream into a `DrainedStreamResult`.
 //! 3. If `finish_reason == "abort"`:
-//!    - `merge_into_partial_state` appends the new tokens to
-//!      `PartialRolloutState`.
+//!    - `merge_into_partial_state` appends the new tokens to `PartialRolloutState`.
 //!    - `reset_ctx_for_loopback` rebuilds `ctx` for the next iteration.
 //! 4. Otherwise the loop exits and the caller forwards the result to the client.
+//!
+//! # Routed experts contract
+//!
+//! When the request opted in to `return_routed_experts`, every iteration's
+//! `Complete` frame carries a `routed_experts` segment whose token count equals
+//! `(prompt_len_iter - prompt_start_iter) + completion_len_iter - 1` (the
+//! `-1` accounts for the final sampled token having no captured RE — vLLM
+//! invariant).  Across loopback iterations the segments are concatenated
+//! rather than overlapped:
+//!     (`prompt_start_iter_{k+1} = first_iter_prompt_start + accumulator.num_tokens()`)
+//! ensures vLLM only captures *new* positions on each restart.
+//! The merge logic in this module is therefore a pure append;
+//! misalignments / late-arrival / shape changes are bug paths
+//! and surface as fail-hard `RoutedExpertsError`.
 
 use tracing::warn;
 
 use crate::routers::grpc::{
     context::RequestContext,
-    proto_wrapper::{ProtoGenerateComplete, ProtoResponseVariant, ProtoStream},
+    proto_wrapper::{
+        ProtoGenerateComplete, ProtoResponseVariant, ProtoRoutedExperts, ProtoRoutedExpertsShape,
+        ProtoStream, RoutedExpertsDtype, RoutedExpertsError,
+    },
 };
 
-/// Accumulated token state carried across partial-rollout loopback iterations.
-#[derive(Debug, Clone, Default)]
+/// Append-only accumulator for routed-experts bytes across loopback iterations.
+#[derive(Debug, Clone)]
+pub(crate) struct RoutedExpertsAccumulator {
+    pub data: Vec<u8>,
+    pub num_layers: u32,
+    pub top_k: u32,
+    pub dtype: RoutedExpertsDtype,
+    pub index: u32,
+}
+
+impl RoutedExpertsAccumulator {
+    /// Seed the accumulator from the first non-empty segment.
+    pub fn from_segment(seg: &ProtoRoutedExperts, capacity_hint_bytes: usize) -> Self {
+        let cap = capacity_hint_bytes.max(seg.data.len());
+        let mut data = Vec::with_capacity(cap);
+        data.extend_from_slice(&seg.data);
+        Self {
+            data,
+            num_layers: seg.num_layers,
+            top_k: seg.top_k,
+            dtype: seg.dtype,
+            index: seg.index,
+        }
+    }
+
+    #[inline]
+    pub const fn token_bytes(&self) -> usize {
+        self.num_layers as usize * self.top_k as usize * self.dtype.size()
+    }
+
+    /// Number of tokens (= token positions covered) accumulated so far.
+    #[inline]
+    pub fn num_tokens(&self) -> usize {
+        let r = self.token_bytes();
+        if r == 0 {
+            0
+        } else {
+            self.data.len() / r
+        }
+    }
+
+    /// Shape descriptor used in error reporting.
+    #[inline]
+    pub const fn shape(&self) -> ProtoRoutedExpertsShape {
+        ProtoRoutedExpertsShape {
+            num_layers: self.num_layers,
+            top_k: self.top_k,
+            dtype: self.dtype,
+            index: self.index,
+        }
+    }
+
+    /// Whether `seg` is shape-compatible with the accumulator and can be
+    /// appended in-place.
+    #[inline]
+    pub fn shape_compatible(&self, seg: &ProtoRoutedExperts) -> bool {
+        self.num_layers == seg.num_layers
+            && self.top_k == seg.top_k
+            && self.dtype == seg.dtype
+            && self.index == seg.index
+    }
+
+    /// Convert into a wire-form `ProtoRoutedExperts` for terminal-frame rewrite.
+    pub fn into_proto(self) -> ProtoRoutedExperts {
+        ProtoRoutedExperts {
+            data: bytes::Bytes::from(self.data),
+            num_layers: self.num_layers,
+            top_k: self.top_k,
+            dtype: self.dtype,
+            index: self.index,
+        }
+    }
+}
+
+/// Accumulated state carried across partial-rollout loopback iterations.
+#[derive(Debug, Clone)]
 pub(crate) struct PartialRolloutState {
     /// All output token IDs accumulated so far across every loopback iteration.
     pub token_ids: Vec<u32>,
     /// Per-token log-probabilities, parallel to `token_ids`.
-    /// `None` if the backend did not return log-prob data in any iteration.
+    /// `None` if any iteration did not return log-prob data.
     pub logprobs: Option<Vec<f32>>,
+    /// Routed-experts accumulator.  `None` when the request did not opt in,
+    /// or before the first iteration that produces a non-empty RE segment.
+    pub routed_experts: Option<RoutedExpertsAccumulator>,
     /// Number of loopback iterations completed so far (excluding the final one).
     ///
     /// Incremented by `merge_into_partial_state` on each `"abort"` cycle.
     /// At completion this equals the number of PS weight-sync interruptions.
     pub iteration_count: u32,
+
+    // ─── Routed-experts metadata (immutable across loopback) ───────────
+    /// Original prompt length at iter 1 dispatch time, before any loopback
+    /// augmented the prompt with accumulated completion tokens.
+    pub prompt_len: u32,
+    /// `routed_experts_prompt_start` from the very first iteration's request
+    /// (default 0 when not supplied).  Captured once at iter 1 entry and
+    /// never overwritten.  Used both as the first-iter dispatch
+    /// `prompt_start` and as the offset baseline for the loopback formula
+    /// `prompt_start_iter_{k+1} = first_iter_prompt_start + accumulator.num_tokens()`.
+    pub first_iter_prompt_start: u32,
+    /// Capacity hint bytes for the RE accumulator, sized once at dispatch
+    /// from `(prompt_len + max_new_tokens - first_iter_prompt_start) * token_bytes`.
+    /// Avoids reallocations on long rollouts.  `0` when the request did not
+    /// opt in to RE.
+    pub expected_final_re_bytes: usize,
+}
+
+impl Default for PartialRolloutState {
+    fn default() -> Self {
+        Self {
+            token_ids: Vec::new(),
+            logprobs: None,
+            routed_experts: None,
+            iteration_count: 0,
+            prompt_len: 0,
+            first_iter_prompt_start: 0,
+            expected_final_re_bytes: 0,
+        }
+    }
 }
 
 impl PartialRolloutState {
@@ -52,6 +175,8 @@ pub(crate) struct DrainedStreamResult {
     pub new_token_ids: Vec<u32>,
     /// New per-token log-probabilities for this segment (if available).
     pub new_logprobs: Option<Vec<f32>>,
+    /// Routed-experts segment from this iteration's `Complete` frame.
+    pub new_routed_experts: Option<ProtoRoutedExperts>,
     /// The finish reason from the `Complete` frame.
     ///
     /// `"abort"` → PS weight-sync interrupted generation (loopback needed).
@@ -94,9 +219,11 @@ pub(crate) async fn drain_stream_for_partial_rollout(
                     new_token_ids = complete.output_ids().to_vec();
                 }
                 let finish_reason = complete.finish_reason().to_owned();
+                let new_routed_experts = complete.routed_experts();
                 return Ok(DrainedStreamResult {
                     new_token_ids,
                     new_logprobs,
+                    new_routed_experts,
                     finish_reason,
                     complete,
                 });
@@ -109,15 +236,11 @@ pub(crate) async fn drain_stream_for_partial_rollout(
 }
 
 /// Append the tokens from `drained` into `state`.
-///
-/// If `state` already contains log-probs and the new segment also has them,
-/// they are appended.  If only one side has log-probs, the mismatch is logged
-/// and the log-prob field is dropped to keep `token_ids` and `logprobs`
-/// always in sync.
 pub(crate) fn merge_into_partial_state(
     state: &mut PartialRolloutState,
     drained: &DrainedStreamResult,
-) {
+) -> Result<(), RoutedExpertsError> {
+    let prior_completion = state.token_ids.len();
     state.token_ids.extend_from_slice(&drained.new_token_ids);
     state.iteration_count += 1;
 
@@ -130,10 +253,79 @@ pub(crate) fn merge_into_partial_state(
         (Some(_), None) => {
             // Previous iterations had log-probs but this one didn't — drop them
             // to keep the vecs in sync.
-            warn!("partial rollout merge: log-prob mismatch (had logprobs, new segment missing); dropping logprobs");
+            warn!(
+                "partial rollout merge: log-prob mismatch (had logprobs, new segment missing); \
+                 dropping logprobs"
+            );
             state.logprobs = None;
         }
         _ => {}
+    }
+
+    let seg = drained.new_routed_experts.as_ref();
+    let no_new_tokens = drained.new_token_ids.is_empty();
+
+    match (state.routed_experts.as_mut(), seg) {
+        // Aborted before any forward; recoverable.
+        (_, None) if no_new_tokens => {
+            metrics::counter!(
+                "smg_routed_experts_recoverable_total",
+                "reason" => "early_abort",
+            )
+            .increment(1);
+            Ok(())
+        }
+        // Append into existing accumulator.
+        (Some(acc), Some(seg)) => {
+            if !acc.shape_compatible(seg) {
+                metrics::counter!(
+                    "smg_routed_experts_failed_total",
+                    "reason" => "shape_mismatch",
+                )
+                .increment(1);
+                return Err(RoutedExpertsError::ShapeMismatch {
+                    accumulator: acc.shape(),
+                    segment: seg.shape(),
+                });
+            }
+            acc.data.extend_from_slice(&seg.data);
+            Ok(())
+        }
+        // First time we see an RE segment.
+        (None, Some(seg)) => {
+            if prior_completion > 0 {
+                metrics::counter!(
+                    "smg_routed_experts_failed_total",
+                    "reason" => "late_arrival",
+                )
+                .increment(1);
+                return Err(RoutedExpertsError::LateArrival {
+                    prior_completion_tokens: prior_completion,
+                    current_segment_tokens: seg.num_tokens(),
+                });
+            }
+            state.routed_experts = Some(RoutedExpertsAccumulator::from_segment(
+                seg,
+                state.expected_final_re_bytes,
+            ));
+            Ok(())
+        }
+        // Accumulator exists but this iteration produced new tokens without
+        // RE — bug path.
+        (Some(acc), None) => {
+            metrics::counter!(
+                "smg_routed_experts_failed_total",
+                "reason" => "missing_segment",
+            )
+            .increment(1);
+            Err(RoutedExpertsError::MissingSegment {
+                accumulator_tokens_so_far: acc.num_tokens(),
+                tokens_in_segment: drained.new_token_ids.len(),
+            })
+        }
+        // No accumulator, no segment, new tokens emitted: engine simply
+        // isn't capturing RE for this request — no error.
+        (None, None) => Ok(()),
     }
 }
 
@@ -179,8 +371,7 @@ mod tests {
     fn response_token_count_with_tokens() {
         let state = PartialRolloutState {
             token_ids: vec![1, 2, 3],
-            logprobs: None,
-            iteration_count: 0,
+            ..PartialRolloutState::default()
         };
         assert_eq!(state.response_token_count(), 3);
     }
@@ -188,21 +379,45 @@ mod tests {
     // ─── merge_into_partial_state ────────────────────────────────────────────
 
     fn make_drained(tokens: &[u32], logprobs: Option<Vec<f32>>) -> DrainedStreamResult {
+        make_drained_full(tokens, logprobs, None, "stop")
+    }
+
+    fn make_drained_full(
+        tokens: &[u32],
+        logprobs: Option<Vec<f32>>,
+        routed_experts: Option<ProtoRoutedExperts>,
+        finish_reason: &str,
+    ) -> DrainedStreamResult {
         use smg_grpc_client::sglang_proto::GenerateComplete as SglangGenerateComplete;
 
-        use crate::routers::grpc::proto_wrapper::ProtoGenerateComplete;
-
         // We need a concrete ProtoGenerateComplete for DrainedStreamResult.
-        // Use the Sglang variant with a "stop" finish_reason.
+        // Use the Sglang variant — `merge_into_partial_state` doesn't read
+        // `complete` at all, so the variant choice is purely cosmetic.
         let complete = ProtoGenerateComplete::Sglang(SglangGenerateComplete {
-            finish_reason: "stop".to_owned(),
+            finish_reason: finish_reason.to_owned(),
             ..Default::default()
         });
         DrainedStreamResult {
             new_token_ids: tokens.to_vec(),
             new_logprobs: logprobs,
-            finish_reason: "stop".to_owned(),
+            new_routed_experts: routed_experts,
+            finish_reason: finish_reason.to_owned(),
             complete,
+        }
+    }
+
+    /// Build a synthetic RE segment whose row stride matches the given shape
+    /// and whose token count equals `num_tokens`.  Bytes are filled with `fill`
+    /// so equality checks remain meaningful across appends.
+    fn make_re(num_tokens: usize, num_layers: u32, top_k: u32, fill: u8) -> ProtoRoutedExperts {
+        let token_bytes = num_layers as usize * top_k as usize;
+        let data = vec![fill; num_tokens * token_bytes];
+        ProtoRoutedExperts {
+            data: bytes::Bytes::from(data),
+            num_layers,
+            top_k,
+            dtype: RoutedExpertsDtype::U8,
+            index: 0,
         }
     }
 
@@ -210,9 +425,10 @@ mod tests {
     fn merge_tokens_no_logprobs() {
         let mut state = PartialRolloutState::default();
         let drained = make_drained(&[10, 20, 30], None);
-        merge_into_partial_state(&mut state, &drained);
+        merge_into_partial_state(&mut state, &drained).unwrap();
         assert_eq!(state.token_ids, vec![10, 20, 30]);
         assert!(state.logprobs.is_none());
+        assert!(state.routed_experts.is_none());
     }
 
     #[test]
@@ -221,13 +437,13 @@ mod tests {
 
         // Iteration 1 — with logprobs
         let d1 = make_drained(&[1, 2], Some(vec![0.1, 0.2]));
-        merge_into_partial_state(&mut state, &d1);
+        merge_into_partial_state(&mut state, &d1).unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2]));
 
         // Iteration 2 — append
         let d2 = make_drained(&[3, 4], Some(vec![0.3, 0.4]));
-        merge_into_partial_state(&mut state, &d2);
+        merge_into_partial_state(&mut state, &d2).unwrap();
         assert_eq!(state.token_ids, vec![1, 2, 3, 4]);
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2, 0.3, 0.4]));
     }
@@ -238,10 +454,11 @@ mod tests {
             token_ids: vec![1],
             logprobs: Some(vec![0.5]),
             iteration_count: 1,
+            ..PartialRolloutState::default()
         };
         // Second segment has no logprobs → drop the accumulated ones
         let drained = make_drained(&[2], None);
-        merge_into_partial_state(&mut state, &drained);
+        merge_into_partial_state(&mut state, &drained).unwrap();
         assert_eq!(state.token_ids, vec![1, 2]);
         assert!(state.logprobs.is_none());
     }
@@ -253,11 +470,11 @@ mod tests {
         assert_eq!(state.iteration_count, 0);
 
         let d1 = make_drained(&[1], None);
-        merge_into_partial_state(&mut state, &d1);
+        merge_into_partial_state(&mut state, &d1).unwrap();
         assert_eq!(state.iteration_count, 1);
 
         let d2 = make_drained(&[2], None);
-        merge_into_partial_state(&mut state, &d2);
+        merge_into_partial_state(&mut state, &d2).unwrap();
         assert_eq!(state.iteration_count, 2);
 
         // Token accumulation is also correct
@@ -270,10 +487,10 @@ mod tests {
         let mut state = PartialRolloutState::default();
         assert_eq!(state.response_token_count(), 0);
 
-        merge_into_partial_state(&mut state, &make_drained(&[10, 20], None));
+        merge_into_partial_state(&mut state, &make_drained(&[10, 20], None)).unwrap();
         assert_eq!(state.response_token_count(), 2);
 
-        merge_into_partial_state(&mut state, &make_drained(&[30, 40, 50], None));
+        merge_into_partial_state(&mut state, &make_drained(&[30, 40, 50], None)).unwrap();
         assert_eq!(state.response_token_count(), 5);
     }
 
@@ -282,7 +499,7 @@ mod tests {
     fn merge_initialises_logprobs_from_first_segment() {
         let mut state = PartialRolloutState::default();
         let d = make_drained(&[1, 2], Some(vec![0.1, 0.2]));
-        merge_into_partial_state(&mut state, &d);
+        merge_into_partial_state(&mut state, &d).unwrap();
         assert_eq!(state.logprobs, Some(vec![0.1, 0.2]));
     }
 
@@ -290,9 +507,143 @@ mod tests {
     #[test]
     fn merge_no_logprobs_stays_none() {
         let mut state = PartialRolloutState::default();
-        merge_into_partial_state(&mut state, &make_drained(&[1], None));
-        merge_into_partial_state(&mut state, &make_drained(&[2], None));
+        merge_into_partial_state(&mut state, &make_drained(&[1], None)).unwrap();
+        merge_into_partial_state(&mut state, &make_drained(&[2], None)).unwrap();
         assert!(state.logprobs.is_none());
+    }
+
+    // ─── Routed experts merge behaviour ──────────────────────────────────
+
+    /// First iteration seeds the accumulator from a non-empty segment.
+    #[test]
+    fn re_seeds_accumulator_from_first_segment() {
+        let mut state = PartialRolloutState {
+            expected_final_re_bytes: 1024,
+            ..PartialRolloutState::default()
+        };
+        let seg = make_re(3, 2, 4, 0xAA); // 3 tokens × 8 bytes
+        let d = make_drained_full(&[1, 2, 3], None, Some(seg.clone()), "abort");
+        merge_into_partial_state(&mut state, &d).unwrap();
+
+        let acc = state.routed_experts.as_ref().expect("accumulator seeded");
+        assert_eq!(acc.num_tokens(), 3);
+        assert_eq!(acc.num_layers, 2);
+        assert_eq!(acc.top_k, 4);
+        assert_eq!(acc.dtype, RoutedExpertsDtype::U8);
+        assert!(acc.data.iter().all(|&b| b == 0xAA));
+    }
+
+    /// Two compatible segments concatenate.
+    #[test]
+    fn re_appends_compatible_segments() {
+        let mut state = PartialRolloutState::default();
+        let s1 = make_re(2, 2, 4, 0x11);
+        let s2 = make_re(3, 2, 4, 0x22);
+
+        merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[1, 2], None, Some(s1), "abort"),
+        )
+        .unwrap();
+        merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[3, 4, 5], None, Some(s2), "stop"),
+        )
+        .unwrap();
+
+        let acc = state.routed_experts.as_ref().expect("accumulator");
+        assert_eq!(acc.num_tokens(), 5);
+        // First 16 bytes are 0x11, next 24 bytes are 0x22.
+        let row = acc.token_bytes();
+        assert!(acc.data[..2 * row].iter().all(|&b| b == 0x11));
+        assert!(acc.data[2 * row..].iter().all(|&b| b == 0x22));
+    }
+
+    /// A shape change between two iterations is fail-hard.
+    #[test]
+    fn re_shape_mismatch_returns_err() {
+        let mut state = PartialRolloutState::default();
+        let s1 = make_re(2, 2, 4, 0x01);
+        let s2 = make_re(2, 2, 8, 0x02); // top_k changed
+
+        merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[1, 2], None, Some(s1), "abort"),
+        )
+        .unwrap();
+        let err = merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[3, 4], None, Some(s2), "abort"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RoutedExpertsError::ShapeMismatch { .. }));
+    }
+
+    /// §1.A step 5: abort with no tokens and no segment is recoverable.
+    #[test]
+    fn re_early_abort_no_tokens_no_segment_is_ok() {
+        let mut state = PartialRolloutState::default();
+        let d = make_drained_full(&[], None, None, "abort");
+        merge_into_partial_state(&mut state, &d).unwrap();
+        assert!(state.routed_experts.is_none());
+        assert_eq!(state.token_ids, Vec::<u32>::new());
+    }
+
+    /// Late arrival: tokens accumulated in earlier iter without RE; a later
+    /// segment cannot retroactively cover them — fail-hard.
+    #[test]
+    fn re_late_arrival_returns_err() {
+        let mut state = PartialRolloutState::default();
+        // Iter 1: tokens but no RE (engine not yet capturing).  This is
+        // legal at face value — the (None, None, tokens > 0) arm returns
+        // Ok because the engine simply isn't producing RE.
+        merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[1, 2], None, None, "abort"),
+        )
+        .unwrap();
+        // Iter 2: a segment arrives — but prior tokens are already in
+        // state.token_ids → LateArrival, because the prompt segment
+        // covering iter 1 is permanently lost.
+        let s = make_re(2, 1, 1, 0xFF);
+        let err = merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[3, 4], None, Some(s), "stop"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RoutedExpertsError::LateArrival { .. }));
+    }
+
+    /// Missing segment: accumulator exists, new iter has tokens but no RE.
+    #[test]
+    fn re_missing_segment_returns_err() {
+        let mut state = PartialRolloutState::default();
+        let s = make_re(2, 1, 1, 0x10);
+        merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[1, 2], None, Some(s), "abort"),
+        )
+        .unwrap();
+        let err = merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[3, 4], None, None, "stop"),
+        )
+        .unwrap_err();
+        assert!(matches!(err, RoutedExpertsError::MissingSegment { .. }));
+    }
+
+    /// When the engine isn't capturing RE (every iteration returns `None`),
+    /// the accumulator stays empty and merge succeeds — no opt-in flag is
+    /// required because RE capture is decided engine-side.
+    #[test]
+    fn re_no_segments_no_accumulator_is_ok() {
+        let mut state = PartialRolloutState::default();
+        merge_into_partial_state(
+            &mut state,
+            &make_drained_full(&[1, 2], None, None, "stop"),
+        )
+        .unwrap();
+        assert!(state.routed_experts.is_none());
     }
 
     // ─── reset_ctx_for_loopback ──────────────────────────────────────────────

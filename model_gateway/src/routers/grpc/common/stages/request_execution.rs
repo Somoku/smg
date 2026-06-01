@@ -43,13 +43,26 @@ impl RequestExecutionStage {
 #[async_trait]
 impl PipelineStage for RequestExecutionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let proto_request = ctx.state.proto_request.take().ok_or_else(|| {
+        let mut proto_request = ctx.state.proto_request.take().ok_or_else(|| {
             error!(
                 function = "RequestExecutionStage::execute",
                 "Proto request not built"
             );
             error::internal_error("proto_request_not_built", "Proto request not built")
         })?;
+
+        // Set `partial_rollout_overrides.routed_experts_prompt_start = Some(...)`
+        // before re-entering the pipeline on iter ≥ 2 so vLLM only captures
+        // RE for new token positions.
+        if let (
+            ProtoRequest::Generate(ref mut generate),
+            Some(prompt_start),
+        ) = (
+            &mut proto_request,
+            ctx.state.partial_rollout_overrides.routed_experts_prompt_start,
+        ) {
+            generate.set_routed_experts_prompt_start(prompt_start);
+        }
 
         let clients = ctx.state.clients.as_mut().ok_or_else(|| {
             error!(
