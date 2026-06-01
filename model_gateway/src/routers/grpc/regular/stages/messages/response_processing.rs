@@ -81,7 +81,7 @@ impl PipelineStage for MessageResponseProcessingStage {
         })?;
 
         if is_streaming {
-            // Read derived skip_special_tokens (set in preparation, survives request_building .take())
+            // Read derived skip_special_tokens set during preparation.
             let skip_special_tokens = ctx.state.response.skip_special_tokens.unwrap_or(true);
 
             // Streaming: use StreamingProcessor and return SSE response

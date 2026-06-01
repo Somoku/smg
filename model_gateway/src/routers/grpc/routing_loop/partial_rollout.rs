@@ -139,16 +139,22 @@ pub(crate) fn merge_into_partial_state(
 
 /// Reset `ctx` so it is ready for the next loopback iteration.
 ///
-/// Specifically this clears the stage outputs that must be re-computed
+/// Clears the per-iteration stage outputs that must be re-computed
 /// (worker selection, client, request, dispatch, load-guards, execution
-/// result) while preserving the preparation output and partial-rollout
-/// state (which are needed by downstream stages).
+/// result) and restores `preparation` from the snapshot stashed by
+/// `dispatch_entry_with_partial_rollout` before the loop began —
+/// `request_building` consumes the live `preparation` via `.take()`, so
+/// without this restore the next iteration's `worker_selection` would
+/// observe `None` and abort the pipeline with `preparation_stage_not_completed`.
 pub(crate) fn reset_ctx_for_loopback(ctx: &mut RequestContext) {
     ctx.state.workers = None;
     ctx.state.clients = None;
     ctx.state.proto_request = None;
     ctx.state.dispatch = None;
     ctx.state.load_guards = None;
+    // Restore preparation from the snapshot for the next iteration's
+    // worker_selection + request_building.
+    ctx.state.preparation = ctx.state.preparation_snapshot.clone();
     // Clear only per-iteration response fields; keep preparation-stage
     // products (`stop_decoder`, `skip_special_tokens`) intact so the final
     // post-execution stage can use them after the last loopback iteration.
@@ -300,8 +306,8 @@ mod tests {
         use tool_parser::ParserFactory as ToolParserFactory;
 
         use crate::routers::grpc::context::{
-            FinalResponse, ProcessingState, RequestContext, RequestInput, RequestType,
-            SharedComponents,
+            FinalResponse, PreparationOutput, ProcessingState, RequestContext, RequestInput,
+            RequestType, SharedComponents,
         };
 
         // Minimal RequestContext built directly so the test stays inside the
@@ -332,6 +338,11 @@ mod tests {
         let stop_decoder = StopSequenceDecoderBuilder::new(tokenizer)
             .skip_special_tokens(true)
             .build();
+        ctx.state.preparation = None;
+        ctx.state.preparation_snapshot = Some(PreparationOutput::Completion {
+            original_text: "prompt".to_string(),
+            token_ids: vec![1, 2, 3],
+        });
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(true);
 
@@ -340,6 +351,23 @@ mod tests {
         ctx.state.response.final_response = Some(FinalResponse::Generate(vec![]));
 
         reset_ctx_for_loopback(&mut ctx);
+
+        // Preparation is restored from the snapshot for the next loopback
+        // iteration's worker_selection + request_building.
+        let restored_preparation = ctx
+            .state
+            .preparation
+            .as_ref()
+            .expect("preparation must survive loopback reset");
+        let PreparationOutput::Completion {
+            original_text,
+            token_ids,
+        } = restored_preparation
+        else {
+            panic!("expected Completion preparation output");
+        };
+        assert_eq!(original_text, "prompt");
+        assert_eq!(token_ids, &[1, 2, 3]);
 
         // Preparation-stage products preserved.
         assert!(

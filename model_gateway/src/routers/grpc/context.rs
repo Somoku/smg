@@ -108,6 +108,13 @@ pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
+    /// Snapshot of `preparation` saved before request_building consumes it.
+    ///
+    /// `request_building` takes ownership of `preparation` via `.take()`, so
+    /// any partial-rollout loopback iteration would otherwise observe `None`
+    /// when re-running `worker_selection` on the next pass
+    pub preparation_snapshot: Option<PreparationOutput>,
+
     /// Resolved tokenizer (set once in preparation, reused in response processing)
     /// This avoids redundant registry lookups across pipeline stages.
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
@@ -141,6 +148,7 @@ pub(crate) struct ProcessingState {
 ///
 /// Each request type produces its own variant, eliminating optional fields
 /// that are always None for certain pipelines.
+#[derive(Clone)]
 pub(crate) enum PreparationOutput {
     Chat {
         token_ids: Vec<u32>,
@@ -285,6 +293,14 @@ pub(crate) struct TitoRequestContext {
     /// ChatResponseProcessingStage for TITO capture).
     /// Consumed by `ChatRequestBuildingStage::execute()` before response processing runs.
     pub prompt_token_ids: Vec<u32>,
+    /// Snapshot of the prefix hash.
+    /// The response stage extends this in place with the newly-generated
+    /// assistant message and finalizes it to derive the leaf hash,
+    /// avoiding a second O(N) walk over the conversation.
+    pub running_hasher: smg_tito::PrefixHasher,
+    /// Hash at the last assistant boundary in the request messages (i.e. the
+    /// parent hash of the node about to be stored).
+    pub parent_hash: Option<smg_tito::PrefixHash>,
 }
 
 /// Response processing state (Step 6)

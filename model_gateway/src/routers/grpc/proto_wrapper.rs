@@ -850,6 +850,94 @@ impl ProtoGenerateComplete {
         }
     }
 
+    /// Override `output_ids` *and* `output_logprobs` with the accumulated
+    /// partial-rollout sequence in a single, internally-consistent write.
+    ///
+    /// Without this, downstream consumers (TITO turn-record extraction,
+    /// OpenAI `ChatLogProbs` payload building) would observe a complete frame
+    /// where `output_ids` carries the merged sequence but `output_logprobs`
+    /// still reflects only the *last* loopback iteration — a misalignment that
+    /// surfaces in PSRL as a TITO trim overflow on the next turn.
+    ///
+    /// Length contract: `logprobs.len() == token_ids.len()` when `logprobs` is
+    /// `Some(_)`. On mismatch the logprobs are dropped to keep the frame
+    /// strictly aligned (mirrors `merge_into_partial_state`'s "prefer no
+    /// logprobs over misaligned ones" policy). When `logprobs` is `None` the
+    /// existing `output_logprobs` is also cleared so downstream code never
+    /// observes a stale, last-iteration-only logprobs vector alongside the
+    /// merged token IDs.
+    ///
+    /// `top_logprobs` is reset to per-position empty entries because the
+    /// partial-rollout drain only retains per-sample `(logprob, token_id)`
+    /// pairs; clients requesting top-k alternatives from a multi-iteration
+    /// rollout will see empty alternatives, which is consistent with the
+    /// information actually available end-to-end.
+    pub fn set_partial_rollout_outputs(
+        &mut self,
+        token_ids: Vec<u32>,
+        logprobs: Option<Vec<f32>>,
+    ) {
+        // Drop logprobs that are missing or misaligned with `token_ids` —
+        // mirrors `merge_into_partial_state`'s "prefer no logprobs over
+        // misaligned ones" policy.
+        let token_logprobs = logprobs.filter(|lp| lp.len() == token_ids.len());
+
+        if let Some(token_logprobs) = token_logprobs {
+            let token_ids_for_logprobs = token_ids.clone();
+            let top_logprobs_len = token_ids_for_logprobs.len();
+            match self {
+                Self::Sglang(c) => {
+                    c.output_logprobs = Some(sglang::OutputLogProbs {
+                        token_logprobs,
+                        token_ids: token_ids_for_logprobs,
+                        top_logprobs: vec![sglang::TopLogProbs::default(); top_logprobs_len],
+                    });
+                }
+                Self::Vllm(c) => {
+                    c.output_logprobs = Some(vllm::OutputLogProbs {
+                        token_logprobs,
+                        token_ids: token_ids_for_logprobs,
+                        top_logprobs: vec![vllm::TopLogProbs::default(); top_logprobs_len],
+                    });
+                }
+                Self::Mlx(c) => {
+                    c.output_logprobs = Some(mlx::OutputLogProbs {
+                        token_logprobs,
+                        token_ids: token_ids_for_logprobs,
+                        top_logprobs: vec![mlx::TopLogProbs::default(); top_logprobs_len],
+                    });
+                }
+                Self::Trtllm(c) => {
+                    c.logprobs = token_ids_for_logprobs
+                        .into_iter()
+                        .zip(token_logprobs)
+                        .map(|(token_id, logprob)| trtllm::TokenLogprob {
+                            token_id,
+                            logprob,
+                            top_logprobs: vec![],
+                        })
+                        .collect();
+                }
+            }
+        } else {
+            match self {
+                Self::Sglang(c) => c.output_logprobs = None,
+                Self::Vllm(c) => c.output_logprobs = None,
+                Self::Mlx(c) => c.output_logprobs = None,
+                Self::Trtllm(c) => c.logprobs.clear(),
+            }
+        }
+
+        // Move `token_ids` into the top-level slot last, so the backing
+        // allocation transfers without an extra copy.
+        match self {
+            Self::Sglang(c) => c.output_ids = token_ids,
+            Self::Vllm(c) => c.output_ids = token_ids,
+            Self::Trtllm(c) => c.output_token_ids = token_ids,
+            Self::Mlx(c) => c.output_ids = token_ids,
+        }
+    }
+
     /// Get cached tokens
     pub fn cached_tokens(&self) -> u32 {
         match self {

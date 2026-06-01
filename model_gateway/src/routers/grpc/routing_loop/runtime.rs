@@ -94,7 +94,7 @@ impl RequestPriority for RoutingQueueEntry {
 pub(crate) struct RoutingLoopStatus {
     pub(crate) enabled: bool,
     pub(crate) paused: bool,
-    pub(crate) routing: bool,
+    pub(crate) selecting: bool,
     pub(crate) queue_len: usize,
     pub(crate) pending_request_num: usize,
     pub(crate) running_tasks: usize,
@@ -119,8 +119,8 @@ pub struct RoutingLoopRuntime {
     queue: Mutex<MultiPriorityRequestQueue<RoutingQueueEntry>>,
     tx: mpsc::UnboundedSender<RoutingQueueEntry>,
     paused: AtomicBool,
-    routing: AtomicBool,
     running_tasks: AtomicUsize,
+    running_selections: AtomicUsize,
     running_requests: AtomicUsize,
     check_interval_ms: u64,
     receive_batch_size: usize,
@@ -169,8 +169,8 @@ impl RoutingLoopRuntime {
             )),
             tx,
             paused: AtomicBool::new(false),
-            routing: AtomicBool::new(false),
             running_tasks: AtomicUsize::new(0),
+            running_selections: AtomicUsize::new(0),
             running_requests: AtomicUsize::new(0),
             check_interval_ms: config.check_interval_ms,
             receive_batch_size: config.receive_batch_size.max(1),
@@ -275,9 +275,22 @@ impl RoutingLoopRuntime {
         self.paused.load(Ordering::Acquire)
     }
 
-    /// Returns `true` while the dispatch batch is in progress.
-    pub(crate) fn is_routing(&self) -> bool {
-        self.routing.load(Ordering::Acquire)
+    /// Returns `true` while at least one dispatch task is still inside the
+    /// worker-selection stage.
+    pub(crate) fn is_selecting(&self) -> bool {
+        self.running_selections.load(Ordering::Acquire) > 0
+    }
+
+    /// Acquire a guard that increments `running_selections` and decrements it
+    /// when dropped (including on panic / `.await` cancellation, because
+    /// `Drop::drop` runs unconditionally).
+    pub(crate) fn selection_guard(self: &Arc<Self>) -> SelectionGuard {
+        self.running_selections.fetch_add(1, Ordering::AcqRel);
+        gauge!("smg_routing_loop_running_selections")
+            .set(self.running_selections.load(Ordering::Acquire) as f64);
+        SelectionGuard {
+            runtime: Arc::clone(self),
+        }
     }
 
     pub(crate) async fn status(&self) -> RoutingLoopStatus {
@@ -286,7 +299,7 @@ impl RoutingLoopRuntime {
         RoutingLoopStatus {
             enabled: true,
             paused: self.is_paused(),
-            routing: self.routing.load(Ordering::Acquire),
+            selecting: self.is_selecting(),
             queue_len,
             pending_request_num: queue_len,
             running_tasks: self.running_tasks.load(Ordering::Acquire),
@@ -353,21 +366,13 @@ impl RoutingLoopRuntime {
         Duration::from_millis(self.check_interval_ms.max(1))
     }
 
-    fn set_routing(&self, routing: bool) {
-        self.routing.store(routing, Ordering::Release);
-    }
-
     fn task_started(&self) {
         let running = self.running_tasks.fetch_add(1, Ordering::AcqRel) + 1;
-        self.set_routing(true);
         gauge!("smg_routing_loop_running_tasks").set(running as f64);
     }
 
     fn task_finished(&self) {
         let previous = self.running_tasks.fetch_sub(1, Ordering::AcqRel);
-        if previous <= 1 {
-            self.set_routing(false);
-        }
         let running = if previous > 0 { previous - 1 } else { 0 };
         gauge!("smg_routing_loop_running_tasks").set(running as f64);
     }
@@ -533,30 +538,44 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
     let prompt_id = entry.routing_meta.as_ref().map(|meta| meta.prompt_id);
 
     if entry.routing_meta.is_none() {
-        // ── Run execution-phase stages (worker select → dispatch) ────────────
-        if let Err(response) = entry.pipeline.execute_through_execution(&mut entry.ctx).await {
-            if entry.ctx.state.workers.is_none() {
-                // Worker selection found no available worker — re-enqueue so
-                // the next routing-loop tick can retry.
-                runtime.push_entries(vec![entry]).await;
-            } else {
-                // A post-selection execution stage failed — propagate to caller.
-                match entry.completion {
-                    RoutingLoopCompletion::Http(tx) => {
-                        let _ = tx.send(response);
-                    }
-                    RoutingLoopCompletion::ChatForResponses(tx) => {
-                        let _ = tx.send(Err(response));
-                    }
-                    RoutingLoopCompletion::HarmonyResponses(tx) => {
-                        let _ = tx.send(Err(response));
-                    }
-                    RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
-                        let _ = tx.send(Err(response));
-                    }
+        // ── Worker selection (drain barrier for `pause?wait=true`) ───────────
+        // The guard increments `running_selections` until the future
+        // completes; PSRL's post-select reserve happens inside this call.
+        let select_result = {
+            let _guard = runtime.selection_guard();
+            entry
+                .pipeline
+                .execute_worker_selection(&mut entry.ctx)
+                .await
+        };
+        if select_result.is_err() {
+            // Worker selection found no available worker — re-enqueue.
+            runtime.push_entries(vec![entry]).await;
+            return;
+        }
+
+        // ── Run remaining execution stages (client acquisition → dispatch) ──
+        if let Err(response) = entry
+            .pipeline
+            .execute_post_selection_execution(&mut entry.ctx)
+            .await
+        {
+            // A post-selection execution stage failed — propagate to caller.
+            match entry.completion {
+                RoutingLoopCompletion::Http(tx) => {
+                    let _ = tx.send(response);
                 }
-                runtime.cleanup_tracking(request_id, prompt_id);
+                RoutingLoopCompletion::ChatForResponses(tx) => {
+                    let _ = tx.send(Err(response));
+                }
+                RoutingLoopCompletion::HarmonyResponses(tx) => {
+                    let _ = tx.send(Err(response));
+                }
+                RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
+                    let _ = tx.send(Err(response));
+                }
             }
+            runtime.cleanup_tracking(request_id, prompt_id);
             return;
         }
 
@@ -679,6 +698,9 @@ async fn dispatch_entry_with_partial_rollout(
 
     let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
 
+    // Snapshot `preparation` before the loop starts
+    ctx.state.preparation_snapshot = ctx.state.preparation.clone();
+
     loop {
         // ── Step 1: publish accumulated response-token count for selection ───
         let headers = ctx.input.headers.get_or_insert_with(Default::default);
@@ -687,23 +709,28 @@ async fn dispatch_entry_with_partial_rollout(
         }
 
         // ── Step 2: run execution-phase stages (worker select → dispatch) ────
-        if let Err(response) = pipeline.execute_through_execution(&mut ctx).await {
-            if ctx.state.workers.is_none() {
-                // Worker selection found no available worker — restore accumulated
-                // partial-rollout state and re-enqueue for the next tick.
-                ctx.state.partial_rollout_state = Some(partial_state);
-                runtime
-                    .push_entries(vec![RoutingQueueEntry {
-                        ctx,
-                        pipeline,
-                        completion,
-                        routing_meta,
-                    }])
-                    .await;
-            } else {
-                send_http_completion(completion, response);
-                runtime.cleanup_tracking(request_id, prompt_id);
-            }
+        let select_result = {
+            let _guard = runtime.selection_guard();
+            pipeline.execute_worker_selection(&mut ctx).await
+        };
+        if select_result.is_err() {
+            // Worker selection found no available worker — restore accumulated
+            // partial-rollout state and re-enqueue for the next tick.
+            ctx.state.partial_rollout_state = Some(partial_state);
+            runtime
+                .push_entries(vec![RoutingQueueEntry {
+                    ctx,
+                    pipeline,
+                    completion,
+                    routing_meta,
+                }])
+                .await;
+            return;
+        }
+
+        if let Err(response) = pipeline.execute_post_selection_execution(&mut ctx).await {
+            send_http_completion(completion, response);
+            runtime.cleanup_tracking(request_id, prompt_id);
             return;
         }
 
@@ -754,8 +781,31 @@ async fn dispatch_entry_with_partial_rollout(
 
                 // Override the output_ids in the final complete frame with the
                 // full accumulated token sequence from all loopback iterations.
+                //
+                // Multi-iteration: also rewrite `output_logprobs` so the frame
+                // is internally consistent — without this, downstream TITO
+                // turn-record extraction sees `output_ids = merged` but
+                // `output_logprobs = last_iteration_only`, which surfaces in
+                // PSRL training-array construction as a "trailing trim
+                // overflow" because the per-token logprobs no longer line up
+                // with the accumulated token sequence.
+                //
+                // Single-iteration: the complete frame already carries
+                // aligned outputs from its sole iteration, so we keep the
+                // (cheaper) `set_output_ids` path. `iteration_count == 1` is
+                // guaranteed by `merge_into_partial_state` incrementing
+                // exactly once per drained segment (including the final
+                // non-abort one).
                 let mut complete = drained.complete;
-                complete.set_output_ids(std::mem::take(&mut partial_state.token_ids));
+                let merged_token_ids = std::mem::take(&mut partial_state.token_ids);
+                if partial_state.iteration_count > 1 {
+                    complete.set_partial_rollout_outputs(
+                        merged_token_ids,
+                        partial_state.logprobs.take(),
+                    );
+                } else {
+                    complete.set_output_ids(merged_token_ids);
+                }
 
                 // Place the assembled complete frame back for PostExecution stages.
                 ctx.state.response.execution_result = Some(ExecutionResult::Complete(complete));
@@ -835,4 +885,18 @@ fn drain_receiver(
         entries.push(entry);
     }
     entries
+}
+
+pub(crate) struct SelectionGuard {
+    runtime: Arc<RoutingLoopRuntime>,
+}
+
+impl Drop for SelectionGuard {
+    fn drop(&mut self) {
+        self.runtime
+            .running_selections
+            .fetch_sub(1, Ordering::AcqRel);
+        gauge!("smg_routing_loop_running_selections")
+            .set(self.runtime.running_selections.load(Ordering::Acquire) as f64);
+    }
 }

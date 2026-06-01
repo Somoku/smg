@@ -139,13 +139,59 @@ impl RequestPipeline {
         Ok(ctx)
     }
 
-    /// Run execution-phase stages only (worker selection → request execution).
+    /// Run the worker-selection stage(s) only.
     ///
-    /// Used by partial-rollout dispatch: called once per loopback iteration.
-    /// Skips `Preparation` stages; stops before `PostExecution` stages.
-    /// Execution stages must not produce an early `Ok(Some(response))`; doing so is
-    /// treated as an internal error.
-    pub(crate) async fn execute_through_execution(
+    /// This is the precise drain barrier the routing loop uses for
+    /// `pause?wait=true`: by tracking entry/exit of this method via
+    /// `RoutingLoopRuntime::selection_guard`, the gateway can wait for all
+    /// in-flight worker selections (including the PSRL post-select
+    /// `reserve_rollout_instance_requests` call) to complete before the
+    /// coordinator pushes a new `version_after_sync` and issues the SYNC
+    /// command — eliminating the TOCTOU window where in-flight requests
+    /// would otherwise reserve with the pre-sync model version.
+    pub(crate) async fn execute_worker_selection(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<(), Response> {
+        for stage in self
+            .stages
+            .iter()
+            .filter(|s| s.phase() == StagePhase::WorkerSelection)
+        {
+            match stage.execute(ctx).await {
+                Ok(Some(_)) => {
+                    error!(
+                        function = "execute_worker_selection",
+                        stage = stage.name(),
+                        "Unexpected early response from worker-selection stage"
+                    );
+                    return Err(error::internal_error(
+                        "unexpected_early_response",
+                        "Worker-selection stage returned an unexpected early response",
+                    ));
+                }
+                Ok(None) => continue,
+                Err(response) => {
+                    // No available worker is the common case here; log at debug
+                    // level so re-enqueue churn doesn't dominate the error log.
+                    tracing::debug!(
+                        function = "execute_worker_selection",
+                        stage = stage.name(),
+                        "Worker selection failed; request will be re-enqueued"
+                    );
+                    return Err(response);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Run the execution-phase stages that follow worker selection
+    /// (client acquisition → request building → dispatch metadata → request
+    /// execution).
+    ///
+    /// Must only be called after `execute_worker_selection` has succeeded.
+    pub(crate) async fn execute_post_selection_execution(
         &self,
         ctx: &mut RequestContext,
     ) -> Result<(), Response> {
@@ -157,7 +203,7 @@ impl RequestPipeline {
             match stage.execute(ctx).await {
                 Ok(Some(_)) => {
                     error!(
-                        function = "execute_through_execution",
+                        function = "execute_post_selection_execution",
                         stage = stage.name(),
                         "Unexpected early response from execution stage"
                     );
@@ -168,22 +214,12 @@ impl RequestPipeline {
                 }
                 Ok(None) => continue,
                 Err(response) => {
-                    if ctx.state.workers.is_none() {
-                        // Worker selection found no available worker — routing loop
-                        // will re-enqueue this request; suppress noisy error log.
-                        tracing::debug!(
-                            function = "execute_through_execution",
-                            stage = stage.name(),
-                            "Worker selection found no available worker; request will be re-enqueued"
-                        );
-                    } else {
-                        error!(
-                            function = "execute_through_execution",
-                            stage = stage.name(),
-                            status = %response.status(),
-                            "Execution stage failed"
-                        );
-                    }
+                    error!(
+                        function = "execute_post_selection_execution",
+                        stage = stage.name(),
+                        status = %response.status(),
+                        "Execution stage failed"
+                    );
                     return Err(response);
                 }
             }

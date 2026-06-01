@@ -6,8 +6,11 @@ pub mod store;
 pub mod validator;
 
 pub use error::TitoError;
-pub use normalizer::{hash_messages, hash_messages_with_context, RenderContext};
-pub use store::{MismatchEntry, PrefixMatch, TitoStore, Trajectory, TurnRecord};
+pub use normalizer::{
+    assistants_diagnostic_summary, finalize_hash, hash_message_into,
+    hash_messages, hash_messages_with_context, PrefixHash, PrefixHasher, RenderContext,
+};
+pub use store::{MismatchEntry, PrefixLookup, PrefixMatch, TitoStore, Trajectory, TurnRecord};
 
 /// HTTP header name for the TITO session identifier.
 pub const TITO_SESSION_HEADER: &str = "x-smg-tito-session-id";

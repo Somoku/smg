@@ -22,7 +22,6 @@ use crate::{
             context::{FinalResponse, RequestContext, TitoRequestContext},
             proto_wrapper::ProtoGenerateComplete,
             regular::{processor, streaming},
-            utils,
         },
     },
     worker::AttachedBody,
@@ -110,7 +109,7 @@ impl ChatResponseProcessingStage {
         })?;
 
         if is_streaming {
-            // Read derived skip_special_tokens (set in preparation, survives request_building .take())
+            // Read derived skip_special_tokens set during preparation.
             let skip_special_tokens = ctx
                 .state
                 .response
@@ -144,108 +143,148 @@ impl ChatResponseProcessingStage {
         let all_completes =
             response_collection::collect_responses(execution_result, request_logprobs).await?;
 
-        // TITO non-streaming capture: uses already-parsed ChatCompletionMessage from first choice.
+        // Parse choices once. The same `ChatCompletionMessage` then feeds both TITO
+        // storage and the final response: re-parsing here would mint fresh tool-call
+        // IDs (`generate_tool_call_id` uses a UUID for non-Kimi models) and break TITO
+        // prefix hashing on the next turn.
+        let choices = {
+            let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
+                error!(
+                    function = "ChatResponseProcessingStage::execute",
+                    "Stop decoder not initialized"
+                );
+                error::internal_error(
+                    "stop_decoder_not_initialized",
+                    "Stop decoder not initialized",
+                )
+            })?;
+            // When the request participates in TITO, suppress the
+            // OpenAI-shaped `choices[*].logprobs` from the outbound HTTP
+            // response: TITO capture reads logprobs straight off the proto in
+            // `do_tito_capture_non_streaming`, so the per-token
+            // `tokenizer.decode` pass that builds `ChatLogProbsContent` would
+            // be pure overhead.
+            // Non-TITO callers are unaffected and keep getting the verbose logprobs shape.
+            let suppress_logprobs = tito_ctx.is_some();
+            self.processor
+                .parse_chat_choices(
+                    &all_completes,
+                    &chat_request,
+                    &tokenizer,
+                    stop_decoder,
+                    suppress_logprobs,
+                )
+                .await?
+        };
+
+        // TITO non-streaming capture: reuse the message we just parsed.
         if let (Some(tc), Some(store)) = (tito_ctx, self.tito_store.as_ref()) {
-            self.do_tito_capture_non_streaming(
-                ctx,
+            let assistant_message = choices.first().map(|c| &c.message).ok_or_else(|| {
+                error!(
+                    function = "ChatResponseProcessingStage::process_chat_response",
+                    session_id = %tc.session_id,
+                    "No completion available for TITO assistant capture"
+                );
+                error::internal_error(
+                    "tito_empty_completion",
+                    "No completion available for TITO assistant capture",
+                )
+            })?;
+            do_tito_capture_non_streaming(
                 Arc::clone(store),
-                tc,
+                &tc,
                 &tokenizer,
                 &all_completes,
-            )
-            .await?;
-        }
-
-        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
-            error!(
-                function = "ChatResponseProcessingStage::execute",
-                "Stop decoder not initialized"
+                assistant_message,
             );
-            error::internal_error(
-                "stop_decoder_not_initialized",
-                "Stop decoder not initialized",
-            )
-        })?;
+        }
 
         let response = self
             .processor
-            .process_chat_choices_from_completes(
-                &all_completes,
-                chat_request,
-                dispatch,
-                tokenizer,
-                stop_decoder,
-                request_logprobs,
-            )
-            .await?;
+            .build_chat_response(choices, &all_completes, &dispatch);
 
         // Store the final response
         ctx.state.response.final_response = Some(FinalResponse::Chat(response));
 
         Ok(None)
     }
+}
 
-    /// TITO capture for the non-streaming path.
-    ///
-    /// Uses the already-collected `all_completes` (no second drain) and processes
-    /// the first complete into a `ChatCompletionMessage` to get tool_calls and reasoning.
-    async fn do_tito_capture_non_streaming(
-        &self,
-        ctx: &mut RequestContext,
-        store: Arc<TitoStore>,
-        tito_ctx: TitoRequestContext,
-        tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
-        all_completes: &[ProtoGenerateComplete],
-    ) -> Result<(), Response> {
-        let first_complete = all_completes.first().ok_or_else(|| {
-            error!(
-                function = "ChatResponseProcessingStage::do_tito_capture_non_streaming",
-                session_id = %tito_ctx.session_id,
-                "No completion available for TITO assistant capture"
-            );
-            error::internal_error(
-                "tito_empty_completion",
-                "No completion available for TITO assistant capture",
-            )
-        })?;
-
-        if all_completes.len() > 1 {
-            debug!(
-                session_id = %tito_ctx.session_id,
-                choices = all_completes.len(),
-                "TITO capture received multiple choices; using the first choice"
-            );
-        }
-
-        let assistant_message = self
-            .parse_assistant_message(ctx, first_complete, tokenizer)
-            .await?;
-
-        let request_messages: &[ChatMessage] = tito_ctx.request.messages.as_slice();
-        // render_context was built once in try_tito — no repeated JSON serialization.
-        let render_context = &tito_ctx.render_context;
-
-        let model_id = tito_ctx.request.model.as_str();
-        let adapter = smg_tito::model_adapter::select_adapter(model_id);
-        let max_trim = adapter.max_trim_tokens();
-        tracing::debug!(
+/// TITO capture for the non-streaming path.
+fn do_tito_capture_non_streaming(
+    store: Arc<TitoStore>,
+    tito_ctx: &TitoRequestContext,
+    tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
+    all_completes: &[ProtoGenerateComplete],
+    assistant_message: &ChatCompletionMessage,
+) {
+    let Some(first_complete) = all_completes.first() else {
+        // Caller guarantees a non-empty `choices` list, so this is unreachable.
+        // Stay defensive — still log so we notice if assumptions drift.
+        error!(
+            function = "ChatResponseProcessingStage::do_tito_capture_non_streaming",
             session_id = %tito_ctx.session_id,
-            model_id = %model_id,
-            is_tito_hit = tito_ctx.is_tito_hit,
-            adapter_type = std::any::type_name_of_val(&*adapter),
-            max_trim_tokens = max_trim,
-            "do_tito_capture_non_streaming: processing final response with adapter"
+            "No completion available for TITO assistant capture"
         );
-        store.set_session_max_trim_tokens(&tito_ctx.session_id, max_trim);
+        return;
+    };
 
-        let output_ids = first_complete.output_ids();
-        let prompt_ids = &tito_ctx.prompt_token_ids;
-        let mut full_ids = Vec::with_capacity(prompt_ids.len() + output_ids.len());
-        full_ids.extend_from_slice(prompt_ids);
-        full_ids.extend_from_slice(output_ids);
-        let all_messages =
-            concat_messages_with_assistant_message(request_messages, &assistant_message);
-        let mismatch_report = build_mismatch_report(
+    if all_completes.len() > 1 {
+        debug!(
+            session_id = %tito_ctx.session_id,
+            choices = all_completes.len(),
+            "TITO capture received multiple choices; using the first choice"
+        );
+    }
+
+    let request_messages: &[ChatMessage] = tito_ctx.request.messages.as_slice();
+    let render_context = &tito_ctx.render_context;
+
+    let model_id = tito_ctx.request.model.as_str();
+    let adapter = smg_tito::model_adapter::select_adapter(model_id);
+    let max_trim = adapter.max_trim_tokens();
+    tracing::debug!(
+        session_id = %tito_ctx.session_id,
+        model_id = %model_id,
+        is_tito_hit = tito_ctx.is_tito_hit,
+        adapter_type = std::any::type_name_of_val(&*adapter),
+        max_trim_tokens = max_trim,
+        "do_tito_capture_non_streaming: processing final response with adapter"
+    );
+    store.set_session_max_trim_tokens(&tito_ctx.session_id, max_trim);
+
+    let output_ids = first_complete.output_ids();
+    let prompt_ids = &tito_ctx.prompt_token_ids;
+    let mut full_ids = Vec::with_capacity(prompt_ids.len() + output_ids.len());
+    full_ids.extend_from_slice(prompt_ids);
+    full_ids.extend_from_slice(output_ids);
+
+    // Build the assistant ChatMessage exactly once: this is the message we
+    // hash into the running hasher *and* the message we hand to the
+    // diagnostic / mismatch-report paths below.
+    //
+    // Building it twice (or re-parsing it from the response)
+    // would risk minting fresh tool_call IDs and breaking the prefix-hash round trip.
+    let new_assistant_message = build_assistant_chat_message(assistant_message);
+
+    // Reuse the prefix hasher captured in preparation to derive the leaf
+    // hash without re-walking request_messages.  Clone is mandatory: the
+    // hasher state is owned by the immutable ``TitoRequestContext`` and the
+    // adapter's `max_trim_tokens` flow ran above without consuming it.
+    let mut leaf_hasher = tito_ctx.running_hasher.clone();
+    smg_tito::hash_message_into(&mut leaf_hasher, &new_assistant_message);
+    let leaf_hash = smg_tito::finalize_hash(&leaf_hasher);
+    let parent_hash = tito_ctx.parent_hash;
+
+    let mismatch_report = if store.is_debug() && tito_ctx.is_tito_hit {
+        let all_messages = {
+            let mut v = Vec::with_capacity(request_messages.len() + 1);
+            v.extend_from_slice(request_messages);
+            v.push(new_assistant_message);
+            v
+        };
+
+        let report = build_mismatch_report(
             tito_ctx.is_tito_hit,
             &full_ids,
             &all_messages,
@@ -254,101 +293,43 @@ impl ChatResponseProcessingStage {
             &store,
             model_id,
         );
-        tracing::debug!(
+
+        debug!(
             session_id = %tito_ctx.session_id,
-            is_tito_hit = tito_ctx.is_tito_hit,
-            prompt_len = prompt_ids.len(),
-            output_len = output_ids.len(),
-            full_ids_len = full_ids.len(),
-            mismatch_count = mismatch_report.len(),
-            "do_tito_capture_non_streaming: storing tokens"
+            total_messages = all_messages.len(),
+            assistants = %smg_tito::assistants_diagnostic_summary(&all_messages),
+            "TITO store: assistants diagnostic"
         );
-        let turn_record = extract_turn_record(first_complete, prompt_ids.len(), mismatch_report);
 
-        match store.store(
-            &tito_ctx.session_id,
-            &all_messages,
-            full_ids,
-            turn_record,
-            render_context,
-            tito_ctx.trajectory_id,
-        ) {
-            Ok(()) => debug!(session_id = %tito_ctx.session_id, "TITO stored generation result"),
-            Err(e) => {
-                warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
-            }
-        };
+        report
+    } else {
+        vec![]
+    };
 
-        Ok(())
-    }
+    tracing::debug!(
+        session_id = %tito_ctx.session_id,
+        is_tito_hit = tito_ctx.is_tito_hit,
+        prompt_len = prompt_ids.len(),
+        output_len = output_ids.len(),
+        full_ids_len = full_ids.len(),
+        mismatch_count = mismatch_report.len(),
+        "do_tito_capture_non_streaming: storing tokens"
+    );
+    let turn_record = extract_turn_record(first_complete, prompt_ids.len(), mismatch_report);
 
-    /// Process the first ProtoGenerateComplete into a ChatCompletionMessage for TITO storage.
-    ///
-    /// Runs the full stop_decoder + reasoning + tool parser pipeline once, producing a message
-    /// that includes tool_calls and reasoning_content (same quality as the final response choice).
-    async fn parse_assistant_message(
-        &self,
-        ctx: &mut RequestContext,
-        complete: &ProtoGenerateComplete,
-        tokenizer: &Arc<dyn llm_tokenizer::traits::Tokenizer>,
-    ) -> Result<ChatCompletionMessage, Response> {
-        let request = ctx.chat_request_arc();
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&request);
-        let reasoning_parser_available = request.separate_reasoning
-            && utils::check_reasoning_parser_availability(
-                &self.processor.reasoning_parser_factory,
-                self.processor.configured_reasoning_parser.as_deref(),
-                &request.model,
-            );
-        let tool_choice_enabled = !matches!(
-            &request.tool_choice,
-            Some(openai_protocol::common::ToolChoice::Value(
-                openai_protocol::common::ToolChoiceValue::None
-            ))
-        );
-        let tool_parser_available = tool_choice_enabled
-            && request.tools.is_some()
-            && utils::check_tool_parser_availability(
-                &self.processor.tool_parser_factory,
-                self.processor.configured_tool_parser.as_deref(),
-                &request.model,
-            );
-        let stop_decoder = ctx.state.response.stop_decoder.as_mut().ok_or_else(|| {
-            error!(
-                function = "ChatResponseProcessingStage::parse_assistant_message",
-                "Stop decoder not initialized for TITO assistant capture"
-            );
-            error::internal_error(
-                "stop_decoder_not_initialized",
-                "Stop decoder not initialized",
-            )
-        })?;
-
-        self.processor
-            .process_single_choice(
-                complete,
-                0,
-                &request,
-                tokenizer,
-                stop_decoder,
-                history_tool_calls_count,
-                reasoning_parser_available,
-                tool_parser_available,
-            )
-            .await
-            .map(|choice| choice.message)
-            .map_err(|e| {
-                error!(
-                    function = "ChatResponseProcessingStage::parse_assistant_message",
-                    error = %e,
-                    "Failed to process assistant message for TITO capture"
-                );
-                error::internal_error(
-                    "tito_process_assistant_failed",
-                    format!("Failed to process final assistant message for TITO capture: {e}"),
-                )
-            })
-    }
+    match store.store_with_hashes(
+        &tito_ctx.session_id,
+        leaf_hash,
+        parent_hash,
+        full_ids,
+        turn_record,
+        tito_ctx.trajectory_id,
+    ) {
+        Ok(()) => debug!(session_id = %tito_ctx.session_id, "TITO stored generation result"),
+        Err(e) => {
+            warn!(session_id = %tito_ctx.session_id, error = %e, "TITO store failed (non-fatal)");
+        }
+    };
 }
 
 fn build_mismatch_report(
@@ -410,14 +391,14 @@ fn extract_turn_record(
     }
 }
 
-/// Concatenate the request messages with the assistant message.
-fn concat_messages_with_assistant_message(
-    request_messages: &[ChatMessage],
-    assistant_message: &ChatCompletionMessage,
-) -> Vec<ChatMessage> {
-    let mut messages = Vec::with_capacity(request_messages.len() + 1);
-    messages.extend_from_slice(request_messages);
-    messages.push(ChatMessage::Assistant {
+/// Build the [`ChatMessage::Assistant`] view of a server-parsed
+/// [`ChatCompletionMessage`].
+/// 
+/// The same `ChatCompletionMessage` must feed both the response that
+/// goes back to the client *and* the assistant turn
+/// that gets hashed into the TITO prefix tree.
+fn build_assistant_chat_message(assistant_message: &ChatCompletionMessage) -> ChatMessage {
+    ChatMessage::Assistant {
         content: assistant_message
             .content
             .as_ref()
@@ -425,6 +406,5 @@ fn concat_messages_with_assistant_message(
         name: None,
         tool_calls: assistant_message.tool_calls.clone(),
         reasoning_content: assistant_message.reasoning_content.clone(),
-    });
-    messages
+    }
 }

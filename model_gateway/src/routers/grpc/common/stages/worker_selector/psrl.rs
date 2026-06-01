@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, warn};
+use tracing::{error, warn, info};
 
 use super::WorkerSelectorStrategy;
 use crate::{
@@ -282,7 +282,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                             candidates.retain(|w| reservable.contains(&self.version_after_sync(w)));
 
                             if candidates.is_empty() {
-                                warn!(
+                                info!(
                                     request_id,
                                     "PSRL Stage 4: no candidates after can_reserve filter"
                                 );

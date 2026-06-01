@@ -9,7 +9,8 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
 };
 use smg_tito::{
-    engine::TitoEngine, model_adapter, TitoStore, TITO_SESSION_HEADER, TITO_TRAJECTORY_ID_HEADER,
+    engine::TitoEngine, model_adapter, PrefixLookup, TitoStore, TITO_SESSION_HEADER,
+    TITO_TRAJECTORY_ID_HEADER,
 };
 use tracing::{debug, error, warn};
 
@@ -350,6 +351,34 @@ impl ChatPreparationStage {
             error::bad_request("tito_render_context_failed", e)
         })?;
 
+        debug!(
+            session_id = %session_id,
+            total_messages = messages.len(),
+            assistants = %smg_tito::assistants_diagnostic_summary(messages),
+            "TITO find_prefix: assistants diagnostic"
+        );
+
+        let lookup: PrefixLookup = match store.find_prefix_with_lookup(
+            &session_id,
+            messages,
+            &render_context,
+        ) {
+            Ok(lookup) => lookup,
+            Err(e) => {
+                warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
+                return Err(error::bad_request(
+                    "tito_invalid_appended_messages",
+                    e.to_string(),
+                ));
+            }
+        };
+
+        // Stash the running hasher state and parent hash into the TITO context
+        // so the response stage can derive the leaf hash by extending this
+        // hasher with the new assistant message.
+        let running_hasher = lookup.running_hasher.clone();
+        let parent_hash = lookup.parent_hash;
+
         ctx.state.tito_context = Some(TitoRequestContext {
             session_id: session_id.clone(),
             request: request_arc,
@@ -358,12 +387,13 @@ impl ChatPreparationStage {
             matched_message_num: 0,
             trajectory_id,
             prompt_token_ids: Vec::new(),
+            running_hasher,
+            parent_hash,
         });
 
-        // Attempt prefix lookup
-        let prefix_match = match store.find_prefix(&session_id, messages, &render_context) {
-            Ok(Some(pm)) => {
-                warn!(
+        let prefix_match = match lookup.matched {
+            Some(pm) => {
+                debug!(
                     session_id = %session_id,
                     matched_messages = pm.matched_message_num,
                     prefix_token_len = pm.pretokenized_ids.len(),
@@ -372,20 +402,13 @@ impl ChatPreparationStage {
                 );
                 pm
             }
-            Ok(None) => {
-                warn!(
+            None => {
+                debug!(
                     session_id = %session_id,
                     total_messages = messages.len(),
                     "TITO MISS — no cached prefix found, falling through to full retokenize"
                 );
                 return Ok(None);
-            }
-            Err(e) => {
-                warn!(session_id = %session_id, error = %e, "TITO find_prefix error");
-                return Err(error::bad_request(
-                    "tito_invalid_appended_messages",
-                    e.to_string(),
-                ));
             }
         };
 

@@ -13,14 +13,18 @@ use crate::routers::grpc::context::RequestContext;
 
 /// Phase a pipeline stage belongs to.
 ///
-/// Used by `execute_through_execution` / `execute_remaining_stages` to split
-/// the pipeline at the execution boundary for partial-rollout loopback.
+/// Used by `execute_worker_selection` / `execute_post_selection_execution` /
+/// `execute_remaining_stages` to split the pipeline at the worker-selection
+/// and execution boundaries (the latter is needed for partial-rollout
+/// loopback).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StagePhase {
     /// Stage 0 — tokenisation, prompt pre-processing.
     Preparation,
-    /// Stages 1-5 — worker selection, client acquisition, request building,
-    /// dispatch metadata, request execution (the "hot path").
+    /// Stage 1 — worker selection
+    WorkerSelection,
+    /// Stages 2-5 — client acquisition, request building, dispatch metadata,
+    /// request execution.
     Execution,
     /// Stage 6 — response serialisation, streaming, metrics emission.
     PostExecution,

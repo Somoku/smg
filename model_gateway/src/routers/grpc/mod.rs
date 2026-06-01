@@ -20,7 +20,7 @@ pub mod utils; // Used by routers/http and bindings/golang
 pub use proto_wrapper::{MultimodalData, TensorBytes};
 
 /// Processed chat messages ready for gRPC generation
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ProcessedMessages {
     pub text: String,
     /// Preprocessed multimodal intermediate (deferred assembly).

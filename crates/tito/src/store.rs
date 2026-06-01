@@ -13,8 +13,8 @@ use serde::Serialize;
 use crate::{
     error::TitoError,
     normalizer::{
-        hash_message_into, hash_messages_with_context, initialize_context_hasher, PrefixHash,
-        RenderContext,
+        finalize_hash, hash_message_into, hash_messages_with_context, initialize_context_hasher,
+        PrefixHash, PrefixHasher, RenderContext,
     },
 };
 
@@ -107,6 +107,26 @@ pub struct PrefixMatch {
     pub pretokenized_ids: Vec<u32>,
     /// How many messages from the start were matched (messages[..matched_len] is cached).
     pub matched_message_num: usize,
+}
+
+
+/// `running_hasher` is the [`PrefixHasher`] state after folding both the
+/// render context and every message in the lookup `messages` slice.
+///
+/// `parent_hash` is the hash at the **last assistant boundary** in the
+/// lookup `messages` slice — i.e. the hash of `messages[..=last_assistant]`.
+/// When the caller appends the new assistant message and stores it, this is
+/// exactly the parent of the new node in the prefix tree.  `None` means the
+/// lookup messages contained no assistant turn at all (root-level store).
+pub struct PrefixLookup {
+    /// Pretokenized prefix on a cache hit; `None` on miss.
+    pub matched: Option<PrefixMatch>,
+    /// Hasher state after folding `(render_context, messages...)`.
+    /// Clone-and-extend with the new assistant message to derive the leaf hash.
+    pub running_hasher: PrefixHasher,
+    /// Hash at the last assistant boundary in the lookup `messages`.  This is
+    /// the parent hash for any node about to be stored after this lookup.
+    pub parent_hash: Option<PrefixHash>,
 }
 
 impl Default for TitoStore {
@@ -221,32 +241,64 @@ impl TitoStore {
     }
 
     /// Look up the longest cached prefix for `messages`.
-    ///
-    /// Returns `Err(TitoError::AssistantInAppended)` if the appended slice would
-    /// contain an assistant turn (client sequencing bug).
-    /// Returns `Ok(None)` on a cache miss.
     pub fn find_prefix(
         &self,
         session_id: &str,
         messages: &[ChatMessage],
         render_context: &RenderContext,
     ) -> Result<Option<PrefixMatch>, TitoError> {
-        if messages.len() < 2 {
-            tracing::debug!(session_id = %session_id, msg_count = messages.len(), "find_prefix: messages too short");
-            return Ok(None);
-        }
+        Ok(self
+            .find_prefix_with_lookup(session_id, messages, render_context)?
+            .matched)
+    }
 
-        // Forward pass: collect (k, hash) at each assistant boundary using incremental hashing.
+    /// Look up the longest cached prefix for `messages` and emit hash-chain
+    /// state usable by [`Self::store_with_hashes`].
+    ///
+    /// Returns `Err(TitoError::AssistantInAppended)` if a HIT candidate would
+    /// require an assistant turn inside the appended slice (client sequencing
+    /// bug).
+    /// 
+    /// On a miss, the running hasher and parent hash are still populated,
+    /// so the caller can store a root node for the session without paying
+    /// for a second full message walk.
+    pub fn find_prefix_with_lookup(
+        &self,
+        session_id: &str,
+        messages: &[ChatMessage],
+        render_context: &RenderContext,
+    ) -> Result<PrefixLookup, TitoError> {
         let mut hasher = initialize_context_hasher(render_context);
         let mut candidates: Vec<(usize, PrefixHash)> = Vec::new();
+        let mut parent_hash: Option<PrefixHash> = None;
 
         for (i, msg) in messages.iter().enumerate() {
             hash_message_into(&mut hasher, msg);
             let k = i + 1;
-            if is_assistant_role(msg) && k < messages.len() {
-                let hash = *hasher.clone().finalize().as_bytes();
-                candidates.push((k, hash));
+            if is_assistant_role(msg) {
+                let h = finalize_hash(&hasher);
+                parent_hash = Some(h);
+                if k < messages.len() {
+                    candidates.push((k, h));
+                }
             }
+        }
+
+        // messages too short to possibly cover a cached prefix.
+        // We still return the running hasher so the caller
+        // can store a root-level entry.
+        if messages.len() < 2 || candidates.is_empty() {
+            tracing::debug!(
+                session_id = %session_id,
+                msg_count = messages.len(),
+                candidate_count = candidates.len(),
+                "find_prefix_with_lookup: no candidates"
+            );
+            return Ok(PrefixLookup {
+                matched: None,
+                running_hasher: hasher,
+                parent_hash,
+            });
         }
 
         tracing::debug!(
@@ -256,7 +308,7 @@ impl TitoStore {
                 .get_session_arc(session_id)
                 .map(|arc| arc.lock().entries.len())
                 .unwrap_or(0),
-            "find_prefix: lookup start"
+            "find_prefix_with_lookup: lookup start"
         );
 
         // Check from longest prefix to shortest. `get_session_arc` ensures the
@@ -264,8 +316,12 @@ impl TitoStore {
         let arc = match self.get_session_arc(session_id) {
             Some(arc) => arc,
             None => {
-                tracing::debug!(session_id = %session_id, "find_prefix: session not found");
-                return Ok(None);
+                tracing::debug!(session_id = %session_id, "find_prefix_with_lookup: session not found");
+                return Ok(PrefixLookup {
+                    matched: None,
+                    running_hasher: hasher,
+                    parent_hash,
+                });
             }
         };
         let state = arc.lock();
@@ -276,26 +332,31 @@ impl TitoStore {
                 if appended.iter().any(is_assistant_role) {
                     return Err(TitoError::AssistantInAppended);
                 }
-                tracing::debug!(session_id = %session_id, matched_len = *k, prefix_tokens = entry.token_ids.len(), "find_prefix: HIT");
-                return Ok(Some(PrefixMatch {
-                    pretokenized_ids: (*entry.token_ids).clone(),
-                    matched_message_num: *k,
-                }));
+                tracing::debug!(
+                    session_id = %session_id,
+                    matched_len = *k,
+                    prefix_tokens = entry.token_ids.len(),
+                    "find_prefix_with_lookup: HIT"
+                );
+                return Ok(PrefixLookup {
+                    matched: Some(PrefixMatch {
+                        pretokenized_ids: (*entry.token_ids).clone(),
+                        matched_message_num: *k,
+                    }),
+                    running_hasher: hasher,
+                    parent_hash,
+                });
             }
         }
 
-        Ok(None)
+        Ok(PrefixLookup {
+            matched: None,
+            running_hasher: hasher,
+            parent_hash,
+        })
     }
 
     /// Store token IDs for a completed generation.
-    ///
-    /// `messages` must end with the assistant turn.  The slice is used only for
-    /// hash computation and is not retained after this call returns.
-    ///
-    /// `trajectory_id` identifies which trajectory (leaf pointer) this turn belongs to.
-    /// After the entry is inserted the trajectory pointer for `trajectory_id` is advanced
-    /// to the new hash, and a GC pass removes all nodes that are not reachable from any
-    /// live trajectory pointer.
     pub fn store(
         &self,
         session_id: &str,
@@ -305,9 +366,37 @@ impl TitoStore {
         render_context: &RenderContext,
         trajectory_id: u64,
     ) -> Result<(), TitoError> {
-        let hash = hash_messages_with_context(messages, render_context);
+        let leaf_hash = hash_messages_with_context(messages, render_context);
         let parent_hash = compute_parent_hash(messages, render_context);
+        self.store_with_hashes(
+            session_id,
+            leaf_hash,
+            parent_hash,
+            token_ids,
+            turn_record,
+            trajectory_id,
+        )
+    }
 
+    /// Store token IDs for a completed generation using caller-supplied hashes.
+    ///
+    /// `leaf_hash` must equal `hash_messages_with_context(all_messages,
+    /// render_context)` where `all_messages` is the full conversation
+    /// including the new assistant turn.  `parent_hash` must equal the
+    /// `hash_messages_with_context` of the prefix that ends at the
+    /// second-to-last assistant turn (or `None` for a root-level node).
+    /// Callers that obtain these hashes from [`PrefixLookup`] satisfy this
+    /// invariant by construction; other callers should prefer the higher-level
+    /// [`Self::store`] which derives the hashes itself.
+    pub fn store_with_hashes(
+        &self,
+        session_id: &str,
+        leaf_hash: PrefixHash,
+        parent_hash: Option<PrefixHash>,
+        token_ids: Vec<u32>,
+        turn_record: TurnRecord,
+        trajectory_id: u64,
+    ) -> Result<(), TitoError> {
         let arc = self.get_or_create_session_arc(session_id);
         let mut state = arc.lock();
 
@@ -315,10 +404,10 @@ impl TitoStore {
         if let Some(ph) = parent_hash {
             state.leaf_hashes.remove(&ph);
         }
-        state.leaf_hashes.insert(hash);
+        state.leaf_hashes.insert(leaf_hash);
 
         state.entries.insert(
-            hash,
+            leaf_hash,
             PrefixEntry {
                 token_ids: Arc::new(token_ids),
                 parent_hash,
@@ -327,7 +416,7 @@ impl TitoStore {
         );
 
         // Advance the trajectory pointer for this trajectory_id to the newly stored hash.
-        state.trajectory_leaves.insert(trajectory_id, hash);
+        state.trajectory_leaves.insert(trajectory_id, leaf_hash);
 
         // GC: remove leaves (and their unreachable ancestors) that no live trajectory
         // points to.  We compute the set of hashes reachable from all trajectory
@@ -1067,5 +1156,184 @@ mod tests {
         // A second session still gets the default.
         store.create_session("t2");
         assert_eq!(store.get_session_gc_threshold("t2"), 10);
+    }
+
+    // -- Hash-reuse contract tests ---------------------------------------------
+    //
+    // The chat path obtains the leaf and parent hashes from `PrefixLookup`
+    // rather than walking the message slice twice.  These tests pin down that
+    // those reused hashes are byte-identical to what the legacy code path
+    // (`hash_messages_with_context` + `compute_parent_hash`) would have
+    // produced, so the on-disk prefix tree stays compatible.
+
+    fn extend_for_assistant(
+        lookup: &PrefixLookup,
+        assistant: &ChatMessage,
+    ) -> PrefixHash {
+        let mut hasher = lookup.running_hasher.clone();
+        hash_message_into(&mut hasher, assistant);
+        finalize_hash(&hasher)
+    }
+
+    #[test]
+    fn lookup_running_hasher_matches_full_hash_no_assistant() {
+        let store = make_store();
+        let ctx = render_context();
+        let request_msgs = vec![user_msg("hi")];
+        let new_assistant = assistant_msg("hello");
+
+        let mut all_msgs = request_msgs.clone();
+        all_msgs.push(new_assistant.clone());
+
+        let lookup = store
+            .find_prefix_with_lookup("s1", &request_msgs, &ctx)
+            .unwrap();
+        let reused_leaf = extend_for_assistant(&lookup, &new_assistant);
+        let canonical_leaf = hash_messages_with_context(&all_msgs, &ctx);
+        assert_eq!(reused_leaf, canonical_leaf);
+        // No prior assistant in request → root node.
+        assert!(lookup.parent_hash.is_none());
+    }
+
+    #[test]
+    fn lookup_parent_hash_matches_compute_parent_hash() {
+        let store = make_store();
+        let ctx = render_context();
+        let request_msgs = vec![
+            user_msg("a"),
+            assistant_msg("b"),
+            user_msg("c"),
+            assistant_msg("d"),
+            user_msg("e"),
+        ];
+        let new_assistant = assistant_msg("f");
+
+        let mut all_msgs = request_msgs.clone();
+        all_msgs.push(new_assistant.clone());
+
+        let lookup = store
+            .find_prefix_with_lookup("s1", &request_msgs, &ctx)
+            .unwrap();
+        // Leaf hash via reused hasher must equal the canonical one-shot hash.
+        let reused_leaf = extend_for_assistant(&lookup, &new_assistant);
+        assert_eq!(reused_leaf, hash_messages_with_context(&all_msgs, &ctx));
+        // Parent hash via lookup must equal the legacy compute_parent_hash.
+        assert_eq!(
+            lookup.parent_hash,
+            compute_parent_hash(&all_msgs, &ctx),
+            "parent_hash from lookup must match legacy compute_parent_hash"
+        );
+    }
+
+    #[test]
+    fn lookup_parent_hash_handles_assistant_at_end_of_request() {
+        // Pathological: client sent a request whose final message is an
+        // assistant.  Legacy `compute_parent_hash` finds the assistant inside
+        // request.messages as the second-to-last assistant in all_messages
+        // (where all_messages = request + new_assistant).  Our running
+        // parent_hash must match that for the on-disk tree to stay coherent.
+        let store = make_store();
+        let ctx = render_context();
+        let request_msgs = vec![
+            user_msg("a"),
+            assistant_msg("b"),
+            user_msg("c"),
+            assistant_msg("d"),
+        ];
+        let new_assistant = assistant_msg("e");
+
+        let mut all_msgs = request_msgs.clone();
+        all_msgs.push(new_assistant.clone());
+
+        let lookup = store
+            .find_prefix_with_lookup("s1", &request_msgs, &ctx)
+            .unwrap();
+        assert_eq!(lookup.parent_hash, compute_parent_hash(&all_msgs, &ctx));
+    }
+
+    #[test]
+    fn store_with_hashes_matches_store() {
+        // Same input through both paths must produce identical tree state.
+        let ctx = render_context();
+        let request_msgs = vec![user_msg("a"), assistant_msg("b"), user_msg("c")];
+        let new_assistant = assistant_msg("d");
+
+        let mut all_msgs = request_msgs.clone();
+        all_msgs.push(new_assistant.clone());
+
+        // Reference: legacy `store` derives both hashes itself.
+        let reference = make_store();
+        reference.create_session("s");
+        reference
+            .store(
+                "s",
+                &all_msgs,
+                vec![1, 2, 3],
+                record(3, "stop"),
+                &ctx,
+                42,
+            )
+            .unwrap();
+
+        // Reused: caller passes hashes obtained from the lookup.
+        let reused = make_store();
+        reused.create_session("s");
+        let lookup = reused
+            .find_prefix_with_lookup("s", &request_msgs, &ctx)
+            .unwrap();
+        let leaf_hash = extend_for_assistant(&lookup, &new_assistant);
+        reused
+            .store_with_hashes(
+                "s",
+                leaf_hash,
+                lookup.parent_hash,
+                vec![1, 2, 3],
+                record(3, "stop"),
+                42,
+            )
+            .unwrap();
+
+        // Both stores should have identical trajectory output.
+        let trajs_ref = reference.get_all_trajectories("s");
+        let trajs_new = reused.get_all_trajectories("s");
+        assert_eq!(trajs_ref.len(), trajs_new.len());
+        let r = &trajs_ref[0];
+        let n = &trajs_new[0];
+        assert_eq!(r.trajectory_id, n.trajectory_id);
+        assert_eq!(r.accumulated_token_ids, n.accumulated_token_ids);
+        assert_eq!(r.turn_records.len(), n.turn_records.len());
+    }
+
+    #[test]
+    fn find_prefix_compatibility_wrapper_returns_same_match() {
+        // The legacy `find_prefix(...) -> Option<PrefixMatch>` API must keep
+        // returning exactly what it used to: HIT data when the prefix exists,
+        // None otherwise.  We rely on this for back-compat with callers that
+        // haven't migrated to `find_prefix_with_lookup`.
+        let store = make_store();
+        let ctx = render_context();
+        let prefix = vec![user_msg("hi"), assistant_msg("hello")];
+        store_turn(
+            &store,
+            "s1",
+            &prefix,
+            vec![1, 2, 3],
+            record(2, "stop"),
+            &ctx,
+        );
+        let query = vec![
+            user_msg("hi"),
+            assistant_msg("hello"),
+            user_msg("more"),
+        ];
+
+        let legacy_hit = store.find_prefix("s1", &query, &ctx).unwrap();
+        let lookup = store.find_prefix_with_lookup("s1", &query, &ctx).unwrap();
+        assert!(legacy_hit.is_some());
+        assert!(lookup.matched.is_some());
+        let legacy = legacy_hit.unwrap();
+        let new = lookup.matched.unwrap();
+        assert_eq!(legacy.pretokenized_ids, new.pretokenized_ids);
+        assert_eq!(legacy.matched_message_num, new.matched_message_num);
     }
 }

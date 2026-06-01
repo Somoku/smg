@@ -54,7 +54,13 @@ impl ResponseProcessor {
         }
     }
 
-    /// Process a single choice from GenerateComplete response
+    /// Process a single choice from GenerateComplete response.
+    ///
+    /// `suppress_logprobs`: when `true`, the per-token `tokenizer.decode` pass
+    /// that builds [`openai_protocol::common::ChatLogProbs`] is skipped and
+    /// the resulting `ChatChoice.logprobs` is `None`.  TITO consumers that
+    /// need logprobs read them directly from the proto response instead, so
+    /// suppression here only affects what reaches the outbound HTTP body.
     #[expect(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
@@ -66,6 +72,7 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
         tool_parser_available: bool,
+        suppress_logprobs: bool,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -186,10 +193,14 @@ impl ResponseProcessor {
 
         let matched_stop = complete.matched_stop_json();
 
-        // Step 4: Convert output logprobs if present
-        let logprobs = complete.output_logprobs().map(|ref proto_logprobs| {
-            utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
-        });
+        // Step 4: Convert output logprobs if present.
+        let logprobs = if suppress_logprobs {
+            None
+        } else {
+            complete.output_logprobs().map(|ref proto_logprobs| {
+                utils::convert_proto_to_openai_logprobs(proto_logprobs, tokenizer)
+            })
+        };
 
         // Step 5: Build ChatCompletionMessage (proper response message type)
         let chat_message = ChatCompletionMessage {
@@ -214,20 +225,24 @@ impl ResponseProcessor {
         })
     }
 
-    /// Build a `ChatCompletionResponse` from pre-collected backend completes.
+    /// Parse all backend completes into [`ChatChoice`]s with a single decode pass per choice.
     ///
-    /// Callers are responsible for draining the stream once via
-    /// `response_collection::collect_responses`
-    pub async fn process_chat_choices_from_completes(
+    /// This is the parsing half of the non-streaming chat path; the caller is responsible for
+    /// turning the resulting choices into a [`ChatCompletionResponse`] via [`Self::build_chat_response`].
+    /// 
+    /// Splitting parse/build lets side-channel consumers (e.g. TITO capture) reuse the same
+    /// `ChatCompletionMessage` without re-running the stop decoder + tool/reasoning parsers,
+    /// which is critical because parsers such as `parse_tool_calls` mint a fresh tool-call ID per
+    /// invocation: parsing twice would yield two different IDs and silently break TITO prefix hashing.
+    pub async fn parse_chat_choices(
         &self,
         all_responses: &[ProtoGenerateComplete],
-        chat_request: Arc<ChatCompletionRequest>,
-        dispatch: DispatchMetadata,
-        tokenizer: Arc<dyn Tokenizer>,
+        chat_request: &ChatCompletionRequest,
+        tokenizer: &Arc<dyn Tokenizer>,
         stop_decoder: &mut StopSequenceDecoder,
-        _request_logprobs: bool,
-    ) -> Result<ChatCompletionResponse, axum::response::Response> {
-        let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
+        suppress_logprobs: bool,
+    ) -> Result<Vec<ChatChoice>, axum::response::Response> {
+        let history_tool_calls_count = utils::get_history_tool_calls_count(chat_request);
 
         // Check parser availability once upfront (not per choice)
         let reasoning_parser_available = chat_request.separate_reasoning
@@ -266,18 +281,19 @@ impl ResponseProcessor {
         }
 
         // Process all choices
-        let mut choices = Vec::new();
+        let mut choices = Vec::with_capacity(all_responses.len());
         for (index, complete) in all_responses.iter().enumerate() {
             match self
                 .process_single_choice(
                     complete,
                     index,
-                    &chat_request,
-                    &tokenizer,
+                    chat_request,
+                    tokenizer,
                     stop_decoder,
                     history_tool_calls_count,
                     reasoning_parser_available,
                     tool_parser_available,
+                    suppress_logprobs,
                 )
                 .await
             {
@@ -291,18 +307,23 @@ impl ResponseProcessor {
             }
         }
 
-        // Build usage
-        let usage = response_formatting::build_usage(all_responses);
+        Ok(choices)
+    }
 
-        // Build final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.clone())
-                .build(),
-        )
+    /// Assemble a [`ChatCompletionResponse`] from already-parsed choices.
+    pub fn build_chat_response(
+        &self,
+        choices: Vec<ChatChoice>,
+        all_responses: &[ProtoGenerateComplete],
+        dispatch: &DispatchMetadata,
+    ) -> ChatCompletionResponse {
+        let usage = response_formatting::build_usage(all_responses);
+        ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.clone())
+            .build()
     }
 
     /// Parse tool calls using model-specific parser

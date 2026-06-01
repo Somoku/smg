@@ -6,6 +6,9 @@ use serde_json::Value;
 /// Hash type for content-addressed prefix tree nodes
 pub type PrefixHash = [u8; 32];
 
+/// Incremental hasher used by the prefix-lookup path.
+pub type PrefixHasher = blake3::Hasher;
+
 /// Rendering inputs that affect chat-template tokenization in addition to messages.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RenderContext {
@@ -63,6 +66,11 @@ pub fn initialize_context_hasher(context: &RenderContext) -> blake3::Hasher {
     let mut hasher = blake3::Hasher::new();
     hash_render_context_into(&mut hasher, context);
     hasher
+}
+
+#[inline]
+pub fn finalize_hash(hasher: &PrefixHasher) -> PrefixHash {
+    *hasher.finalize().as_bytes()
 }
 
 fn hash_render_context_into(hasher: &mut blake3::Hasher, context: &RenderContext) {
@@ -217,6 +225,93 @@ fn hash_message_content(
             }
         }
     }
+}
+
+/// Render a one-line, byte-level digest of every assistant message in `messages`.
+///
+/// This is a debugging aid for diagnosing TITO prefix-hash mismatches across turns:
+/// the store side (after generation) and the lookup side (`find_prefix`) both log
+/// this string, so any per-field divergence — content length/sha, tool-call ids,
+/// `reasoning_content`, `name` presence — becomes visible at a glance when grepping
+/// a single `session_id`.
+pub fn assistants_diagnostic_summary(messages: &[ChatMessage]) -> String {
+    use openai_protocol::chat::MessageContent;
+
+    let mut out = String::with_capacity(64);
+    out.push('[');
+    let mut first = true;
+    for (i, msg) in messages.iter().enumerate() {
+        let ChatMessage::Assistant {
+            content,
+            name,
+            tool_calls,
+            reasoning_content,
+        } = msg
+        else {
+            continue;
+        };
+
+        if first {
+            first = false;
+        } else {
+            out.push_str(" | ");
+        }
+
+        // Position k = i+1 (the prefix length once this assistant has been hashed).
+        out.push_str(&format!(
+            "k={} name={}",
+            i + 1,
+            if name.is_some() { "Some" } else { "None" }
+        ));
+
+        match content {
+            None => out.push_str(" content=None"),
+            Some(MessageContent::Text(s)) => out.push_str(&format!(
+                " content=Text({},{})",
+                s.len(),
+                short_sha(s.as_bytes())
+            )),
+            Some(MessageContent::Parts(parts)) => {
+                out.push_str(&format!(" content=Parts({})", parts.len()))
+            }
+        }
+
+        match reasoning_content {
+            None => out.push_str(" rc=None"),
+            Some(s) => out.push_str(&format!(" rc=Some({},{})", s.len(), short_sha(s.as_bytes()))),
+        }
+
+        match tool_calls {
+            None => out.push_str(" tc=None"),
+            Some(tcs) => {
+                out.push_str(&format!(" tc=[n={}", tcs.len()));
+                for (j, tc) in tcs.iter().enumerate() {
+                    let args = tc.function.arguments.as_deref().unwrap_or("{}");
+                    out.push_str(&format!(
+                        " {}:(id={},type={},name={},args=({},{}))",
+                        j,
+                        tc.id,
+                        tc.tool_type,
+                        tc.function.name,
+                        args.len(),
+                        short_sha(args.as_bytes())
+                    ));
+                }
+                out.push(']');
+            }
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn short_sha(bytes: &[u8]) -> String {
+    let h = blake3::hash(bytes);
+    let prefix = &h.as_bytes()[..4];
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}",
+        prefix[0], prefix[1], prefix[2], prefix[3]
+    )
 }
 
 fn canonicalize_json(json_str: &str) -> String {

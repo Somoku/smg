@@ -204,7 +204,7 @@ pub(crate) struct MultimodalOutput {
 /// Holds all preprocessing results without serializing tensors to bytes.
 /// The assembly stage converts this into a backend-specific [`MultimodalData`]
 /// variant once the target backend is known (after worker selection).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct MultimodalIntermediate {
     /// Preprocessed pixel values and model-specific tensors (not yet serialized).
     pub preprocessed: PreprocessedImages,

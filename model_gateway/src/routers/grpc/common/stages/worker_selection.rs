@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::{error, warn};
 
-use super::{worker_selector::WorkerSelectorStrategy, PipelineStage};
+use super::{worker_selector::WorkerSelectorStrategy, PipelineStage, StagePhase};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
@@ -146,6 +146,10 @@ impl PipelineStage for WorkerSelectionStage {
 
     fn name(&self) -> &'static str {
         "WorkerSelection"
+    }
+
+    fn phase(&self) -> StagePhase {
+        StagePhase::WorkerSelection
     }
 }
 
