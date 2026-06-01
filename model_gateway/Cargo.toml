@@ -119,7 +119,7 @@ arc-swap = "1.7.1"
 bitflags.workspace = true
 once_cell = "1.21.3"
 sha2 = "0.10"
-base64 = "0.22"
+base64 = { workspace = true }
 image = { version = "0.25.4", default-features = false }
 tokio-tungstenite = { workspace = true }
 webpki-roots = { workspace = true }

@@ -108,17 +108,69 @@ impl TurnRoutedExpertsDtype {
             Self::U16 => "uint16",
         }
     }
+
+    /// Corresponding `.npy` writer dtype.
+    const fn as_npy(self) -> openai_protocol::npy::NpyDtype {
+        match self {
+            Self::U8 => openai_protocol::npy::NpyDtype::U8,
+            Self::U16 => openai_protocol::npy::NpyDtype::U16,
+        }
+    }
 }
 
 /// Routed-experts payload attached to a single turn record.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct TurnRoutedExperts {
-    #[serde(skip)]
     pub data: Arc<Vec<u8>>,
     pub num_layers: u32,
     pub top_k: u32,
     pub dtype: TurnRoutedExpertsDtype,
     pub prompt_start: u32,
+}
+
+impl TurnRoutedExperts {
+    /// Bytes per token (`num_layers * top_k * dtype.size()`).
+    const fn token_bytes(&self) -> usize {
+        self.num_layers as usize * self.top_k as usize * self.dtype.size()
+    }
+
+    /// Number of tokens held in `data`.
+    fn num_tokens(&self) -> usize {
+        match self.token_bytes() {
+            0 => 0,
+            row => self.data.len() / row,
+        }
+    }
+}
+
+impl Serialize for TurnRoutedExperts {
+    /// Emit `{data: base64(.npy), num_layers, top_k, dtype, prompt_start}`, or
+    /// `null` when no tokens were captured (degenerate blobs help no consumer).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        use serde::ser::SerializeStruct;
+
+        let tokens = self.num_tokens();
+        if tokens == 0 {
+            return serializer.serialize_none();
+        }
+
+        let shape = [
+            tokens as u64,
+            u64::from(self.num_layers),
+            u64::from(self.top_k),
+        ];
+        let npy = openai_protocol::npy::encode_npy(&shape, self.dtype.as_npy(), &self.data);
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(npy);
+
+        let mut state = serializer.serialize_struct("TurnRoutedExperts", 5)?;
+        state.serialize_field("data", &data_b64)?;
+        state.serialize_field("num_layers", &self.num_layers)?;
+        state.serialize_field("top_k", &self.top_k)?;
+        state.serialize_field("dtype", self.dtype.wire_str())?;
+        state.serialize_field("prompt_start", &self.prompt_start)?;
+        state.end()
+    }
 }
 
 /// A single mismatch between TITO accumulated tokens and canonical retokenization.
@@ -1428,5 +1480,54 @@ mod tests {
         let new = lookup.matched.unwrap();
         assert_eq!(legacy.pretokenized_ids, new.pretokenized_ids);
         assert_eq!(legacy.matched_message_num, new.matched_message_num);
+    }
+
+    #[test]
+    fn routed_experts_serializes_as_base64_npy_blob() {
+        use base64::Engine as _;
+
+        // 2 rows × 2 layers × 3 top_k = 12 uint8 bytes.
+        let re = TurnRoutedExperts {
+            data: Arc::new((0u8..12).collect()),
+            num_layers: 2,
+            top_k: 3,
+            dtype: TurnRoutedExpertsDtype::U8,
+            prompt_start: 5,
+        };
+        let value = serde_json::to_value(&re).unwrap();
+        assert_eq!(value["num_layers"], 2);
+        assert_eq!(value["top_k"], 3);
+        assert_eq!(value["dtype"], "uint8");
+        assert_eq!(value["prompt_start"], 5);
+        let blob = base64::engine::general_purpose::STANDARD
+            .decode(value["data"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(&blob[..6], b"\x93NUMPY");
+    }
+
+    #[test]
+    fn routed_experts_zero_rows_serializes_as_null() {
+        let re = TurnRoutedExperts {
+            data: Arc::new(Vec::new()),
+            num_layers: 2,
+            top_k: 3,
+            dtype: TurnRoutedExpertsDtype::U8,
+            prompt_start: 0,
+        };
+        assert!(serde_json::to_value(&re).unwrap().is_null());
+    }
+
+    #[test]
+    fn turn_record_omits_routed_experts_when_absent() {
+        let record = TurnRecord {
+            prompt_token_count: 3,
+            output_logprobs: None,
+            finish_reason: "stop".to_string(),
+            mismatch_report: Vec::new(),
+            routed_experts: None,
+            weight_version: None,
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert!(value.get("routed_experts").is_none());
     }
 }
