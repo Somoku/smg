@@ -5,14 +5,19 @@
 //! fit under the live backend capacity; runtime admission lives in
 //! follow-on commits.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    cmp::Reverse,
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use parking_lot::RwLock;
 use smg_auth::RequestId;
 use thiserror::Error;
 use tokio::sync::{oneshot, watch, Notify};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::{
     inflight::InflightHandle,
@@ -20,6 +25,13 @@ use super::{
     slots::SlotPool,
     Class, ClassRuntimeConfig, SchedulerSettings,
 };
+
+/// Max time to wait, after firing a preemption cancel, for the victim's slot
+/// to free before falling back to enqueue.
+const PREEMPTION_WAIT_BUDGET: Duration = Duration::from_millis(50);
+
+/// Poll interval while waiting for a preempted slot to free.
+const PREEMPTION_POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Construction-time failures for [`PriorityScheduler::new`].
 ///
@@ -47,7 +59,7 @@ pub enum RejectionReason {
     /// Queued waiter aged past `queue_timeout`. → 408.
     QueueTimeout,
     /// Scheduler cancelled this inflight to admit a higher-priority
-    /// waiter. → 503 + Retry-After. Lands in a later commit.
+    /// waiter. → 503 + Retry-After.
     Preempted,
     /// The caller's cancellation token fired before admission completed
     /// (typically the HTTP client disconnected). Never serialized — the
@@ -163,6 +175,64 @@ impl PriorityScheduler {
             return AdmitOutcome::Admitted(permit);
         }
 
+        // Preemption path: if this class may preempt, try to cancel one
+        // lower-class pre-TTFT request and claim its slot. At most one
+        // preemption per admission (no cascading); if the victim's body
+        // doesn't wind down within the budget we fall through to enqueue
+        // — the cancel still fired, so the slot frees shortly regardless.
+        if self.class_config[class as usize].can_preempt {
+            // Don't cancel a victim on behalf of a caller whose client has
+            // already disconnected — the queued path treats a fired `cancel`
+            // as ClientCancelled, and the preempt path must match.
+            if cancel.is_cancelled() {
+                return AdmitOutcome::Rejected(RejectionReason::ClientCancelled);
+            }
+            if let Some(victim) = self.find_preemption_victim(class) {
+                // CAS the victim pre-TTFT lock. Fire its cancel only on a
+                // win, so we never unwind a request that already streamed.
+                //
+                // The mark is irreversible (no rollback — a CAS back to 0
+                // could race a now-arriving first byte). So a victim that
+                // doesn't unwind within the budget is still preempted: its
+                // first data frame is truncated by `SchedulerGuardBody`. For
+                // the victim to actually unwind, its handler must honor the
+                // cancel token (wired into the long-running handlers in M4.5
+                // / #1577); until that lands the flag must stay off.
+                //
+                // The freed slot is not reserved for this preemptor — the
+                // dispatcher (on the victim's release) or a concurrent
+                // fast-path admit may take it first, in which case we simply
+                // fall through to enqueue. A successful mark therefore does
+                // not guarantee this preemptor benefits.
+                if victim.try_mark_preempted() {
+                    info!(
+                        victim_id = %victim.request_id().0,
+                        victim_class = ?victim.class(),
+                        preemptor_class = ?class,
+                        "scheduler: preempting pre-TTFT request to admit higher class"
+                    );
+                    victim.cancel();
+                    if let Some(permit) = self
+                        .wait_for_slot(class, request_id.clone(), &cancel, PREEMPTION_WAIT_BUDGET)
+                        .await
+                    {
+                        return AdmitOutcome::Admitted(permit);
+                    }
+                    // Client went away while we waited — don't enqueue work
+                    // nobody is waiting for.
+                    if cancel.is_cancelled() {
+                        return AdmitOutcome::Rejected(RejectionReason::ClientCancelled);
+                    }
+                    warn!(
+                        preemptor_class = ?class,
+                        budget_ms = PREEMPTION_WAIT_BUDGET.as_millis() as u64,
+                        "scheduler: preempted slot did not free within budget; enqueueing"
+                    );
+                    // Slot not free in time — fall through to enqueue.
+                }
+            }
+        }
+
         // Slow path: enqueue and wait. The waiter holds a child cancel
         // token of the caller's `cancel` so the queue's
         // `drop_cancelled_head` GC sees the cancellation regardless of
@@ -218,6 +288,71 @@ impl PriorityScheduler {
         self.inflight_registry.write().remove(handle.request_id());
         self.slot_pool.release(handle.class());
         self.release_notify.notify_one();
+    }
+
+    /// Test-only in-flight count for a class. Lets sibling-module tests
+    /// (e.g. `body.rs`) assert slot release without reaching the private
+    /// `slot_pool` field.
+    #[cfg(test)]
+    pub(crate) fn inflight_for_test(&self, class: Class) -> u16 {
+        self.slot_pool.inflight(class)
+    }
+
+    /// Find the best preemption victim for an admission of `waiter_class`,
+    /// or `None` if there is no eligible victim.
+    ///
+    /// Eligible = a strictly-lower-class inflight request that is still
+    /// pre-TTFT (`is_preemptible`). Among those, prefer the **lowest
+    /// class** (cheapest to cancel) and, within that class, the
+    /// **most-recently-admitted** request (least upstream work wasted).
+    /// `Reverse(class)` makes the lowest class sort highest under
+    /// `max_by_key`; `admitted_at` then breaks ties toward the newest.
+    ///
+    /// Read-locks the registry only; never mutates. Callers gate this on
+    /// `class_config[class].can_preempt`, so it runs only on the
+    /// contention path for a preempt-capable class — never the hot path.
+    fn find_preemption_victim(&self, waiter_class: Class) -> Option<Arc<InflightHandle>> {
+        self.inflight_registry
+            .read()
+            .values()
+            .filter(|h| h.class() < waiter_class && h.is_preemptible())
+            .max_by_key(|h| (Reverse(h.class()), h.admitted_at()))
+            .cloned()
+    }
+
+    /// Poll the slot pool for up to `budget` for a slot to free under
+    /// `class`, returning a permit if one is acquired. Used only after
+    /// firing a preemption cancel, to grab the victim's slot as its body
+    /// winds down. Polls (rather than sharing `release_notify` with the
+    /// dispatcher, which would let the dispatcher steal the single
+    /// `notify_one` wakeup); this is the contention path, not the hot
+    /// path, and the poll is bounded.
+    async fn wait_for_slot(
+        self: &Arc<Self>,
+        class: Class,
+        request_id: RequestId,
+        cancel: &CancellationToken,
+        budget: Duration,
+    ) -> Option<SchedulerPermit> {
+        let deadline = Instant::now() + budget;
+        loop {
+            // Acquire the slot and register in one step, consuming
+            // `request_id` only on success — so a failed poll never clones it
+            // (this loop runs up to budget/poll-interval times per
+            // preemption).
+            if self.slot_pool.try_acquire(class) {
+                return Some(self.register_inflight(class, request_id));
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            // Abort the wait if the caller's client disconnects — no point
+            // holding the victim's freed slot for a request nobody wants.
+            tokio::select! {
+                () = tokio::time::sleep(PREEMPTION_POLL_INTERVAL) => {}
+                () = cancel.cancelled() => return None,
+            }
+        }
     }
 
     /// Try to admit one queued waiter. Returns `true` if a waiter was
@@ -338,7 +473,7 @@ impl PriorityScheduler {
             .iter()
             .map(|c| self.class_config[*c as usize].starvation_threshold)
             .min()
-            .unwrap_or(std::time::Duration::from_secs(60));
+            .unwrap_or(Duration::from_secs(60));
         #[expect(
             clippy::disallowed_methods,
             reason = "dispatcher loop holds only a Weak<Self> and exits when the scheduler is dropped (Drop fires release_notify)"
@@ -452,6 +587,24 @@ impl SchedulerPermit {
     /// preemption coordination in follow-on commits).
     pub fn handle(&self) -> &Arc<InflightHandle> {
         &self.handle
+    }
+
+    /// Mark the first response byte. Called by [`super::body::SchedulerGuardBody`]
+    /// on the first data frame. Returns `false` if the scheduler already
+    /// won the preemption CAS — the body wrapper treats that as
+    /// "preempted, end the stream." The TTFT value is `admitted_at`
+    /// elapsed in millis, clamped by the handle to `[1, u64::MAX - 1]`.
+    pub fn try_mark_first_byte(&self) -> bool {
+        let now_ms = self.handle.admitted_at().elapsed().as_millis() as u64;
+        self.handle.try_mark_first_byte(now_ms)
+    }
+
+    /// Clone of the scheduler-owned cancel token for this request. The
+    /// admission middleware inserts this into request extensions so the
+    /// handler can `select!` against it; the scheduler fires it on
+    /// preemption.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.handle.cancel_token()
     }
 }
 
@@ -1081,5 +1234,193 @@ mod tests {
         drop(permit);
         // All strong refs gone now.
         assert!(weak.upgrade().is_none());
+    }
+
+    // ── M3: preemption ────────────────────────────────────────────────
+
+    /// All classes reserved=0 (so acquire is purely capacity-bound),
+    /// short queue timeout (so declined-preempt enqueues resolve fast),
+    /// can_preempt left at defaults (System/Interactive true, others false).
+    fn preempt_settings() -> SchedulerSettings {
+        use std::collections::HashMap as StdMap;
+        let mut classes = StdMap::new();
+        for c in Class::ALL {
+            let mut cfg = ClassConfig::default_for(c);
+            cfg.reserved = 0;
+            cfg.queue_size = 8;
+            cfg.queue_timeout_secs = 1;
+            classes.insert(c, cfg);
+        }
+        let yaml = PrioritySchedulerYaml {
+            classes,
+            tenant_policies: StdMap::new(),
+        };
+        SchedulerSettings::from_cli_and_yaml(true, Class::Default, 32, Some(&yaml)).unwrap()
+    }
+
+    #[test]
+    fn test_find_victim_empty_registry_returns_none() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        assert!(sched.find_preemption_victim(Class::Interactive).is_none());
+    }
+
+    #[test]
+    fn test_find_victim_returns_lower_class_pre_ttft() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        let _bulk = sched.acquire_inflight(Class::Bulk, rid("b")).unwrap();
+        let v = sched
+            .find_preemption_victim(Class::Interactive)
+            .expect("victim");
+        assert_eq!(v.class(), Class::Bulk);
+    }
+
+    #[test]
+    fn test_find_victim_prefers_lowest_class() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        let _def = sched.acquire_inflight(Class::Default, rid("d")).unwrap();
+        let _bulk = sched.acquire_inflight(Class::Bulk, rid("b")).unwrap();
+        // Candidate Interactive: Default and Bulk both qualify; Bulk (lowest) wins.
+        let v = sched
+            .find_preemption_victim(Class::Interactive)
+            .expect("victim");
+        assert_eq!(v.class(), Class::Bulk);
+    }
+
+    #[test]
+    fn test_find_victim_skips_post_ttft() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        let _def = sched.acquire_inflight(Class::Default, rid("d")).unwrap();
+        let bulk = sched.acquire_inflight(Class::Bulk, rid("b")).unwrap();
+        bulk.handle().try_mark_first_byte(5); // Bulk no longer preemptible
+        let v = sched
+            .find_preemption_victim(Class::Interactive)
+            .expect("victim");
+        assert_eq!(
+            v.class(),
+            Class::Default,
+            "Bulk past TTFT is skipped; Default chosen"
+        );
+    }
+
+    #[test]
+    fn test_find_victim_none_for_lowest_class() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        let _def = sched.acquire_inflight(Class::Default, rid("d")).unwrap();
+        // Bulk is the lowest class — nothing is strictly lower to preempt.
+        assert!(sched.find_preemption_victim(Class::Bulk).is_none());
+    }
+
+    #[test]
+    fn test_permit_try_mark_first_byte_locks_out_preempt() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        let permit = sched.acquire_inflight(Class::Default, rid("x")).unwrap();
+        assert!(permit.try_mark_first_byte());
+        assert!(
+            !permit.handle().try_mark_preempted(),
+            "preempt must lose after TTFT is marked"
+        );
+    }
+
+    #[test]
+    fn test_permit_cancel_token_reflects_handle_cancel() {
+        let sched = PriorityScheduler::new(&preempt_settings(), 8).unwrap();
+        let permit = sched.acquire_inflight(Class::Bulk, rid("x")).unwrap();
+        let tok = permit.cancel_token();
+        assert!(!tok.is_cancelled());
+        assert!(permit.handle().try_mark_preempted());
+        permit.handle().cancel();
+        assert!(tok.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_preempt_admits_by_cancelling_lower_class() {
+        // Capacity 1, full with a pre-TTFT Bulk request. An Interactive
+        // admission (can_preempt) cancels it; a watcher drops the victim's
+        // permit on cancel (mimicking the handler unwinding), freeing the
+        // slot for the Interactive waiter.
+        let sched = PriorityScheduler::new(&preempt_settings(), 1).unwrap();
+        let victim = sched.acquire_inflight(Class::Bulk, rid("victim")).unwrap();
+        let victim_cancel = victim.cancel_token();
+
+        let sched_admit = Arc::clone(&sched);
+        let admit_fut = async move {
+            sched_admit
+                .admit(Class::Interactive, rid("vip"), CancellationToken::new())
+                .await
+        };
+        let dropper = async move {
+            victim_cancel.cancelled().await;
+            drop(victim); // handler unwinds → slot frees
+        };
+        let (outcome, ()) = tokio::join!(admit_fut, dropper);
+        assert!(matches!(outcome, AdmitOutcome::Admitted(_)));
+    }
+
+    #[tokio::test]
+    async fn test_preempt_skipped_when_caller_already_cancelled() {
+        // A preempt-capable admission whose own client has already
+        // disconnected must not cancel a lower-class victim: it returns
+        // ClientCancelled and leaves the victim untouched.
+        let sched = PriorityScheduler::new(&preempt_settings(), 1).unwrap();
+        let victim = sched.acquire_inflight(Class::Bulk, rid("victim")).unwrap();
+        let victim_cancel = victim.cancel_token();
+
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        let outcome = sched.admit(Class::Interactive, rid("vip"), cancelled).await;
+
+        assert!(matches!(
+            outcome,
+            AdmitOutcome::Rejected(RejectionReason::ClientCancelled)
+        ));
+        assert!(
+            !victim_cancel.is_cancelled(),
+            "victim must not be preempted"
+        );
+        assert_eq!(sched.inflight_for_test(Class::Bulk), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_preempt_declined_when_only_victim_past_ttft() {
+        // The single lower-class inflight has already emitted its first
+        // byte, so it is not a valid victim. The Interactive admission must
+        // NOT cancel it; it falls through to enqueue and times out.
+        let sched = PriorityScheduler::new(&preempt_settings(), 1).unwrap();
+        let victim = sched.acquire_inflight(Class::Bulk, rid("victim")).unwrap();
+        victim.handle().try_mark_first_byte(5);
+        let victim_cancel = victim.cancel_token();
+
+        let outcome = sched
+            .admit(Class::Interactive, rid("vip"), CancellationToken::new())
+            .await;
+        assert!(matches!(
+            outcome,
+            AdmitOutcome::Rejected(RejectionReason::QueueTimeout)
+        ));
+        assert!(
+            !victim_cancel.is_cancelled(),
+            "a post-TTFT request must never be cancelled"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_non_preempting_class_does_not_cancel() {
+        // Default has can_preempt=false; even with a Bulk victim available
+        // it must not attempt preemption.
+        let sched = PriorityScheduler::new(&preempt_settings(), 1).unwrap();
+        let victim = sched.acquire_inflight(Class::Bulk, rid("victim")).unwrap();
+        let victim_cancel = victim.cancel_token();
+
+        let outcome = sched
+            .admit(Class::Default, rid("plain"), CancellationToken::new())
+            .await;
+        assert!(matches!(
+            outcome,
+            AdmitOutcome::Rejected(RejectionReason::QueueTimeout)
+        ));
+        assert!(
+            !victim_cancel.is_cancelled(),
+            "can_preempt=false class must not cancel anyone"
+        );
     }
 }
