@@ -417,6 +417,7 @@ mod tests {
             logprobs: None,
             finish_reason: None,
             matched_stop: None,
+            routed_experts: None,
         };
 
         let chunk = ChatCompletionStreamResponseBuilder::new("chatcmpl_505", "gpt-4")

@@ -139,6 +139,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             matched_stop: None,
             hidden_states: None,
+            routed_experts: None,
         };
 
         let usage = Usage {
@@ -176,6 +177,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             matched_stop: None,
             hidden_states: None,
+            routed_experts: None,
         };
 
         let choice2 = ChatChoice {
@@ -190,6 +192,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             matched_stop: None,
             hidden_states: None,
+            routed_experts: None,
         };
 
         let response = ChatCompletionResponse::builder("chatcmpl_789", "gpt-4")
