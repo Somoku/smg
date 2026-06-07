@@ -22,8 +22,11 @@ use async_trait::async_trait;
 use crate::{
     config::types::{PsrlConfig, WorkerSelectionStrategy},
     policies::PolicyRegistry,
-    routers::grpc::routing_loop::{metadata::RoutingMeta, runtime::RoutingLoopRuntime},
-    worker::{Worker, WorkerRegistry},
+    routers::grpc::{
+        kv_transfer::KvTransferCoordinator,
+        routing_loop::{metadata::RoutingMeta, runtime::RoutingLoopRuntime},
+    },
+    worker::{KvEventMonitor, Worker, WorkerRegistry},
 };
 
 pub(crate) mod naive;
@@ -57,6 +60,7 @@ pub(crate) fn build_strategy(
     policy_registry: Arc<PolicyRegistry>,
     runtime: Option<Arc<RoutingLoopRuntime>>,
     config: &PsrlConfig,
+    kv_event_monitor: Option<Arc<KvEventMonitor>>,
 ) -> Result<Arc<dyn WorkerSelectorStrategy>, String> {
     match strategy {
         WorkerSelectionStrategy::Naive => Ok(Arc::new(NaiveWorkerSelector::new(
@@ -68,6 +72,15 @@ pub(crate) fn build_strategy(
             let rt = runtime.ok_or_else(|| {
                 "psrl strategy requires the routing loop to be enabled".to_string()
             })?;
+            // The transfer coordinator is only meaningful when migration is on.
+            let kv_transfer = if config.enable_mig_strategy && config.kv_transfer.enable {
+                Some(Arc::new(KvTransferCoordinator::new(
+                    config.kv_transfer.clone(),
+                    kv_event_monitor,
+                )))
+            } else {
+                None
+            };
             Ok(Arc::new(PsrlWorkerSelector::new(
                 worker_registry,
                 policy_registry,
@@ -75,6 +88,7 @@ pub(crate) fn build_strategy(
                 config.enable_mig_strategy,
                 config.candidate_sort_key,
                 config.enable_group_sticky_routing,
+                kv_transfer,
             )))
         }
     }

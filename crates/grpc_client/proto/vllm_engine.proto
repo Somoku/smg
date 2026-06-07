@@ -36,6 +36,16 @@ service VllmEngine {
   // Subscribe to preemption events (server-streaming)
   rpc SubscribePreemptionEvents(SubscribePreemptionEventsRequest)
       returns (stream PreemptionEvent);
+
+  // Transfer a trajectory's cached KV prefix from this (source) instance to a
+  // destination instance's LMCache backend.
+  rpc TransferKv(TransferKvRequest) returns (TransferKvResponse);
+
+  // Pin a trajectory's cached prefix to prevent LRU eviction during a transfer.
+  rpc PinKv(PinKvRequest) returns (PinKvResponse);
+
+  // Unpin a previously-pinned trajectory prefix.
+  rpc UnpinKv(UnpinKvRequest) returns (UnpinKvResponse);
 }
 
 // =====================
@@ -381,4 +391,55 @@ message PreemptionEvent {
   // Wall-clock time of the preemption event, nanoseconds since Unix epoch.
   // int64 is used (not uint64) for compatibility with Rust's SystemTime APIs.
   int64 timestamp_ns = 2;
+}
+
+// =====================
+// KV Cache Transfer
+// =====================
+
+// Request to transfer a trajectory's cached KV prefix to a destination
+// instance. Served by the SOURCE instance, which pushes the cached chunks to
+// the destination's LMCache backend (direct ZMQ MoveWorkerMsg, no Controller).
+message TransferKvRequest {
+  // Full token sequence identifying the trajectory prefix to move.
+  repeated uint32 tokens = 1;
+  // Destination LMCache instance id, e.g. "psrl_instance_3".
+  string dst_instance_id = 2;
+  // Destination peer init URL (NIXL endpoint, e.g. "10.0.0.1:18200").
+  string dst_peer_url = 3;
+  // Source / destination backend location strings (default "LocalCPUBackend").
+  string src_backend = 4;
+  string dst_backend = 5;
+  // If true, keep the data at the source as well (copy instead of move).
+  bool copy = 6;
+}
+
+message TransferKvResponse {
+  bool success = 1;
+  // Number of tokens actually transferred (0 if source had no cached data).
+  int64 num_tokens = 2;
+  // Error detail when success is false.
+  string error = 3;
+}
+
+// Pin / unpin a trajectory's cached prefix to prevent LRU eviction.
+message PinKvRequest {
+  repeated uint32 tokens = 1;
+  // Subset of {"gpu", "backend"}.
+  repeated string targets = 2;
+}
+
+message PinKvResponse {
+  bool success = 1;
+  string error = 2;
+}
+
+message UnpinKvRequest {
+  repeated uint32 tokens = 1;
+  repeated string targets = 2;
+}
+
+message UnpinKvResponse {
+  bool success = 1;
+  string error = 2;
 }

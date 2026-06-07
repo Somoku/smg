@@ -59,12 +59,18 @@ macro_rules! impl_subscribe_kv_events {
     () => {
         /// Subscribe to KV cache events from the backend.
         /// Returns a long-lived server-streaming response.
+        ///
+        /// `dp_rank` selects the data-parallel rank to subscribe to when the
+        /// engine fronts multiple DP ranks behind one gRPC server.
+        /// Pass `None` for single-DP backends (selects rank 0).
         pub async fn subscribe_kv_events(
             &self,
             start_sequence_number: u64,
+            dp_rank: Option<u32>,
         ) -> Result<tonic::Streaming<$crate::common_proto::KvEventBatch>, tonic::Status> {
             let request = tonic::Request::new($crate::common_proto::SubscribeKvEventsRequest {
                 start_sequence_number,
+                dp_rank,
             });
             let mut client = self.client.clone();
             let response = client.subscribe_kv_events(request).await?;

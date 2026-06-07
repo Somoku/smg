@@ -1,12 +1,24 @@
 //! Per-worker KV cache event subscription manager.
 //!
-//! `KvEventMonitor` spawns a background tokio task per gRPC worker that subscribes
-//! to KV cache events and feeds them into a shared `PositionalIndexer` (one per model).
-//! This enables event-driven cache-aware routing as an alternative to the approximate
-//! radix tree approach.
+//! `KvEventMonitor` spawns a background tokio task per (worker, dp_rank) that
+//! subscribes to KV cache events and feeds them into a shared [`TieredIndexer`]
+//! (one per model). This enables event-driven, multi-tier cache-aware routing as
+//! an alternative to the approximate radix tree approach.
+//!
+//! **Multi-tier**: backends with a layered KV cache (vLLM GPU prefix cache +
+//! LMCache CPU offload) tag each block with `cache_level` (0 = GPU, 1 = LMCache).
+//! Events are routed into the matching [`Tier`] so the router can score GPU and
+//! LMCache hits with different weights. An `AllBlocksCleared` event clears *all*
+//! tiers for the worker (PSRL weight-sync invalidates both levels at once).
+//!
+//! **Data parallelism**: when one gRPC server fronts several DP ranks (PSRL),
+//! each rank publishes on an independent stream with its own sequence counter.
+//! Subscriptions are therefore keyed by `(url, dp_rank)` and each carries its
+//! `dp_rank` in the subscribe request; interning/indexing is per-rank so caches
+//! from different ranks never alias.
 //!
 //! Lifecycle:
-//! - `on_worker_added` — spawns streaming task, creates indexer if needed
+//! - `on_worker_added` — spawns one streaming task per dp_rank, creates indexer
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 
@@ -14,7 +26,8 @@ use std::{collections::HashMap, fmt, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
 use kv_index::{
-    compute_content_hash, ApplyError, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap,
+    compute_content_hash, ApplyError, SequenceHash, StoredBlock, Tier, TieredIndexer,
+    WorkerBlockMap,
 };
 use smg_grpc_client::common_proto::{
     kv_cache_event, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheEvent, KvEventBatch,
@@ -38,22 +51,24 @@ const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 
 /// Manages per-worker KV cache event subscriptions.
 ///
-/// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
-/// KV cache event stream and feeds events into a shared `PositionalIndexer`
-/// (one per `model_id`). Workers serving the same model share the same indexer.
+/// Each (gRPC worker, dp_rank) gets a dedicated tokio task that subscribes to
+/// the backend's KV cache event stream and feeds events into a shared
+/// [`TieredIndexer`] (one per `model_id`). Workers serving the same model share
+/// the same indexer.
 pub struct KvEventMonitor {
-    /// Per-model positional indexers: model_id → shared indexer.
-    pub(crate) indexers: DashMap<String, Arc<PositionalIndexer>>,
-    /// Per-model block sizes learned from KV events or set via WorkerSpec.
-    /// Used by CacheAwarePolicy to chunk request tokens at query time.
-    /// Arc-wrapped so subscription tasks can update it from events.
-    block_sizes: Arc<DashMap<String, usize>>,
-    /// Per-worker subscription handles: worker_url → subscription info.
+    /// Per-model tiered indexers: model_id → shared indexer.
+    pub(crate) indexers: DashMap<String, Arc<TieredIndexer>>,
+    /// Per-worker subscription handles, keyed by `(url, dp_rank)`.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove.
-    worker_handles: Mutex<HashMap<String, WorkerSubscription>>,
-    /// Jump size for new PositionalIndexer instances.
+    worker_handles: Mutex<HashMap<SubscriptionKey, WorkerSubscription>>,
+    /// Jump size for new `TieredIndexer` instances.
     jump_size: usize,
 }
+
+/// Identifies a single subscription stream. A backend may front multiple DP
+/// ranks behind one URL, each with an independent event stream, so the URL
+/// alone is not unique.
+type SubscriptionKey = (String, Option<u32>);
 
 /// Tracks a single worker's subscription state.
 struct WorkerSubscription {
@@ -83,7 +98,6 @@ impl KvEventMonitor {
         let jump_size = jump_size.unwrap_or(DEFAULT_JUMP_SIZE).max(1);
         Self {
             indexers: DashMap::new(),
-            block_sizes: Arc::new(DashMap::new()),
             worker_handles: Mutex::new(HashMap::new()),
             jump_size,
         }
@@ -92,10 +106,14 @@ impl KvEventMonitor {
     /// Start a KV event subscription for a worker.
     ///
     /// Spawns a background tokio task that subscribes to KV cache events via
-    /// server-streaming gRPC and applies them to the model's `PositionalIndexer`.
-    /// Duplicate calls for the same worker URL are no-ops.
+    /// server-streaming gRPC and applies them to the model's [`TieredIndexer`].
+    /// Subscriptions are keyed by `(url, dp_rank)`; duplicate calls for the same
+    /// key are no-ops. When a backend fronts several DP ranks behind one URL,
+    /// this method is invoked once per rank (one Worker per rank), so each rank
+    /// gets its own stream.
     pub async fn on_worker_added(&self, worker: &Arc<dyn Worker>) {
         let url = worker.url().to_string();
+        let dp_rank = worker.dp_rank().map(|r| r as u32);
         // Normalize model_id to match routing's normalize_model_key — empty → "unknown".
         let model_id = Self::normalize_model_id(worker.model_id());
 
@@ -104,23 +122,26 @@ impl KvEventMonitor {
             return;
         }
 
+        let key: SubscriptionKey = (url.clone(), dp_rank);
         let mut handles = self.worker_handles.lock().await;
-        if handles.contains_key(&url) {
-            debug!(worker_url = %url, "KV event subscription already active, skipping");
+        if handles.contains_key(&key) {
+            debug!(worker_url = %url, ?dp_rank, "KV event subscription already active, skipping");
             return;
         }
 
         let indexer = self
             .indexers
             .entry(model_id.clone())
-            .or_insert_with(|| Arc::new(PositionalIndexer::new(self.jump_size)))
+            .or_insert_with(|| Arc::new(TieredIndexer::new(self.jump_size)))
             .clone();
 
-        // Seed block_size provisionally from WorkerSpec. The event stream will
-        // overwrite this with the backend's actual page size once received.
+        // Seed GPU-tier block_size provisionally from WorkerSpec. The event
+        // stream overwrites this with the backend's actual page size once a
+        // stored event arrives (the GPU prefix-cache block size is the one the
+        // router uses to chunk request tokens for overlap scoring).
         if let Some(bs) = worker.metadata().spec.kv_block_size {
             if bs > 0 {
-                self.block_sizes.entry(model_id.clone()).or_insert(bs);
+                indexer.set_block_size(Tier::GPU, bs);
             } else {
                 warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
             }
@@ -128,16 +149,15 @@ impl KvEventMonitor {
 
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
-        let block_sizes = Arc::clone(&self.block_sizes);
 
         info!(
             worker_url = %url,
+            ?dp_rank,
             model_id = %model_id,
             "Starting KV event subscription"
         );
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
-        let loop_model_id = model_id.clone();
 
         #[expect(
             clippy::disallowed_methods,
@@ -145,19 +165,11 @@ impl KvEventMonitor {
                       handle is stored and graceful shutdown is sent on removal"
         )]
         let handle = tokio::spawn(async move {
-            Self::subscription_loop(
-                worker,
-                worker_url,
-                indexer,
-                block_sizes,
-                loop_model_id,
-                shutdown_rx,
-            )
-            .await;
+            Self::subscription_loop(worker, worker_url, dp_rank, indexer, shutdown_rx).await;
         });
 
         handles.insert(
-            url,
+            key,
             WorkerSubscription {
                 handle,
                 model_id,
@@ -166,43 +178,52 @@ impl KvEventMonitor {
         );
     }
 
-    /// Stop the KV event subscription for a worker.
+    /// Stop the KV event subscriptions for a worker (all dp_ranks behind `url`).
     ///
-    /// Sends a graceful shutdown signal — the task cleans up its own
+    /// Sends a graceful shutdown signal — each task cleans up its own
     /// `WorkerBlockMap` in the indexer before exiting.
     pub async fn on_worker_removed(&self, worker_url: &str) {
-        let subscription = {
+        // A single URL may carry multiple dp_rank subscriptions; remove them all.
+        let subscriptions: Vec<WorkerSubscription> = {
             let mut handles = self.worker_handles.lock().await;
-            handles.remove(worker_url)
+            let keys: Vec<SubscriptionKey> = handles
+                .keys()
+                .filter(|(u, _)| u == worker_url)
+                .cloned()
+                .collect();
+            keys.into_iter().filter_map(|k| handles.remove(&k)).collect()
         };
 
-        let Some(sub) = subscription else {
+        if subscriptions.is_empty() {
             return;
-        };
+        }
 
-        info!(worker_url = %worker_url, "Stopping KV event subscription");
-        // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
-        let _ = sub.shutdown_tx.send(());
-        let _ = sub.handle.await;
+        info!(worker_url = %worker_url, count = subscriptions.len(), "Stopping KV event subscriptions");
+        let mut model_ids: Vec<String> = Vec::new();
+        for sub in subscriptions {
+            // Signal graceful shutdown — task cleans up its worker_blocks in the indexer.
+            let _ = sub.shutdown_tx.send(());
+            let _ = sub.handle.await;
+            if !model_ids.contains(&sub.model_id) {
+                model_ids.push(sub.model_id);
+            }
+        }
 
-        // Re-check under lock whether this was the last worker for the model.
+        // Re-check under lock whether each model still has any subscription.
         // Must re-acquire lock after shutdown to avoid TOCTOU with concurrent
         // on_worker_added that may have added a new worker for the same model
         // between our first lock release and this point.
-        let should_remove_indexer = {
-            let handles = self.worker_handles.lock().await;
-            !handles.values().any(|other| other.model_id == sub.model_id)
-        };
-
-        if should_remove_indexer {
-            self.indexers.remove(&sub.model_id);
-            self.block_sizes.remove(&sub.model_id);
+        let handles = self.worker_handles.lock().await;
+        for model_id in model_ids {
+            if !handles.values().any(|other| other.model_id == model_id) {
+                self.indexers.remove(&model_id);
+            }
         }
     }
 
     /// Stop all subscriptions and clean up.
     pub async fn stop(&self) {
-        let subscriptions: HashMap<String, WorkerSubscription> = {
+        let subscriptions: HashMap<SubscriptionKey, WorkerSubscription> = {
             let mut handles = self.worker_handles.lock().await;
             std::mem::take(&mut *handles)
         };
@@ -212,33 +233,37 @@ impl KvEventMonitor {
                 count = subscriptions.len(),
                 "Stopping all KV event subscriptions"
             );
-            for (url, sub) in subscriptions {
-                debug!(worker_url = %url, "Stopping KV event subscription");
+            for ((url, dp_rank), sub) in subscriptions {
+                debug!(worker_url = %url, ?dp_rank, "Stopping KV event subscription");
                 let _ = sub.shutdown_tx.send(());
                 let _ = sub.handle.await;
             }
         }
 
         self.indexers.clear();
-        self.block_sizes.clear();
     }
 
     /// Get the indexer for a model (used by `CacheAwarePolicy` for queries).
-    pub fn get_indexer(&self, model_id: &str) -> Option<Arc<PositionalIndexer>> {
+    pub fn get_indexer(&self, model_id: &str) -> Option<Arc<TieredIndexer>> {
         self.indexers.get(model_id).map(|r| Arc::clone(&r))
     }
 
-    /// Get the block size for a model (learned from events or set via `set_block_size`).
+    /// Get the GPU-tier block size for a model (learned from events or seeded
+    /// from WorkerSpec). This is the page size the router uses to chunk request
+    /// tokens for overlap scoring.
     pub fn block_size(&self, model_id: &str) -> Option<usize> {
-        self.block_sizes.get(model_id).map(|v| *v)
+        self.indexers
+            .get(model_id)
+            .and_then(|idx| idx.block_size(Tier::GPU))
     }
 
-    /// Set the block size for a model (e.g. from WorkerSpec during registration).
-    /// Does not overwrite a value already learned from events.
+    /// Set the GPU-tier block size for a model (e.g. from WorkerSpec during
+    /// registration). Does not overwrite a value already learned from events.
     pub fn set_block_size(&self, model_id: &str, block_size: usize) {
-        self.block_sizes
+        self.indexers
             .entry(model_id.to_string())
-            .or_insert(block_size);
+            .or_insert_with(|| Arc::new(TieredIndexer::new(self.jump_size)))
+            .set_block_size(Tier::GPU, block_size);
     }
 
     /// Check if any subscription is running.
@@ -264,55 +289,43 @@ impl KvEventMonitor {
     ///
     /// Called once per model when the first stored event arrives, providing
     /// ground truth from the backend. `CacheAwarePolicy` uses this to chunk
-    /// request tokens into blocks for overlap scoring.
-    ///
-    /// Overwrites any provisional value seeded from `WorkerSpec` since the
-    /// event stream reflects the backend's actual page size.
-    fn learn_block_size(
-        block_sizes: &DashMap<String, usize>,
-        model_id: &str,
-        learned: &mut bool,
-        batch: &KvEventBatch,
-    ) {
-        if *learned {
-            return;
-        }
+    /// Learn the per-tier `block_size` from the first stored event seen for
+    /// each tier. GPU and LMCache use different page sizes, so each tier learns
+    /// independently. Overwrites any provisional value seeded from `WorkerSpec`.
+    fn learn_block_sizes(indexer: &TieredIndexer, batch: &KvEventBatch) {
         for event in &batch.events {
             if let Some(kv_cache_event::Data::Stored(stored)) = &event.data {
                 if let Some(block) = stored.blocks.first() {
                     if block.block_size > 0 {
-                        let bs = block.block_size as usize;
-                        block_sizes.insert(model_id.to_string(), bs);
-                        info!(
-                            model_id = %model_id,
-                            block_size = bs,
-                            "Learned block_size from KV event"
-                        );
-                        *learned = true;
-                        return;
+                        let tier = Tier::from_cache_level(block.cache_level);
+                        if indexer.block_size(tier).is_none() {
+                            indexer.set_block_size(tier, block.block_size as usize);
+                            info!(
+                                ?tier,
+                                block_size = block.block_size,
+                                "Learned block_size from KV event"
+                            );
+                        }
                     }
                 }
             }
         }
     }
 
-    /// Main subscription loop for a single worker.
+    /// Main subscription loop for a single (worker, dp_rank).
     ///
-    /// Owns the `WorkerBlockMap` for this worker and cleans it up on exit.
+    /// Owns the per-tier [`WorkerTierState`] and cleans it up on exit.
     /// Exits when `shutdown_rx` fires or the backend returns `Unimplemented`.
     async fn subscription_loop(
         worker: Arc<dyn Worker>,
         worker_url: String,
-        indexer: Arc<PositionalIndexer>,
-        block_sizes: Arc<DashMap<String, usize>>,
-        model_id: String,
+        dp_rank: Option<u32>,
+        indexer: Arc<TieredIndexer>,
         mut shutdown_rx: oneshot::Receiver<()>,
     ) {
-        let worker_id = indexer.intern_worker(&worker_url);
-        let mut worker_blocks = WorkerBlockMap::default();
+        let mut state = WorkerTierState::new(&indexer, &worker_url);
         let mut last_seq: u64 = 0;
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
-        let mut block_size_learned = false;
 
         /// Sleep with shutdown check. Returns `true` if shutdown was signaled.
         macro_rules! sleep_or_shutdown {
@@ -340,7 +353,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        state.cleanup(&indexer);
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -357,7 +370,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        state.cleanup(&indexer);
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -365,10 +378,11 @@ impl KvEventMonitor {
                 }
             };
 
-            let stream = match grpc_client.subscribe_kv_events(last_seq).await {
+            let stream = match grpc_client.subscribe_kv_events(last_seq, dp_rank).await {
                 Ok(stream) => {
                     info!(
                         worker_url = %worker_url,
+                        ?dp_rank,
                         start_seq = last_seq,
                         "KV event stream connected"
                     );
@@ -384,7 +398,7 @@ impl KvEventMonitor {
                             "Backend does not implement SubscribeKvEvents, \
                              disabling KV event subscription for this worker"
                         );
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        state.cleanup(&indexer);
                         return;
                     }
                     warn!(
@@ -397,7 +411,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        state.cleanup(&indexer);
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -405,16 +419,12 @@ impl KvEventMonitor {
                 }
             };
 
-            let on_batch = |batch: &KvEventBatch| {
-                Self::learn_block_size(&block_sizes, &model_id, &mut block_size_learned, batch);
-            };
             let stream_result = tokio::select! {
                 result = Self::process_stream(
-                    stream, &worker_url, worker_id, &indexer,
-                    &mut worker_blocks, &mut last_seq, on_batch,
+                    stream, &worker_url, &indexer, &mut state, &mut last_seq,
                 ) => result,
                 _ = &mut shutdown_rx => {
-                    indexer.remove_worker(worker_id, worker_blocks);
+                    state.cleanup(&indexer);
                     return;
                 }
             };
@@ -433,7 +443,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        state.cleanup(&indexer);
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -450,7 +460,7 @@ impl KvEventMonitor {
                         Duration::from_millis(reconnect_delay_ms),
                         &mut shutdown_rx
                     ) {
-                        indexer.remove_worker(worker_id, worker_blocks);
+                        state.cleanup(&indexer);
                         return;
                     }
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
@@ -476,11 +486,9 @@ impl KvEventMonitor {
     async fn process_stream(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
-        worker_id: u32,
-        indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
+        indexer: &TieredIndexer,
+        state: &mut WorkerTierState,
         last_seq: &mut u64,
-        mut on_batch: impl FnMut(&KvEventBatch),
     ) -> StreamResult {
         use tokio_stream::StreamExt;
 
@@ -509,10 +517,10 @@ impl KvEventMonitor {
                 };
             }
 
-            on_batch(&batch);
+            Self::learn_block_sizes(indexer, &batch);
 
             for event in &batch.events {
-                Self::apply_event(event, worker_id, indexer, worker_blocks);
+                Self::apply_event(event, indexer, state);
             }
 
             *last_seq = batch.sequence_number;
@@ -521,48 +529,59 @@ impl KvEventMonitor {
         StreamResult::Ended
     }
 
-    /// Apply a single KV cache event to the indexer.
-    fn apply_event(
-        event: &KvCacheEvent,
-        worker_id: u32,
-        indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
-    ) {
+    /// Apply a single KV cache event to the matching tier of the indexer.
+    fn apply_event(event: &KvCacheEvent, indexer: &TieredIndexer, state: &mut WorkerTierState) {
         let Some(ref data) = event.data else {
             return;
         };
 
         match data {
             kv_cache_event::Data::Stored(stored) => {
-                Self::apply_stored(stored, worker_id, indexer, worker_blocks);
+                Self::apply_stored(stored, indexer, state);
             }
             kv_cache_event::Data::Removed(removed) => {
-                Self::apply_removed(removed, worker_id, indexer, worker_blocks);
+                Self::apply_removed(removed, indexer, state);
             }
             kv_cache_event::Data::Cleared(_) => {
-                indexer.apply_cleared(worker_id, worker_blocks);
+                // Dual-clear: a clear event (PSRL weight-sync) invalidates the
+                // whole multi-tier cache for this worker. LMCache emits no
+                // explicit clear event of its own, so clearing every tier on the
+                // GPU-side `AllBlocksCleared` is what keeps the off-GPU tier from
+                // serving stale hits after a weight update.
+                for tier in Tier::ALL {
+                    indexer
+                        .tier(tier)
+                        .apply_cleared(state.worker_id(tier), state.blocks_mut(tier));
+                }
             }
         }
     }
 
-    /// Convert proto `KvBlocksStored` and apply to the indexer.
-    fn apply_stored(
-        stored: &KvBlocksStored,
-        worker_id: u32,
-        indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
-    ) {
+    /// Convert proto `KvBlocksStored` and apply it to the block's tier.
+    ///
+    /// vLLM emits each store event from a single source (GPU `kv_cache_manager`
+    /// or the LMCache connector), so all blocks in one event share a tier; we
+    /// take the tier from the first block.
+    fn apply_stored(stored: &KvBlocksStored, indexer: &TieredIndexer, state: &mut WorkerTierState) {
+        let Some(first) = stored.blocks.first() else {
+            return;
+        };
+        let tier = Tier::from_cache_level(first.cache_level);
         let blocks: Vec<StoredBlock> = stored.blocks.iter().map(convert_kv_block).collect();
-
         let parent_seq_hash = stored.parent_block_hash.map(SequenceHash::from);
 
-        match indexer.apply_stored(worker_id, &blocks, parent_seq_hash, worker_blocks) {
+        let pi = indexer.tier(tier);
+        let worker_id = state.worker_id(tier);
+        let worker_blocks = state.blocks_mut(tier);
+
+        match pi.apply_stored(worker_id, &blocks, parent_seq_hash, worker_blocks) {
             Ok(()) => {}
             Err(ApplyError::WorkerNotTracked | ApplyError::ParentBlockNotFound) => {
                 // Cold start or parent evicted — retry without parent to start a new chain.
-                if let Err(e) = indexer.apply_stored(worker_id, &blocks, None, worker_blocks) {
+                if let Err(e) = pi.apply_stored(worker_id, &blocks, None, worker_blocks) {
                     warn!(
                         worker_id = worker_id,
+                        ?tier,
                         error = %e,
                         "Failed to apply stored event after fallback"
                     );
@@ -571,24 +590,65 @@ impl KvEventMonitor {
         }
     }
 
-    /// Convert proto `KvBlocksRemoved` and apply to the indexer.
+    /// Convert proto `KvBlocksRemoved` and apply it to the event's tier.
     fn apply_removed(
         removed: &KvBlocksRemoved,
-        worker_id: u32,
-        indexer: &PositionalIndexer,
-        worker_blocks: &mut WorkerBlockMap,
+        indexer: &TieredIndexer,
+        state: &mut WorkerTierState,
     ) {
+        let tier = Tier::from_cache_level(removed.cache_level);
         let seq_hashes: Vec<SequenceHash> = removed
             .block_hashes
             .iter()
             .map(|&h| SequenceHash::from(h))
             .collect();
 
-        indexer.apply_removed(worker_id, &seq_hashes, worker_blocks);
+        indexer
+            .tier(tier)
+            .apply_removed(state.worker_id(tier), &seq_hashes, state.blocks_mut(tier));
     }
 }
 
-/// Convert a proto `KvBlock` to a kv-index `StoredBlock`.
+/// Per-tier subscription state for one (worker, dp_rank) stream.
+///
+/// Each tier interns the worker independently (its own internal `u32` id) and
+/// keeps its own reverse `WorkerBlockMap`, because the two tiers index content
+/// hashes in separate spaces. Owned by the subscription task; cleaned up on exit.
+struct WorkerTierState {
+    worker_ids: [u32; Tier::COUNT],
+    blocks: [WorkerBlockMap; Tier::COUNT],
+}
+
+impl WorkerTierState {
+    fn new(indexer: &TieredIndexer, worker_url: &str) -> Self {
+        Self {
+            worker_ids: Tier::ALL.map(|tier| indexer.intern_worker(tier, worker_url)),
+            blocks: std::array::from_fn(|_| WorkerBlockMap::default()),
+        }
+    }
+
+    #[inline]
+    fn worker_id(&self, tier: Tier) -> u32 {
+        self.worker_ids[tier.index()]
+    }
+
+    #[inline]
+    fn blocks_mut(&mut self, tier: Tier) -> &mut WorkerBlockMap {
+        &mut self.blocks[tier.index()]
+    }
+
+    /// Drop this worker's blocks from every tier of the indexer.
+    fn cleanup(&mut self, indexer: &TieredIndexer) {
+        for tier in Tier::ALL {
+            let worker_blocks = std::mem::take(&mut self.blocks[tier.index()]);
+            indexer
+                .tier(tier)
+                .remove_worker(self.worker_ids[tier.index()], worker_blocks);
+        }
+    }
+}
+
+/// Convert a proto `KvBlock` to a kv-index `StoredBlock` (tier handled by caller).
 fn convert_kv_block(block: &KvBlock) -> StoredBlock {
     StoredBlock {
         seq_hash: SequenceHash::from(block.block_hash),
@@ -611,7 +671,6 @@ impl fmt::Debug for KvEventMonitor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvEventMonitor")
             .field("models", &self.indexers.len())
-            .field("block_sizes", &self.block_sizes.len())
             .field("jump_size", &self.jump_size)
             .finish()
     }
@@ -620,6 +679,28 @@ impl fmt::Debug for KvEventMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a stored-blocks event for a given tier (via `cache_level`).
+    fn stored_event(
+        blocks: &[(i64, &[u32])],
+        block_size: i32,
+        parent: Option<i64>,
+        cache_level: Option<i32>,
+    ) -> KvBlocksStored {
+        KvBlocksStored {
+            blocks: blocks
+                .iter()
+                .map(|(hash, tokens)| KvBlock {
+                    block_hash: *hash,
+                    token_ids: tokens.to_vec(),
+                    block_size,
+                    lora_id: None,
+                    cache_level,
+                })
+                .collect(),
+            parent_block_hash: parent,
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Proto → kv-index conversion
@@ -652,270 +733,175 @@ mod tests {
         assert_eq!(stored.seq_hash, SequenceHash(u64::MAX));
     }
 
-    #[test]
-    fn test_convert_kv_block_empty_tokens() {
-        let block = KvBlock {
-            block_hash: 100,
-            token_ids: vec![],
-            block_size: 0,
-            lora_id: None,
-            cache_level: None,
-        };
-        let stored = convert_kv_block(&block);
-        assert_eq!(stored.seq_hash, SequenceHash::from(100i64));
-        assert_eq!(stored.content_hash, compute_content_hash(&[]));
-    }
-
     // -----------------------------------------------------------------------
-    // apply_event integration with PositionalIndexer
+    // apply_event integration with TieredIndexer
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_apply_stored_no_parent() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-        let stored = KvBlocksStored {
-            blocks: vec![
-                KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![10, 20, 30, 40],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                },
-                KvBlock {
-                    block_hash: 2,
-                    token_ids: vec![50, 60, 70, 80],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                },
-            ],
-            parent_block_hash: None,
-        };
-
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 2);
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
+        let stored = stored_event(
+            &[(1, &[10, 20, 30, 40]), (2, &[50, 60, 70, 80])],
+            4,
+            None,
+            None,
+        );
+        KvEventMonitor::apply_stored(&stored, &indexer, &mut state);
+        assert_eq!(indexer.tier(Tier::GPU).current_size(), 2);
     }
 
     #[test]
     fn test_apply_stored_with_parent() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-
-        let stored1 = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-            }],
-            parent_block_hash: None,
-        };
-        KvEventMonitor::apply_stored(&stored1, w1, &indexer, &mut wb);
-
-        let stored2 = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 2,
-                token_ids: vec![50, 60, 70, 80],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-            }],
-            parent_block_hash: Some(1),
-        };
-        KvEventMonitor::apply_stored(&stored2, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 2);
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(1, &[10, 20, 30, 40])], 4, None, None),
+            &indexer,
+            &mut state,
+        );
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(2, &[50, 60, 70, 80])], 4, Some(1), None),
+            &indexer,
+            &mut state,
+        );
+        assert_eq!(indexer.tier(Tier::GPU).current_size(), 2);
     }
 
     #[test]
-    fn test_apply_stored_fallback_on_worker_not_tracked() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://new-worker:8000");
-        let mut wb = WorkerBlockMap::default();
-
-        // Pass parent_block_hash for an untracked worker — should fallback to no parent.
-        let stored = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-            }],
-            parent_block_hash: Some(999),
-        };
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
+    fn test_apply_stored_fallback_on_parent_not_found() {
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://new-worker:8000");
+        // parent for a cold worker — should fall back to no-parent insert.
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(1, &[10, 20, 30, 40])], 4, Some(999), None),
+            &indexer,
+            &mut state,
+        );
+        assert_eq!(indexer.tier(Tier::GPU).current_size(), 1);
     }
 
     #[test]
     fn test_apply_removed() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-
-        let stored = KvBlocksStored {
-            blocks: vec![
-                KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![10, 20, 30, 40],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                },
-                KvBlock {
-                    block_hash: 2,
-                    token_ids: vec![50, 60, 70, 80],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                },
-            ],
-            parent_block_hash: None,
-        };
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
-
-        let removed = KvBlocksRemoved {
-            block_hashes: vec![2],
-            cache_level: None,
-        };
-        KvEventMonitor::apply_removed(&removed, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
-    }
-
-    #[test]
-    fn test_apply_cleared_event() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-
-        let stored = KvBlocksStored {
-            blocks: vec![KvBlock {
-                block_hash: 1,
-                token_ids: vec![10, 20, 30, 40],
-                block_size: 4,
-                lora_id: None,
-                cache_level: None,
-            }],
-            parent_block_hash: None,
-        };
-        KvEventMonitor::apply_stored(&stored, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
-
-        indexer.apply_cleared(w1, &mut wb);
-        assert_eq!(indexer.current_size(), 0);
-    }
-
-    #[test]
-    fn test_apply_event_dispatch_stored() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-        let event = KvCacheEvent {
-            event_id: 1,
-            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                blocks: vec![KvBlock {
-                    block_hash: 42,
-                    token_ids: vec![1, 2, 3, 4],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                }],
-                parent_block_hash: None,
-            })),
-        };
-
-        KvEventMonitor::apply_event(&event, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 1);
-    }
-
-    #[test]
-    fn test_apply_event_dispatch_removed() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-
-        let stored_event = KvCacheEvent {
-            event_id: 1,
-            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                blocks: vec![KvBlock {
-                    block_hash: 1,
-                    token_ids: vec![1, 2, 3, 4],
-                    block_size: 4,
-                    lora_id: None,
-                    cache_level: None,
-                }],
-                parent_block_hash: None,
-            })),
-        };
-        KvEventMonitor::apply_event(&stored_event, w1, &indexer, &mut wb);
-
-        let removed_event = KvCacheEvent {
-            event_id: 2,
-            data: Some(kv_cache_event::Data::Removed(KvBlocksRemoved {
-                block_hashes: vec![1],
-                cache_level: None,
-            })),
-        };
-        KvEventMonitor::apply_event(&removed_event, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 0);
-    }
-
-    #[test]
-    fn test_apply_event_dispatch_cleared() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-
-        KvEventMonitor::apply_event(
-            &KvCacheEvent {
-                event_id: 1,
-                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
-                    blocks: vec![KvBlock {
-                        block_hash: 1,
-                        token_ids: vec![1, 2, 3, 4],
-                        block_size: 4,
-                        lora_id: None,
-                        cache_level: None,
-                    }],
-                    parent_block_hash: None,
-                })),
-            },
-            w1,
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(1, &[10, 20, 30, 40]), (2, &[50, 60, 70, 80])], 4, None, None),
             &indexer,
-            &mut wb,
+            &mut state,
+        );
+        KvEventMonitor::apply_removed(
+            &KvBlocksRemoved {
+                block_hashes: vec![2],
+                cache_level: None,
+            },
+            &indexer,
+            &mut state,
+        );
+        assert_eq!(indexer.tier(Tier::GPU).current_size(), 1);
+    }
+
+    /// Stored events route to the tier indicated by `cache_level`, and the two
+    /// tiers track size independently.
+    #[test]
+    fn test_apply_stored_routes_by_tier() {
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
+
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(1, &[1, 2, 3, 4])], 4, None, Some(0)), // GPU
+            &indexer,
+            &mut state,
+        );
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(2, &[5, 6, 7, 8]), (3, &[9, 10, 11, 12])], 4, None, Some(1)), // LMCache
+            &indexer,
+            &mut state,
         );
 
-        // Clear
+        assert_eq!(indexer.tier(Tier::GPU).current_size(), 1);
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 2);
+    }
+
+    /// A clear event must wipe BOTH tiers: LMCache emits no clear
+    /// of its own, so the GPU-side `AllBlocksCleared` is the invalidation signal
+    /// for the whole multi-tier cache.
+    #[test]
+    fn test_apply_cleared_clears_all_tiers() {
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(1, &[1, 2, 3, 4])], 4, None, Some(0)),
+            &indexer,
+            &mut state,
+        );
+        KvEventMonitor::apply_stored(
+            &stored_event(&[(2, &[5, 6, 7, 8])], 4, None, Some(1)),
+            &indexer,
+            &mut state,
+        );
+        assert_eq!(indexer.current_size(), 2);
+
         KvEventMonitor::apply_event(
             &KvCacheEvent {
-                event_id: 2,
+                event_id: 9,
                 data: Some(kv_cache_event::Data::Cleared(
                     smg_grpc_client::common_proto::KvCacheCleared {},
                 )),
             },
-            w1,
             &indexer,
-            &mut wb,
+            &mut state,
+        );
+        assert_eq!(indexer.tier(Tier::GPU).current_size(), 0);
+        assert_eq!(indexer.tier(Tier::Lmcache).current_size(), 0);
+    }
+
+    #[test]
+    fn test_apply_event_no_data() {
+        let indexer = TieredIndexer::new(64);
+        let mut state = WorkerTierState::new(&indexer, "http://w1:8000");
+        KvEventMonitor::apply_event(
+            &KvCacheEvent {
+                event_id: 1,
+                data: None,
+            },
+            &indexer,
+            &mut state,
         );
         assert_eq!(indexer.current_size(), 0);
     }
 
     #[test]
-    fn test_apply_event_no_data() {
-        let indexer = PositionalIndexer::new(64);
-        let w1 = indexer.intern_worker("http://w1:8000");
-        let mut wb = WorkerBlockMap::default();
-        let event = KvCacheEvent {
-            event_id: 1,
-            data: None,
+    fn test_learn_block_sizes_per_tier() {
+        let indexer = TieredIndexer::new(64);
+        let batch = KvEventBatch {
+            sequence_number: 1,
+            timestamp: 0.0,
+            dp_rank: None,
+            events: vec![
+                KvCacheEvent {
+                    event_id: 1,
+                    data: Some(kv_cache_event::Data::Stored(stored_event(
+                        &[(1, &[1, 2, 3, 4])],
+                        16,
+                        None,
+                        Some(0),
+                    ))),
+                },
+                KvCacheEvent {
+                    event_id: 2,
+                    data: Some(kv_cache_event::Data::Stored(stored_event(
+                        &[(2, &[5, 6])],
+                        256,
+                        None,
+                        Some(1),
+                    ))),
+                },
+            ],
         };
-        KvEventMonitor::apply_event(&event, w1, &indexer, &mut wb);
-        assert_eq!(indexer.current_size(), 0);
+        KvEventMonitor::learn_block_sizes(&indexer, &batch);
+        assert_eq!(indexer.block_size(Tier::GPU), Some(16));
+        assert_eq!(indexer.block_size(Tier::Lmcache), Some(256));
     }
 
     // -----------------------------------------------------------------------
@@ -953,21 +939,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // block_size learning
+    // block_size learning (GPU tier is the router-facing default)
     // -----------------------------------------------------------------------
 
     #[test]
     fn test_set_block_size() {
         let monitor = KvEventMonitor::new(None);
-
-        // Initially no block_size
         assert!(monitor.block_size("llama").is_none());
 
-        // Set it
         monitor.set_block_size("llama", 32);
         assert_eq!(monitor.block_size("llama"), Some(32));
 
-        // set_block_size doesn't overwrite existing value
+        // set_block_size doesn't overwrite an existing value (learn-once).
         monitor.set_block_size("llama", 64);
         assert_eq!(monitor.block_size("llama"), Some(32));
     }

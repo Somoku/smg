@@ -235,6 +235,37 @@ impl VllmEngineClient {
         Ok(response.into_inner())
     }
 
+    /// Transfer a trajectory's cached KV prefix from this (source) instance to
+    /// a destination instance's LMCache backend.
+    pub async fn transfer_kv(
+        &self,
+        request: proto::TransferKvRequest,
+    ) -> Result<proto::TransferKvResponse, tonic::Status> {
+        let mut client = self.client.clone();
+        let response = client.transfer_kv(Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Pin a trajectory's cached prefix to prevent LRU eviction during transfer.
+    pub async fn pin_kv(
+        &self,
+        request: proto::PinKvRequest,
+    ) -> Result<proto::PinKvResponse, tonic::Status> {
+        let mut client = self.client.clone();
+        let response = client.pin_kv(Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Unpin a previously-pinned trajectory prefix.
+    pub async fn unpin_kv(
+        &self,
+        request: proto::UnpinKvRequest,
+    ) -> Result<proto::UnpinKvResponse, tonic::Status> {
+        let mut client = self.client.clone();
+        let response = client.unpin_kv(Request::new(request)).await?;
+        Ok(response.into_inner())
+    }
+
     /// Get model information
     pub async fn get_model_info(&self) -> Result<proto::GetModelInfoResponse, tonic::Status> {
         debug!("Requesting model info");

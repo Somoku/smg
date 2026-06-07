@@ -43,6 +43,51 @@ pub enum CandidateSortKey {
     ReserveCapability,
 }
 
+/// How the router coordinates a KV-cache transfer with request dispatch on
+/// migration (old instance A → new instance B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvTransferMode {
+    /// Fire-and-forget: trigger the transfer and dispatch to B immediately.
+    /// If B misses, it re-prefills — lowest latency, best for hot paths.
+    #[default]
+    Async,
+    /// Await the `TransferKv` RPC before dispatching to B (B is guaranteed warm).
+    Sync,
+    /// `PinKv(A)` → `TransferKv(A→B)` → dispatch → `UnpinKv(A)`. Protects the
+    /// source prefix from LRU eviction mid-transfer.
+    PinSync,
+}
+
+/// Configuration for KV-cache transfer on migration.
+///
+/// When a request migrates from instance A (its `rollout_instance_hint`) to a
+/// newly-selected instance B, the router can proactively move A's cached prefix
+/// to B so the request resumes from cache instead of re-prefilling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KvTransferConfig {
+    /// Master switch. When false, migration never triggers a transfer.
+    pub enable: bool,
+    /// Coordination mode between transfer and dispatch.
+    pub transfer_mode: KvTransferMode,
+    /// Per-RPC timeout (milliseconds) for sync/pin_sync modes.
+    pub transfer_timeout_ms: u64,
+    /// Max concurrent in-flight transfers per source instance (ZMQ back-pressure).
+    pub max_concurrent_per_source: usize,
+}
+
+impl Default for KvTransferConfig {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            transfer_mode: KvTransferMode::Async,
+            transfer_timeout_ms: 30_000,
+            max_concurrent_per_source: 8,
+        }
+    }
+}
+
 /// Configuration for the PSRL worker selection strategy.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -54,6 +99,8 @@ pub struct PsrlConfig {
     pub candidate_sort_key: CandidateSortKey,
     /// When true, the same prompt will run on the same worker.
     pub enable_group_sticky_routing: bool,
+    /// KV-cache transfer on migration (A → B).
+    pub kv_transfer: KvTransferConfig,
 }
 
 impl Default for PsrlConfig {
@@ -63,6 +110,7 @@ impl Default for PsrlConfig {
             enable_mig_strategy: false,
             candidate_sort_key: CandidateSortKey::Version,
             enable_group_sticky_routing: false,
+            kv_transfer: KvTransferConfig::default(),
         }
     }
 }
@@ -453,6 +501,10 @@ pub enum PolicyConfig {
         max_tree_size: usize,
         #[serde(default = "default_block_size")]
         block_size: usize,
+        #[serde(default = "default_gpu_overlap_weight")]
+        gpu_overlap_weight: f64,
+        #[serde(default = "default_lmcache_overlap_weight")]
+        lmcache_overlap_weight: f64,
     },
 
     #[serde(rename = "power_of_two")]
@@ -583,6 +635,14 @@ pub enum PolicyConfig {
 
 fn default_block_size() -> usize {
     16
+}
+
+fn default_gpu_overlap_weight() -> f64 {
+    1.0
+}
+
+fn default_lmcache_overlap_weight() -> f64 {
+    0.5
 }
 
 fn default_prefix_token_count() -> usize {
@@ -1239,6 +1299,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 300,
             max_tree_size: 1000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1261,6 +1323,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 300,
             max_tree_size: 1000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1284,6 +1348,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 600,
             max_tree_size: 5000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         };
 
         match cache_aware {
@@ -1690,6 +1756,8 @@ stream_retention_secs: 3600
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                gpu_overlap_weight: 1.0,
+                lmcache_overlap_weight: 0.5,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1721,6 +1789,8 @@ stream_retention_secs: 3600
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                gpu_overlap_weight: 1.0,
+                lmcache_overlap_weight: 0.5,
             }),
             decode_policy: None,
         };
@@ -1778,6 +1848,8 @@ stream_retention_secs: 3600
             eviction_interval_secs: 300,
             max_tree_size: 2000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         };
 
         match pd.get_prefill_policy(&main_policy) {

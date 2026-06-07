@@ -379,6 +379,8 @@ struct Router {
     eviction_interval_secs: u64,
     max_tree_size: usize,
     block_size: usize,
+    gpu_overlap_weight: f64,
+    lmcache_overlap_weight: f64,
     max_concurrent_seqs_per_instance: usize,
     delta_throughput_threshold: f64,
     max_prompt_length: usize,
@@ -489,6 +491,10 @@ struct Router {
     psrl_enable_mig_strategy: bool,
     psrl_candidate_sort_key: String,
     psrl_enable_group_sticky: bool,
+    // KV-cache transfer on migration (cache-aware routing)
+    psrl_kv_transfer_enable: bool,
+    psrl_kv_transfer_mode: String,
+    psrl_kv_transfer_timeout_ms: u64,
     // TITO
     enable_tito: bool,
     tito_debug: bool,
@@ -534,6 +540,8 @@ impl Router {
                     eviction_interval_secs: self.eviction_interval_secs,
                     max_tree_size: self.max_tree_size,
                     block_size: self.block_size,
+                    gpu_overlap_weight: self.gpu_overlap_weight,
+                    lmcache_overlap_weight: self.lmcache_overlap_weight,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
@@ -670,6 +678,18 @@ impl Router {
         let candidate_sort_key = match self.psrl_candidate_sort_key.as_str() {
             "reserve_capability" => config::CandidateSortKey::ReserveCapability,
             _ => config::CandidateSortKey::Version,
+        };
+
+        let kv_transfer_mode = match self.psrl_kv_transfer_mode.as_str() {
+            "sync" => config::KvTransferMode::Sync,
+            "pin_sync" => config::KvTransferMode::PinSync,
+            _ => config::KvTransferMode::Async,
+        };
+        let kv_transfer_config = config::KvTransferConfig {
+            enable: self.psrl_kv_transfer_enable,
+            transfer_mode: kv_transfer_mode,
+            transfer_timeout_ms: self.psrl_kv_transfer_timeout_ms,
+            ..Default::default()
         };
 
         let worker_selection_strategy = match self.worker_selection_strategy.as_str() {
@@ -828,6 +848,7 @@ impl Router {
             .psrl_enable_mig_strategy(self.psrl_enable_mig_strategy)
             .psrl_candidate_sort_key(candidate_sort_key)
             .psrl_enable_group_sticky(self.psrl_enable_group_sticky)
+            .psrl_kv_transfer(kv_transfer_config)
             .build()
     }
 }
@@ -850,6 +871,8 @@ impl Router {
         eviction_interval_secs = 120,
         max_tree_size = 2usize.pow(26),
         block_size = 16,
+        gpu_overlap_weight = 1.0,
+        lmcache_overlap_weight = 0.5,
         max_concurrent_seqs_per_instance = 100,
         delta_throughput_threshold = 0.5,
         max_prompt_length = 8192,
@@ -958,6 +981,9 @@ impl Router {
         psrl_enable_mig_strategy = false,
         psrl_candidate_sort_key = String::from("version"),
         psrl_enable_group_sticky = false,
+        psrl_kv_transfer_enable = false,
+        psrl_kv_transfer_mode = String::from("async"),
+        psrl_kv_transfer_timeout_ms = 30_000,
         enable_tito = false,
         tito_debug = false,
         tito_gc_threshold = None,
@@ -982,6 +1008,8 @@ impl Router {
         eviction_interval_secs: u64,
         max_tree_size: usize,
         block_size: usize,
+        gpu_overlap_weight: f64,
+        lmcache_overlap_weight: f64,
         max_concurrent_seqs_per_instance: usize,
         delta_throughput_threshold: f64,
         max_prompt_length: usize,
@@ -1090,6 +1118,9 @@ impl Router {
         psrl_enable_mig_strategy: bool,
         psrl_candidate_sort_key: String,
         psrl_enable_group_sticky: bool,
+        psrl_kv_transfer_enable: bool,
+        psrl_kv_transfer_mode: String,
+        psrl_kv_transfer_timeout_ms: u64,
         enable_tito: bool,
         tito_debug: bool,
         tito_gc_threshold: Option<usize>,
@@ -1127,6 +1158,8 @@ impl Router {
             eviction_interval_secs,
             max_tree_size,
             block_size,
+            gpu_overlap_weight,
+            lmcache_overlap_weight,
             max_concurrent_seqs_per_instance,
             delta_throughput_threshold,
             max_prompt_length,
@@ -1235,6 +1268,9 @@ impl Router {
             psrl_enable_mig_strategy,
             psrl_candidate_sort_key,
             psrl_enable_group_sticky,
+            psrl_kv_transfer_enable,
+            psrl_kv_transfer_mode,
+            psrl_kv_transfer_timeout_ms,
             enable_tito,
             tito_debug,
             tito_gc_threshold,

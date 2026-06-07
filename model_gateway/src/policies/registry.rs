@@ -830,6 +830,8 @@ mod tests {
             eviction_interval_secs: 0,
             max_tree_size: 10_000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         });
 
         let stores = Arc::new(StateStores::with_self_name("node1".to_string()));
@@ -880,6 +882,8 @@ mod tests {
             eviction_interval_secs: 0,
             max_tree_size: 10_000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         }));
 
         let stores = Arc::new(StateStores::with_self_name("node1".to_string()));

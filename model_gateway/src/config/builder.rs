@@ -4,10 +4,10 @@ use smg_mcp::McpConfig;
 
 use super::{
     CandidateSortKey, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, MemoryRuntimeConfig, MetricsConfig, OracleConfig,
-    PolicyConfig, PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey, RetryConfig,
-    RouterConfig, RoutingLoopConfig, RoutingMode, SkillsConfig, TokenizerCacheConfig, TraceConfig,
-    WorkerSelectionStrategy,
+    HealthCheckConfig, HistoryBackend, KvTransferConfig, MemoryRuntimeConfig, MetricsConfig,
+    OracleConfig, PolicyConfig, PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey,
+    RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode, SkillsConfig, TokenizerCacheConfig,
+    TraceConfig, WorkerSelectionStrategy,
 };
 use crate::worker::ConnectionMode;
 
@@ -134,6 +134,8 @@ impl RouterConfigBuilder {
             eviction_interval_secs,
             max_tree_size,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         };
         self
     }
@@ -333,6 +335,11 @@ impl RouterConfigBuilder {
 
     pub fn psrl_enable_group_sticky(mut self, v: bool) -> Self {
         self.config.psrl.enable_group_sticky_routing = v;
+        self
+    }
+
+    pub fn psrl_kv_transfer(mut self, config: KvTransferConfig) -> Self {
+        self.config.psrl.kv_transfer = config;
         self
     }
 

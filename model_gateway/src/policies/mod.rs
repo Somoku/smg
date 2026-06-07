@@ -146,6 +146,13 @@ pub struct CacheAwareConfig {
     /// Used by `compute_request_content_hashes` to chunk request tokens into blocks.
     /// Must match the backend's block size. Default: 16 (SGLang page size).
     pub block_size: usize,
+    /// Weight applied to GPU-tier overlap in event-driven scoring. A GPU hit
+    /// implies zero reload cost, so it is weighted highest. Default: 1.0.
+    pub gpu_overlap_weight: f64,
+    /// Weight applied to LMCache-tier (off-GPU) overlap in event-driven scoring.
+    /// A hit still requires loading the prefix back onto the GPU, so it scores
+    /// below a GPU hit. Set 0.0 to ignore the off-GPU tier. Default: 0.5.
+    pub lmcache_overlap_weight: f64,
 }
 
 impl Default for CacheAwareConfig {
@@ -157,6 +164,8 @@ impl Default for CacheAwareConfig {
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         }
     }
 }

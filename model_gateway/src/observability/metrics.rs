@@ -349,6 +349,24 @@ pub(crate) fn init_metrics() {
         "End-to-end dispatch duration for a single routing-loop entry (preparation already done)"
     );
 
+    // Layer 8: KV-cache transfer metrics (migration A → B)
+    describe_counter!(
+        "smg_kv_transfer_total",
+        "KV-cache transfers attempted on migration by result (ok/src_miss/timeout/error)"
+    );
+    describe_counter!(
+        "smg_kv_transfer_skipped_total",
+        "KV-cache transfers skipped by reason (no_overlap/disabled/no_dst_endpoint)"
+    );
+    describe_histogram!(
+        "smg_kv_transfer_latency_seconds",
+        "Latency of the TransferKv RPC issued to the migration source instance"
+    );
+    describe_counter!(
+        "smg_kv_pin_total",
+        "Pin/unpin operations on the source prefix by op (pin/unpin) and result"
+    );
+
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
 }

@@ -81,6 +81,7 @@ impl GrpcRouter {
             policy_registry.clone(),
             ctx.routing_loop_runtime.clone(),
             &ctx.router_config.psrl,
+            ctx.kv_event_monitor.clone(),
         )
         .map_err(|e| format!("Failed to build worker selection strategy: {e}"))?;
 

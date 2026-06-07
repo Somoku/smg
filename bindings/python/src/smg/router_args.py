@@ -37,6 +37,8 @@ class RouterArgs:
     eviction_interval_secs: int = 60
     max_tree_size: int = 2**26
     block_size: int = 16
+    gpu_overlap_weight: float = 1.0  # Weight for GPU-tier cache hits (cache_aware event-driven scoring)
+    lmcache_overlap_weight: float = 0.5  # Weight for LMCache-tier (off-GPU) cache hits
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -100,6 +102,10 @@ class RouterArgs:
     psrl_enable_mig_strategy: bool = False
     psrl_candidate_sort_key: str = "version"
     psrl_enable_group_sticky: bool = False
+    # KV-cache transfer on migration
+    psrl_kv_transfer_enable: bool = False
+    psrl_kv_transfer_mode: str = "async"  # async | sync | pin_sync
+    psrl_kv_transfer_timeout_ms: int = 30000
     # TITO configuration
     enable_tito: bool = False
     tito_debug: bool = False

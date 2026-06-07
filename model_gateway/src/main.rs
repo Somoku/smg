@@ -176,6 +176,14 @@ struct CliArgs {
     #[arg(long, default_value_t = 16, help_heading = "Routing Policy")]
     block_size: usize,
 
+    /// Weight for GPU-tier cache overlap in event-driven cache-aware routing.
+    #[arg(long, default_value_t = 1.0, help_heading = "Routing Policy")]
+    gpu_overlap_weight: f64,
+
+    /// Weight for LMCache-tier (off-GPU) cache overlap in event-driven routing.
+    #[arg(long, default_value_t = 0.5, help_heading = "Routing Policy")]
+    lmcache_overlap_weight: f64,
+
     /// Maximum idle time in seconds before eviction (for manual policy)
     #[arg(long, default_value_t = 14400, help_heading = "Routing Policy")]
     max_idle_secs: u64,
@@ -958,6 +966,8 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
                 block_size: self.block_size,
+                gpu_overlap_weight: self.gpu_overlap_weight,
+                lmcache_overlap_weight: self.lmcache_overlap_weight,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,

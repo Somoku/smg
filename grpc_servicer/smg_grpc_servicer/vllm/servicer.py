@@ -14,13 +14,23 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 
 import grpc
+import msgspec
 import numpy as np
 import torch
+import zmq
+import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+)
+from vllm.distributed.kv_events import ZmqEventPublisher
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -87,7 +97,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - SubscribePreemptionEvents: Stream scheduler-preempted request IDs to SMG
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None,):
+    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None,):
         """
         Initialize the servicer.
 
@@ -97,12 +107,35 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             preemption_queue: Optional queue for preemption events; if None,
                 a new empty queue is created (no events will be delivered
                 unless a PreemptionStatLogger is wired to the same queue)
+            kv_cache_manager: Optional PSRL ``KVCacheManager`` enabling the
+                TransferKv/PinKv/UnpinKv RPCs (cross-instance KV migration).
+                When None those RPCs return UNIMPLEMENTED.
         """
         self.engine = async_llm
         self.start_time = start_time
         self.preemption_queue: asyncio.Queue[list[str]] = (
             preemption_queue if preemption_queue is not None else asyncio.Queue()
         )
+        self.kv_cache_manager = kv_cache_manager
+
+        # Parse the native vLLM KV-event publisher config so SubscribeKvEvents
+        # can bridge the local ZMQ stream to gRPC (event-driven cache-aware
+        # routing). None → events not enabled → SubscribeKvEvents is UNIMPLEMENTED.
+        self.kv_events_config = None
+        try:
+            cfg = getattr(self.engine.vllm_config, "kv_events_config", None)
+            if cfg is not None and getattr(cfg, "publisher", None) == "zmq":
+                self.kv_events_config = cfg
+                logger.info(
+                    "KV events enabled: endpoint=%s topic=%s",
+                    cfg.endpoint,
+                    cfg.topic,
+                )
+        except Exception as e:  # noqa: BLE001 - defensive: never block startup
+            logger.warning("Failed to read kv_events_config: %s", e)
+
+        # Monotonic event-id counter for converted KvCacheEvents.
+        self.kv_event_id_counter = 0
         logger.info("VllmEngineServicer initialized")
 
     async def Generate(
@@ -488,6 +521,258 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 request_ids=req_ids,
                 timestamp_ns=time.time_ns(),
             )
+
+    # ========== KV cache event streaming (event-driven cache-aware routing) ==========
+
+    async def SubscribeKvEvents(
+        self,
+        request: common_pb2.SubscribeKvEventsRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[common_pb2.KvEventBatch]:
+        """Bridge vLLM's internal ZMQ KV cache event stream to gRPC.
+
+        vLLM publishes one ZMQ stream per data-parallel rank (port offset by
+        ``dp_rank``) with an independent monotonic sequence counter. The router
+        subscribes once per ``(url, dp_rank)`` and passes the rank in the request,
+        so we connect to exactly that rank's publisher endpoint.
+        The publisher's native sequence numbers are forwarded as-is so SMG's gap
+        detection and ``start_sequence_number`` replay work unchanged.
+        """
+        if self.kv_events_config is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV cache events not enabled. Launch vLLM with a kv_events_config "
+                'whose publisher == "zmq".',
+            )
+            return
+
+        config = self.kv_events_config
+        dp_rank = request.dp_rank if request.HasField("dp_rank") else 0
+
+        # The publisher binds e.g. "tcp://*:5557"; connect on localhost and offset
+        # the port by the requested dp_rank to reach that rank's stream.
+        pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
+        pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, dp_rank)
+
+        zmq_ctx = zmq.asyncio.Context.instance()
+        sub_socket = zmq_ctx.socket(zmq.SUB)
+        sub_socket.subscribe(config.topic.encode("utf-8"))
+        sub_socket.connect(pub_endpoint)
+
+        logger.info(
+            "SubscribeKvEvents: connected to ZMQ endpoint %s (dp_rank=%d)",
+            pub_endpoint,
+            dp_rank,
+        )
+
+        # Send headers immediately so the tonic client's subscribe future resolves
+        # before the first event arrives.
+        await context.send_initial_metadata(())
+
+        decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
+
+        try:
+            while not context.cancelled():
+                try:
+                    frames = await asyncio.wait_for(sub_socket.recv_multipart(), timeout=1.0)
+                except (TimeoutError, asyncio.TimeoutError):
+                    continue
+
+                # ZMQ multipart layout: [topic, seq(8B big-endian), msgpack payload]
+                if len(frames) < 3:
+                    continue
+
+                zmq_seq = int.from_bytes(frames[1], "big")
+                payload = frames[2]
+                try:
+                    raw_batch = decoder.decode(payload)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("Failed to decode KV event batch: %s", e)
+                    continue
+
+                yield self._convert_kv_event_batch(raw_batch, zmq_seq)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            sub_socket.close(linger=0)
+            logger.info("SubscribeKvEvents: stream closed (dp_rank=%d)", dp_rank)
+
+    def _convert_kv_event_batch(
+        self, raw_batch: KVEventBatch, seq_num: int
+    ) -> common_pb2.KvEventBatch:
+        """Convert a vLLM ZMQ ``KVEventBatch`` to the proto ``KvEventBatch``."""
+        proto_batch = common_pb2.KvEventBatch(
+            sequence_number=seq_num,
+            timestamp=raw_batch.ts,
+        )
+        if raw_batch.data_parallel_rank is not None:
+            proto_batch.dp_rank = raw_batch.data_parallel_rank
+
+        for event in raw_batch.events:
+            proto_event = self._convert_kv_event(event)
+            if proto_event is not None:
+                proto_batch.events.append(proto_event)
+        return proto_batch
+
+    @staticmethod
+    def _block_hash_to_int(block_hash) -> int:
+        """Coerce a vLLM ``ExternalBlockHash`` (``bytes | int``) to int64.
+
+        The proto carries block hashes as ``int64``; vLLM may emit raw ``bytes``.
+        We fold bytes into a stable 63-bit int (positive, fits signed int64).
+        """
+        if isinstance(block_hash, (bytes, bytearray)):
+            return int.from_bytes(block_hash[:8], "big") & 0x7FFF_FFFF_FFFF_FFFF
+        return int(block_hash) & 0x7FFF_FFFF_FFFF_FFFF
+
+    def _convert_kv_event(self, event) -> common_pb2.KvCacheEvent | None:
+        """Convert a single vLLM raw KV event to a proto ``KvCacheEvent``.
+
+        The block's ``medium`` is mapped to ``cache_level`` so the router can
+        score GPU vs LMCache (off-GPU) hits with different weights:
+          - ``medium == "GPU"`` (or None for legacy single-tier) → cache_level 0
+          - anything else (LMCache CPU/disk offload) → cache_level 1
+        """
+        self.kv_event_id_counter += 1
+        event_id = self.kv_event_id_counter
+
+        if isinstance(event, BlockStored):
+            cache_level = 0 if (event.medium is None or event.medium == "GPU") else 1
+            blocks = []
+            for i, bh in enumerate(event.block_hashes):
+                start = i * event.block_size
+                end = start + event.block_size
+                block = common_pb2.KvBlock(
+                    block_hash=self._block_hash_to_int(bh),
+                    token_ids=event.token_ids[start:end],
+                    block_size=event.block_size,
+                    cache_level=cache_level,
+                )
+                if event.lora_id is not None:
+                    block.lora_id = event.lora_id
+                blocks.append(block)
+
+            stored = common_pb2.KvBlocksStored(blocks=blocks)
+            if event.parent_block_hash is not None:
+                stored.parent_block_hash = self._block_hash_to_int(event.parent_block_hash)
+            return common_pb2.KvCacheEvent(event_id=event_id, stored=stored)
+
+        elif isinstance(event, BlockRemoved):
+            cache_level = 0 if (event.medium is None or event.medium == "GPU") else 1
+            removed = common_pb2.KvBlocksRemoved(
+                block_hashes=[self._block_hash_to_int(h) for h in event.block_hashes],
+                cache_level=cache_level,
+            )
+            return common_pb2.KvCacheEvent(event_id=event_id, removed=removed)
+
+        elif isinstance(event, AllBlocksCleared):
+            return common_pb2.KvCacheEvent(
+                event_id=event_id, cleared=common_pb2.KvCacheCleared()
+            )
+
+        return None
+
+    # ========== KV cache transfer (cross-instance migration) ==========
+
+    async def TransferKv(
+        self,
+        request: vllm_engine_pb2.TransferKvRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> vllm_engine_pb2.TransferKvResponse:
+        """Push this instance's cached prefix for ``tokens`` to a peer instance.
+
+        Calls the local ``KVCacheManager.transfer_direct`` (ZMQ MoveWorkerMsg to
+        the local LMCacheWorker), addressing the destination by its
+        ``dst_instance_id`` (resolved to a peer URL via the broadcast registry).
+        """
+        if self.kv_cache_manager is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV transfer not enabled: no KVCacheManager attached.",
+            )
+            return vllm_engine_pb2.TransferKvResponse()
+
+        tokens = list(request.tokens)
+        if not tokens:
+            return vllm_engine_pb2.TransferKvResponse(
+                success=False, num_tokens=0, error="empty token sequence"
+            )
+
+        src_instance = self.kv_cache_manager.config.lmcache_instance_id
+        src_backend = request.src_backend or "LocalCPUBackend"
+        dst_backend = request.dst_backend or "LocalCPUBackend"
+
+        # Seed the peer registry with the explicit dst peer URL if the broadcast
+        # registry has not learned it yet (idempotent — set_peer_registry merges).
+        if request.dst_peer_url:
+            try:
+                self.kv_cache_manager.set_peer_registry(
+                    {request.dst_instance_id: request.dst_peer_url}
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Failed to seed peer registry: %s", e)
+
+        try:
+            ok = await self.kv_cache_manager.transfer_direct(
+                tokens,
+                (src_instance, src_backend),
+                (request.dst_instance_id, dst_backend),
+                request.copy,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("TransferKv failed: %s", e)
+            return vllm_engine_pb2.TransferKvResponse(
+                success=False, num_tokens=0, error=str(e)
+            )
+
+        if ok:
+            return vllm_engine_pb2.TransferKvResponse(success=True, num_tokens=len(tokens))
+        err = getattr(self.kv_cache_manager, "_last_transfer_error", "transfer returned False")
+        return vllm_engine_pb2.TransferKvResponse(success=False, num_tokens=0, error=str(err))
+
+    async def PinKv(
+        self,
+        request: vllm_engine_pb2.PinKvRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> vllm_engine_pb2.PinKvResponse:
+        """Pin the cached prefix for ``tokens`` to protect it from LRU eviction."""
+        if self.kv_cache_manager is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV pin not enabled: no KVCacheManager attached.",
+            )
+            return vllm_engine_pb2.PinKvResponse()
+
+        tokens = list(request.tokens)
+        targets = list(request.targets) or ["gpu", "backend"]
+        try:
+            ok = await self.kv_cache_manager.pin(tokens, targets)
+            return vllm_engine_pb2.PinKvResponse(success=bool(ok))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("PinKv failed: %s", e)
+            return vllm_engine_pb2.PinKvResponse(success=False, error=str(e))
+
+    async def UnpinKv(
+        self,
+        request: vllm_engine_pb2.UnpinKvRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> vllm_engine_pb2.UnpinKvResponse:
+        """Unpin a previously-pinned prefix, releasing the pin budget."""
+        if self.kv_cache_manager is None:
+            await context.abort(
+                grpc.StatusCode.UNIMPLEMENTED,
+                "KV unpin not enabled: no KVCacheManager attached.",
+            )
+            return vllm_engine_pb2.UnpinKvResponse()
+
+        tokens = list(request.tokens)
+        targets = list(request.targets) or ["gpu", "backend"]
+        try:
+            ok = await self.kv_cache_manager.unpin(tokens, targets)
+            return vllm_engine_pb2.UnpinKvResponse(success=bool(ok))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("UnpinKv failed: %s", e)
+            return vllm_engine_pb2.UnpinKvResponse(success=False, error=str(e))
 
     # ========== Helper methods ==========
 

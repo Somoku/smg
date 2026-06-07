@@ -209,16 +209,60 @@ impl GrpcClient {
     }
 
     /// Subscribe to KV cache events (all backends).
+    ///
+    /// `dp_rank` selects the data-parallel rank when the backend fronts
+    /// multiple DP ranks behind one gRPC server. `None` → rank 0.
     pub async fn subscribe_kv_events(
         &self,
         start_seq: u64,
+        dp_rank: Option<u32>,
     ) -> Result<tonic::Streaming<smg_grpc_client::common_proto::KvEventBatch>, tonic::Status> {
         match self {
-            Self::Sglang(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Vllm(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Trtllm(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Sglang(client) => client.subscribe_kv_events(start_seq, dp_rank).await,
+            Self::Vllm(client) => client.subscribe_kv_events(start_seq, dp_rank).await,
+            Self::Trtllm(client) => client.subscribe_kv_events(start_seq, dp_rank).await,
             Self::Mlx(_) => Err(tonic::Status::unimplemented(
                 "SubscribeKvEvents RPC not supported for MLX backend",
+            )),
+        }
+    }
+
+    /// Transfer a trajectory's cached KV prefix to a destination instance.
+    /// Only supported by the vLLM backend (PSRL cross-instance migration).
+    pub async fn transfer_kv(
+        &self,
+        request: smg_grpc_client::vllm_proto::TransferKvRequest,
+    ) -> Result<smg_grpc_client::vllm_proto::TransferKvResponse, tonic::Status> {
+        match self {
+            Self::Vllm(client) => client.transfer_kv(request).await,
+            _ => Err(tonic::Status::unimplemented(
+                "TransferKv RPC only supported for vLLM backend",
+            )),
+        }
+    }
+
+    /// Pin a trajectory's cached prefix (vLLM backend only).
+    pub async fn pin_kv(
+        &self,
+        request: smg_grpc_client::vllm_proto::PinKvRequest,
+    ) -> Result<smg_grpc_client::vllm_proto::PinKvResponse, tonic::Status> {
+        match self {
+            Self::Vllm(client) => client.pin_kv(request).await,
+            _ => Err(tonic::Status::unimplemented(
+                "PinKv RPC only supported for vLLM backend",
+            )),
+        }
+    }
+
+    /// Unpin a trajectory's cached prefix (vLLM backend only).
+    pub async fn unpin_kv(
+        &self,
+        request: smg_grpc_client::vllm_proto::UnpinKvRequest,
+    ) -> Result<smg_grpc_client::vllm_proto::UnpinKvResponse, tonic::Status> {
+        match self {
+            Self::Vllm(client) => client.unpin_kv(request).await,
+            _ => Err(tonic::Status::unimplemented(
+                "UnpinKv RPC only supported for vLLM backend",
             )),
         }
     }

@@ -27,6 +27,8 @@ impl PolicyFactory {
                 eviction_interval_secs,
                 max_tree_size,
                 block_size,
+                gpu_overlap_weight,
+                lmcache_overlap_weight,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -35,6 +37,8 @@ impl PolicyFactory {
                     eviction_interval_secs: *eviction_interval_secs,
                     max_tree_size: *max_tree_size,
                     block_size: *block_size,
+                    gpu_overlap_weight: *gpu_overlap_weight,
+                    lmcache_overlap_weight: *lmcache_overlap_weight,
                 };
                 Ok(Arc::new(CacheAwarePolicy::with_config(config)))
             }
@@ -177,6 +181,8 @@ mod tests {
             eviction_interval_secs: 30,
             max_tree_size: 1000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         })
         .unwrap();
         assert_eq!(policy.name(), "cache_aware");

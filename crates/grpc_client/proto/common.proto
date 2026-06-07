@@ -19,6 +19,11 @@ message GetTokenizerChunk {
 message SubscribeKvEventsRequest {
   // Resume from this sequence number (0 = start from current state).
   uint64 start_sequence_number = 1;
+  // Data-parallel rank to subscribe to. When the engine fronts multiple DP
+  // ranks behind a single gRPC server, each rank publishes on an
+  // independent ZMQ endpoint with its own sequence counter; the consumer must
+  // select the rank explicitly. Absent / 0 selects rank 0 (single-DP default).
+  optional uint32 dp_rank = 2;
 }
 
 message KvEventBatch {

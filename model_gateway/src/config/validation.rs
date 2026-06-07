@@ -366,6 +366,8 @@ impl ConfigValidator {
                 eviction_interval_secs,
                 max_tree_size,
                 block_size,
+                gpu_overlap_weight,
+                lmcache_overlap_weight,
             } => {
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -404,6 +406,14 @@ impl ConfigValidator {
                         field: "max_tree_size".to_string(),
                         value: max_tree_size.to_string(),
                         reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *gpu_overlap_weight < 0.0 || *lmcache_overlap_weight < 0.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "gpu_overlap_weight/lmcache_overlap_weight".to_string(),
+                        value: format!("{gpu_overlap_weight}/{lmcache_overlap_weight}"),
+                        reason: "Tier overlap weights must be >= 0.0".to_string(),
                     });
                 }
             }
@@ -1002,6 +1012,8 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                gpu_overlap_weight: 1.0,
+                lmcache_overlap_weight: 0.5,
             },
         );
 
@@ -1022,6 +1034,8 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                gpu_overlap_weight: 1.0,
+                lmcache_overlap_weight: 0.5,
             },
         );
 
@@ -1077,6 +1091,8 @@ mod tests {
                 eviction_interval_secs: 60,
                 max_tree_size: 1000,
                 block_size: 16,
+                gpu_overlap_weight: 1.0,
+                lmcache_overlap_weight: 0.5,
             },
         );
 
@@ -1122,6 +1138,8 @@ mod tests {
                     eviction_interval_secs: 60,
                     max_tree_size: 1000,
                     block_size: 16,
+                    gpu_overlap_weight: 1.0,
+                    lmcache_overlap_weight: 0.5,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,

@@ -30,7 +30,10 @@ use crate::{
     config::types::CandidateSortKey,
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
-    routers::grpc::routing_loop::{metadata::RoutingMeta, runtime::RoutingLoopRuntime},
+    routers::grpc::{
+        kv_transfer::KvTransferCoordinator,
+        routing_loop::{metadata::RoutingMeta, runtime::RoutingLoopRuntime},
+    },
     worker::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -105,6 +108,7 @@ pub(crate) struct PsrlWorkerSelector {
     enable_mig_strategy: bool,
     candidate_sort_key: CandidateSortKey,
     enable_group_sticky: bool,
+    kv_transfer: Option<Arc<KvTransferCoordinator>>,
 }
 
 impl PsrlWorkerSelector {
@@ -115,6 +119,7 @@ impl PsrlWorkerSelector {
         enable_mig_strategy: bool,
         candidate_sort_key: CandidateSortKey,
         enable_group_sticky: bool,
+        kv_transfer: Option<Arc<KvTransferCoordinator>>,
     ) -> Self {
         Self {
             worker_registry,
@@ -123,6 +128,7 @@ impl PsrlWorkerSelector {
             enable_mig_strategy,
             candidate_sort_key,
             enable_group_sticky,
+            kv_transfer,
         }
     }
 
@@ -142,6 +148,24 @@ impl PsrlWorkerSelector {
             .get(&instance)
             .map(|v| *v)
             .unwrap_or_else(|| worker_version_tag(worker))
+    }
+
+    /// Resolve the live [`Worker`] for a `(base_worker_id, dp_rank)` instance,
+    /// scanning the model's worker set. Used to locate the migration source
+    /// (old instance A) so the transfer coordinator can address its servicer.
+    fn find_worker_by_instance(
+        &self,
+        model_id: &str,
+        instance: &(String, usize),
+    ) -> Option<Arc<dyn Worker>> {
+        let workers = if model_id == UNKNOWN_MODEL_ID {
+            self.worker_registry.get_all()
+        } else {
+            self.worker_registry.get_by_model(model_id).to_vec()
+        };
+        workers
+            .into_iter()
+            .find(|w| self.worker_instance_id(w) == *instance)
     }
 }
 
@@ -483,6 +507,24 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             }
         }
 
+        // ── Migration KV transfer: move A's cached prefix to B ─
+        // Triggered when this request carried a hint to a *different* instance
+        // (A ≠ B) and KV transfer is enabled. The coordinator further gates on
+        // whether A actually holds the prefix (event-driven indexer, no RPC).
+        if let Some(ref coordinator) = self.kv_transfer {
+            if let Some(ref hint) = meta.rollout_instance_hint {
+                if *hint != selected_instance {
+                    if let (Some(src), Some(req_tokens)) =
+                        (self.find_worker_by_instance(model_id, hint), tokens)
+                    {
+                        coordinator
+                            .transfer_on_migration(model_id, &src, &selected, req_tokens)
+                            .await;
+                    }
+                }
+            }
+        }
+
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
             metrics_labels::CONNECTION_GRPC,
@@ -615,6 +657,7 @@ mod tests {
             false,
             CandidateSortKey::Version,
             true,
+            None,
         );
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://worker-a:8000")

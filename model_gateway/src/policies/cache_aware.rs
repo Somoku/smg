@@ -44,7 +44,7 @@
 use std::sync::Arc;
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
+use kv_index::{compute_request_content_hashes, Tier, TieredIndexer, TokenTree, Tree};
 use parking_lot::RwLock;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -990,11 +990,12 @@ impl CacheAwarePolicy {
             .is_some_and(|indexer| indexer.current_size() > 0)
     }
 
-    /// Event-driven routing: PositionalIndexer overlap scoring (Type 1).
+    /// Event-driven routing: multi-tier overlap scoring (Type 1).
     ///
     /// Self-contained — when overlap is found, selects the worker with the best
-    /// cache match. When no overlap (cold start, novel tokens, short request),
-    /// falls back to min-load. Does NOT fall back to approximate token tree.
+    /// weighted cache match across GPU + LMCache tiers. When no overlap (cold
+    /// start, novel tokens, short request), falls back to min-load. Does NOT
+    /// fall back to the approximate token tree.
     fn select_worker_event_driven(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1006,14 +1007,7 @@ impl CacheAwarePolicy {
         let monitor = guard.as_ref()?;
         let indexer = monitor.get_indexer(model_id)?;
 
-        // Per-model block_size: learned from events > config default
-        let block_size = monitor
-            .block_size(model_id)
-            .unwrap_or(self.config.block_size);
-
-        if let Some(idx) =
-            Self::score_overlap(workers, tokens, healthy_indices, &indexer, block_size)
-        {
+        if let Some(idx) = self.score_overlap(workers, tokens, healthy_indices, &indexer) {
             return Some(idx);
         }
 
@@ -1030,63 +1024,73 @@ impl CacheAwarePolicy {
         Some(min_idx)
     }
 
-    /// Score healthy workers by PositionalIndexer overlap and select the best.
+    /// Score healthy workers by weighted multi-tier overlap and select the best.
     ///
-    /// Returns `Some(idx)` if at least one worker has cached blocks matching the
-    /// request. Returns `None` if the request is too short for a full block or
-    /// no workers have matching data.
+    /// Each tier is queried independently (GPU and LMCache have different block
+    /// sizes, learned per-tier). A worker's score is the weighted sum
+    /// `w_gpu * gpu_overlap + w_lmcache * lmcache_overlap`, so a GPU hit (zero
+    /// reload cost) outranks an LMCache hit (needs reload) of the same depth.
+    ///
+    /// Returns `Some(idx)` if at least one worker has a positive weighted score.
+    /// Returns `None` if the request is too short for any full block or no worker
+    /// has matching data (caller then falls back to min-load).
     fn score_overlap(
+        &self,
         workers: &[Arc<dyn Worker>],
         tokens: &[u32],
         healthy_indices: &[usize],
-        indexer: &PositionalIndexer,
-        block_size: usize,
+        indexer: &TieredIndexer,
     ) -> Option<usize> {
-        let content_hashes = compute_request_content_hashes(tokens, block_size);
-        if content_hashes.is_empty() {
-            return None;
+        // Per-tier weighted overlap + total tree size, keyed by worker index.
+        let mut weighted: Vec<f64> = vec![0.0; workers.len()];
+        let mut tree_sizes: Vec<usize> = vec![0; workers.len()];
+
+        for (tier, weight) in [
+            (Tier::GPU, self.config.gpu_overlap_weight),
+            (Tier::Lmcache, self.config.lmcache_overlap_weight),
+        ] {
+            if weight <= 0.0 {
+                continue;
+            }
+            let block_size = indexer.block_size(tier).unwrap_or(self.config.block_size);
+            let content_hashes = compute_request_content_hashes(tokens, block_size);
+            if content_hashes.is_empty() {
+                continue;
+            }
+            let pi = indexer.tier(tier);
+            let overlap = pi.find_matches(&content_hashes, false);
+            if overlap.scores.is_empty() {
+                continue;
+            }
+            for &idx in healthy_indices {
+                if let Some(wid) = pi.worker_id(workers[idx].url()) {
+                    if let Some(&score) = overlap.scores.get(&wid) {
+                        weighted[idx] += weight * f64::from(score);
+                    }
+                    tree_sizes[idx] += overlap.tree_sizes.get(&wid).copied().unwrap_or(0);
+                }
+            }
         }
 
-        let overlap = indexer.find_matches(&content_hashes, false);
-        if overlap.scores.is_empty() {
-            return None;
-        }
-
-        // Select worker with best overlap among those that actually match.
-        // Tie-break: lower load, then smaller tree size.
+        // Select worker with best weighted score among those that actually match.
+        // Tie-break: lower load, then smaller total tree size.
         let best_idx = healthy_indices
             .iter()
             .copied()
-            .filter(|&idx| {
-                indexer
-                    .worker_id(workers[idx].url())
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0)
-                    > 0
-            })
-            .max_by_key(|&idx| {
-                let wid = indexer.worker_id(workers[idx].url());
-                let score = wid
-                    .and_then(|id| overlap.scores.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                let load = workers[idx].engine_stats().waiting_and_running_queue_size();
-                let tree_size = wid
-                    .and_then(|id| overlap.tree_sizes.get(&id))
-                    .copied()
-                    .unwrap_or(0);
-                (score, std::cmp::Reverse(load), std::cmp::Reverse(tree_size))
+            .filter(|&idx| weighted[idx] > 0.0)
+            .max_by(|&a, &b| {
+                let load_a = workers[a].engine_stats().waiting_and_running_queue_size();
+                let load_b = workers[b].engine_stats().waiting_and_running_queue_size();
+                weighted[a]
+                    .total_cmp(&weighted[b])
+                    .then(load_b.cmp(&load_a)) // lower load wins
+                    .then(tree_sizes[b].cmp(&tree_sizes[a])) // smaller tree wins
             })?;
 
         debug!(
             worker = workers[best_idx].url(),
-            score = indexer
-                .worker_id(workers[best_idx].url())
-                .and_then(|id| overlap.scores.get(&id))
-                .copied()
-                .unwrap_or(0),
-            "Event-driven routing: overlap match"
+            score = weighted[best_idx],
+            "Event-driven routing: weighted multi-tier overlap match"
         );
         workers[best_idx].increment_processed();
         Some(best_idx)
@@ -1338,6 +1342,8 @@ mod tests {
             eviction_interval_secs: 0, // Disable eviction thread
             max_tree_size: 10000,
             block_size: 16,
+            gpu_overlap_weight: 1.0,
+            lmcache_overlap_weight: 0.5,
         });
 
         let worker1 = BasicWorkerBuilder::new("http://w1:8000")
@@ -1834,15 +1840,20 @@ mod tests {
     // Event-driven routing tests (Type 1: PositionalIndexer overlap scoring)
     // -----------------------------------------------------------------------
 
-    /// Helper: create a PositionalIndexer and store blocks for a worker.
-    /// `token_chunks` is a list of token-id slices — each becomes one block.
+    /// Helper: create a TieredIndexer and store blocks for a worker in the GPU
+    /// tier. `token_chunks` is a list of token-id slices — each becomes one
+    /// block. The GPU-tier block size is seeded from the first chunk length.
     fn setup_indexer_with_blocks(
         worker_url: &str,
         token_chunks: &[&[u32]],
         jump_size: usize,
-    ) -> Arc<PositionalIndexer> {
-        let indexer = Arc::new(PositionalIndexer::new(jump_size));
-        let worker_id = indexer.intern_worker(worker_url);
+    ) -> Arc<TieredIndexer> {
+        let indexer = Arc::new(TieredIndexer::new(jump_size));
+        if let Some(first) = token_chunks.first() {
+            indexer.set_block_size(Tier::GPU, first.len());
+        }
+        let pi = indexer.tier(Tier::GPU);
+        let worker_id = pi.intern_worker(worker_url);
         let mut wb = WorkerBlockMap::default();
         let blocks: Vec<StoredBlock> = token_chunks
             .iter()
@@ -1852,9 +1863,7 @@ mod tests {
                 content_hash: compute_content_hash(tokens),
             })
             .collect();
-        indexer
-            .apply_stored(worker_id, &blocks, None, &mut wb)
-            .unwrap();
+        pi.apply_stored(worker_id, &blocks, None, &mut wb).unwrap();
         indexer
     }
 
@@ -1900,12 +1909,11 @@ mod tests {
         );
 
         // Query with matching tokens — should select w1
-        let result = CacheAwarePolicy::score_overlap(
+        let result = policy.score_overlap(
             &workers,
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             &[0, 1],
             &indexer,
-            4,
         );
         assert_eq!(result, Some(0)); // w1
     }
@@ -1925,12 +1933,11 @@ mod tests {
             setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4], &[5, 6, 7, 8]], 4);
 
         // Completely different tokens — no overlap → None
-        let result = CacheAwarePolicy::score_overlap(
+        let result = policy.score_overlap(
             &workers,
             &[100, 200, 300, 400, 500, 600, 700, 800],
             &[0],
             &indexer,
-            4,
         );
         assert_eq!(result, None);
     }
@@ -1957,28 +1964,26 @@ mod tests {
         policy.init_workers(&workers);
 
         // Store same blocks for both workers (equal overlap)
-        let indexer = Arc::new(PositionalIndexer::new(4));
-        let w1_id = indexer.intern_worker("http://w1:8000");
-        let w2_id = indexer.intern_worker("http://w2:8000");
+        let indexer = Arc::new(TieredIndexer::new(4));
+        indexer.set_block_size(Tier::GPU, 4);
+        let pi = indexer.tier(Tier::GPU);
+        let w1_id = pi.intern_worker("http://w1:8000");
+        let w2_id = pi.intern_worker("http://w2:8000");
         let mut wb1 = WorkerBlockMap::default();
         let mut wb2 = WorkerBlockMap::default();
         let blocks = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4]),
         }];
-        indexer
-            .apply_stored(w1_id, &blocks, None, &mut wb1)
-            .unwrap();
+        pi.apply_stored(w1_id, &blocks, None, &mut wb1).unwrap();
         let blocks2 = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4]),
         }];
-        indexer
-            .apply_stored(w2_id, &blocks2, None, &mut wb2)
-            .unwrap();
+        pi.apply_stored(w2_id, &blocks2, None, &mut wb2).unwrap();
 
         // Equal overlap → tie-break by load → w2 wins (lower load)
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
+        let result = policy.score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer);
         assert_eq!(result, Some(1)); // w2 (lower load)
     }
 
@@ -2001,9 +2006,11 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let indexer = Arc::new(PositionalIndexer::new(4));
-        let w1_id = indexer.intern_worker("http://w1:8000");
-        let w2_id = indexer.intern_worker("http://w2:8000");
+        let indexer = Arc::new(TieredIndexer::new(4));
+        indexer.set_block_size(Tier::GPU, 4);
+        let pi = indexer.tier(Tier::GPU);
+        let w1_id = pi.intern_worker("http://w1:8000");
+        let w2_id = pi.intern_worker("http://w2:8000");
         let mut wb1 = WorkerBlockMap::default();
         let mut wb2 = WorkerBlockMap::default();
 
@@ -2012,31 +2019,29 @@ mod tests {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4]),
         }];
-        indexer.apply_stored(w1_id, &block, None, &mut wb1).unwrap();
+        pi.apply_stored(w1_id, &block, None, &mut wb1).unwrap();
 
         // w2 has the same block plus extra blocks → larger tree
         let block2 = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4]),
         }];
-        indexer
-            .apply_stored(w2_id, &block2, None, &mut wb2)
-            .unwrap();
+        pi.apply_stored(w2_id, &block2, None, &mut wb2).unwrap();
         let extra = vec![StoredBlock {
             seq_hash: SequenceHash(2),
             content_hash: compute_content_hash(&[5, 6, 7, 8]),
         }];
-        indexer
-            .apply_stored(w2_id, &extra, Some(SequenceHash(1)), &mut wb2)
+        pi.apply_stored(w2_id, &extra, Some(SequenceHash(1)), &mut wb2)
             .unwrap();
 
         // Equal overlap, equal load → tie-break by tree size → w1 wins (smaller)
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer, 4);
+        let result = policy.score_overlap(&workers, &[1, 2, 3, 4], &[0, 1], &indexer);
         assert_eq!(result, Some(0)); // w1 (smaller tree)
     }
 
     #[test]
     fn test_score_overlap_short_request_returns_none() {
+        let policy = CacheAwarePolicy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
                 .worker_type(WorkerType::Regular)
@@ -2047,7 +2052,7 @@ mod tests {
         let indexer = setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]], 4);
 
         // Request shorter than block_size → no full blocks → None
-        let result = CacheAwarePolicy::score_overlap(&workers, &[1, 2, 3], &[0], &indexer, 4);
+        let result = policy.score_overlap(&workers, &[1, 2, 3], &[0], &indexer);
         assert_eq!(result, None);
     }
 
@@ -2070,9 +2075,11 @@ mod tests {
         ];
         policy.init_workers(&workers);
 
-        let indexer = Arc::new(PositionalIndexer::new(4));
-        let w1_id = indexer.intern_worker("http://w1:8000");
-        let w2_id = indexer.intern_worker("http://w2:8000");
+        let indexer = Arc::new(TieredIndexer::new(4));
+        indexer.set_block_size(Tier::GPU, 4);
+        let pi = indexer.tier(Tier::GPU);
+        let w1_id = pi.intern_worker("http://w1:8000");
+        let w2_id = pi.intern_worker("http://w2:8000");
         let mut wb1 = WorkerBlockMap::default();
         let mut wb2 = WorkerBlockMap::default();
 
@@ -2088,9 +2095,7 @@ mod tests {
                 ]),
             })
             .collect();
-        indexer
-            .apply_stored(w1_id, &blocks_w1, None, &mut wb1)
-            .unwrap();
+        pi.apply_stored(w1_id, &blocks_w1, None, &mut wb1).unwrap();
 
         // w2 has only the first 2 blocks (partial overlap with same request)
         let blocks_w2: Vec<StoredBlock> = (0..2)
@@ -2104,17 +2109,14 @@ mod tests {
                 ]),
             })
             .collect();
-        indexer
-            .apply_stored(w2_id, &blocks_w2, None, &mut wb2)
-            .unwrap();
+        pi.apply_stored(w2_id, &blocks_w2, None, &mut wb2).unwrap();
 
         // Query with all 4 blocks worth of tokens → w1 wins (higher overlap: 4 vs 2)
-        let result = CacheAwarePolicy::score_overlap(
+        let result = policy.score_overlap(
             &workers,
             &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
             &[0, 1],
             &indexer,
-            4,
         );
         assert_eq!(result, Some(0)); // w1 (higher overlap)
     }
@@ -2320,14 +2322,15 @@ mod tests {
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
 
         // Store blocks using block_size=8 (tokens chunked in groups of 8)
-        let indexer = Arc::new(PositionalIndexer::new(4));
-        let w1_id = indexer.intern_worker("http://w1:8000");
+        let indexer = Arc::new(TieredIndexer::new(4));
+        let pi = indexer.tier(Tier::GPU);
+        let w1_id = pi.intern_worker("http://w1:8000");
         let mut wb = WorkerBlockMap::default();
         let block = vec![StoredBlock {
             seq_hash: SequenceHash(1),
             content_hash: compute_content_hash(&[1, 2, 3, 4, 5, 6, 7, 8]),
         }];
-        indexer.apply_stored(w1_id, &block, None, &mut wb).unwrap();
+        pi.apply_stored(w1_id, &block, None, &mut wb).unwrap();
         monitor
             .indexers
             .insert("unknown".to_string(), indexer.clone());
@@ -2419,7 +2422,7 @@ mod tests {
 
         // Set up monitor with an empty indexer
         let monitor = Arc::new(KvEventMonitor::new(Some(4)));
-        let empty_indexer = Arc::new(PositionalIndexer::new(4));
+        let empty_indexer = Arc::new(TieredIndexer::new(4));
         monitor
             .indexers
             .insert("unknown".to_string(), empty_indexer);
