@@ -23,16 +23,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tracing::{error, warn, info};
+use axum::response::Response;
+use tracing::{error, info, warn};
 
 use super::WorkerSelectorStrategy;
 use crate::{
     config::types::CandidateSortKey,
     observability::metrics::{metrics_labels, Metrics},
     policies::{PolicyRegistry, SelectWorkerInfo},
-    routers::grpc::{
-        kv_transfer::KvTransferCoordinator,
-        routing_loop::{metadata::RoutingMeta, runtime::RoutingLoopRuntime},
+    routers::{
+        error,
+        grpc::{
+            kv_transfer::KvTransferCoordinator,
+            routing_loop::{metadata::RoutingMeta, runtime::RoutingLoopRuntime},
+        },
     },
     worker::{ConnectionMode, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
@@ -436,94 +440,6 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         )?;
 
         let selected = sorted_candidates[idx].clone();
-        let selected_instance = self.worker_instance_id(&selected);
-
-        // ── Post-selection: update PS Manager and bookkeeping maps ───────────
-        {
-            let instance = &selected_instance;
-            if let Some(ps_client) = self.runtime.ps_manager_client.get() {
-                let version = self.version_after_sync(&selected);
-
-                if meta.rollout_instance_hint.is_none() {
-                    // First placement — reserve and record.
-                    match ps_client
-                        .reserve_rollout_instance_requests(
-                            vec![instance.clone()],
-                            vec![request_id],
-                            vec![version],
-                            false,
-                            is_validate,
-                        )
-                        .await
-                    {
-                        Ok((success, _buffer_ids, _entry_ids, err_msg)) => {
-                            if !success {
-                                error!(
-                                    request_id,
-                                    %err_msg,
-                                    "PSRL post-select: reserve_rollout_instance_requests failed"
-                                );
-                            }
-                        }
-                        Err(status) => {
-                            error!(
-                                request_id,
-                                %status,
-                                "PSRL post-select: reserve_rollout_instance_requests RPC error"
-                            );
-                        }
-                    }
-                } else {
-                    // Migration — update the assigned instance.
-                    match ps_client
-                        .update_request_instance_id(request_id, instance.clone(), is_validate)
-                        .await
-                    {
-                        Ok(success) => {
-                            if !success {
-                                error!(
-                                    request_id,
-                                    "PSRL post-select: update_request_instance_id returned false"
-                                );
-                            }
-                        }
-                        Err(status) => {
-                            error!(
-                                request_id,
-                                %status,
-                                "PSRL post-select: update_request_instance_id RPC error"
-                            );
-                        }
-                    }
-                }
-            }
-
-            if meta.rollout_instance_hint.is_none() {
-                self.runtime.record_selected_instance(
-                    request_id,
-                    Some(meta.prompt_id),
-                    instance.clone(),
-                );
-            }
-        }
-
-        // ── Migration KV transfer: move A's cached prefix to B ─
-        // Triggered when this request carried a hint to a *different* instance
-        // (A ≠ B) and KV transfer is enabled. The coordinator further gates on
-        // whether A actually holds the prefix (event-driven indexer, no RPC).
-        if let Some(ref coordinator) = self.kv_transfer {
-            if let Some(ref hint) = meta.rollout_instance_hint {
-                if *hint != selected_instance {
-                    if let (Some(src), Some(req_tokens)) =
-                        (self.find_worker_by_instance(model_id, hint), tokens)
-                    {
-                        coordinator
-                            .transfer_on_migration(model_id, &src, &selected, req_tokens)
-                            .await;
-                    }
-                }
-            }
-        }
 
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
@@ -533,6 +449,92 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         );
 
         Some(selected)
+    }
+
+    async fn commit_single_worker(
+        &self,
+        model_id: &str,
+        tokens: Option<&[u32]>,
+        routing_meta: Option<&RoutingMeta>,
+        selected: &Arc<dyn Worker>,
+    ) -> Result<(), Response> {
+        let meta = routing_meta.ok_or_else(|| {
+            error::internal_error(
+                "missing_routing_metadata",
+                "PSRL selection commit requires routing metadata",
+            )
+        })?;
+        let request_id = meta.request_id;
+        let selected_instance = self.worker_instance_id(selected);
+
+        if let Some(ps_client) = self.runtime.ps_manager_client.get() {
+            let result = if meta.rollout_instance_hint.is_none() {
+                let version = self.version_after_sync(selected);
+                ps_client
+                    .reserve_rollout_instance_requests(
+                        vec![selected_instance.clone()],
+                        vec![request_id],
+                        vec![version],
+                        false,
+                        meta.is_validate,
+                    )
+                    .await
+                    .map(|(success, _, _, err_msg)| success.then_some(()).ok_or(err_msg))
+            } else {
+                ps_client
+                    .update_request_instance_id(
+                        request_id,
+                        selected_instance.clone(),
+                        meta.is_validate,
+                    )
+                    .await
+                    .map(|success| {
+                        success
+                            .then_some(())
+                            .ok_or_else(|| "update_request_instance_id returned false".to_string())
+                    })
+            };
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    error!(request_id, %message, "PSRL selection commit rejected");
+                    return Err(error::internal_error(
+                        "psrl_selection_commit_rejected",
+                        message.as_str(),
+                    ));
+                }
+                Err(status) => {
+                    error!(request_id, %status, "PSRL selection commit RPC failed");
+                    return Err(error::internal_error(
+                        "psrl_selection_commit_failed",
+                        status.message(),
+                    ));
+                }
+            }
+        }
+
+        if meta.rollout_instance_hint.is_none() {
+            self.runtime.record_selected_instance(
+                request_id,
+                Some(meta.prompt_id),
+                selected_instance.clone(),
+            );
+        }
+
+        if let (Some(coordinator), Some(hint), Some(request_tokens)) =
+            (&self.kv_transfer, &meta.rollout_instance_hint, tokens)
+        {
+            if *hint != selected_instance {
+                if let Some(src) = self.find_worker_by_instance(model_id, hint) {
+                    coordinator
+                        .transfer_on_migration(model_id, &src, selected, request_tokens)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

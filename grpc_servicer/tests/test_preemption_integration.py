@@ -74,3 +74,21 @@ async def test_subscribe_terminates_on_cancellation():
         await gen.__anext__()
 
     await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_generate_admission_close_waits_for_registered_requests():
+    servicer = VllmEngineServicer(MagicMock(), start_time=time.time())
+    assert servicer._begin_generate_admission()
+
+    close_task = asyncio.create_task(servicer.close_generate_admission())
+    await asyncio.sleep(0)
+    assert not close_task.done()
+    assert not servicer._begin_generate_admission()
+
+    servicer._finish_generate_admission()
+    await close_task
+
+    await servicer.open_generate_admission()
+    assert servicer._begin_generate_admission()
+    servicer._finish_generate_admission()

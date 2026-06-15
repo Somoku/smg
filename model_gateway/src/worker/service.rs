@@ -4,7 +4,10 @@
 //! and business logic for worker management. The service orchestrates
 //! WorkerRegistry and JobQueue operations.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     http::StatusCode,
@@ -29,6 +32,8 @@ use crate::{
     },
     workflow::{Job, JobQueue},
 };
+
+type ReplicaWeightVersionUpdate = (WorkerId, Arc<dyn Worker>, usize, u64);
 
 /// Error types for worker service operations
 #[derive(Debug)]
@@ -562,46 +567,38 @@ impl WorkerService {
     ) -> WorkerWeightVersionUpdateResult {
         let total = update.len();
         let mut results = Vec::with_capacity(total);
+        let mut replica_updates: HashMap<String, Vec<ReplicaWeightVersionUpdate>> = HashMap::new();
+        let mut replica_ranks: HashMap<String, HashSet<usize>> = HashMap::new();
 
-        // Process each update
+        for worker in self.worker_registry.get_all() {
+            if let Some(dp_rank) = worker.dp_rank() {
+                let base_worker_id = self
+                    .worker_registry
+                    .reserve_id_for_url(worker.base_url())
+                    .as_str()
+                    .to_string();
+                replica_ranks
+                    .entry(base_worker_id)
+                    .or_default()
+                    .insert(dp_rank);
+            }
+        }
+
         for item in update {
             let weight_version = item.weight_version;
             match self.resolve_worker_by_id_and_dp(&item.worker_id, item.dp_rank) {
                 Ok((worker_id, worker)) => {
-                    if worker.update_dyn_weight_version(weight_version) {
-                        if let Ok(version_tag) = i64::try_from(weight_version) {
-                            self.instance_to_version_after_sync.insert(
-                                (
-                                    self.worker_registry
-                                        .reserve_id_for_url(worker.base_url())
-                                        .as_str()
-                                        .to_string(),
-                                    worker.dp_rank().unwrap_or(0),
-                                ),
-                                version_tag,
-                            );
-                        }
-                        results.push(WorkerWeightVersionUpdateResultItem {
-                            status: "updated".to_string(),
-                            worker_id: worker_id.as_str().to_string(),
-                            url: worker.url().to_string(),
-                            weight_version,
-                            dp_rank: item.dp_rank,
-                            reason: None,
-                        });
-                    } else {
-                        results.push(WorkerWeightVersionUpdateResultItem {
-                            status: "rejected".to_string(),
-                            worker_id: worker_id.as_str().to_string(),
-                            url: worker.url().to_string(),
-                            weight_version,
-                            dp_rank: item.dp_rank,
-                            reason: Some(
-                                "worker does not support dynamic weight version updates"
-                                    .to_string(),
-                            ),
-                        });
-                    }
+                    let base_worker_id = self
+                        .worker_registry
+                        .reserve_id_for_url(worker.base_url())
+                        .as_str()
+                        .to_string();
+                    replica_updates.entry(base_worker_id).or_default().push((
+                        worker_id,
+                        worker.clone(),
+                        worker.dp_rank().unwrap_or(0),
+                        weight_version,
+                    ));
                 }
                 Err(err) => {
                     results.push(WorkerWeightVersionUpdateResultItem {
@@ -613,6 +610,62 @@ impl WorkerService {
                         reason: Some(err.to_string()),
                     });
                 }
+            }
+        }
+
+        for (base_worker_id, items) in replica_updates {
+            let expected_ranks = replica_ranks.get(&base_worker_id);
+            let requested_ranks: HashSet<usize> =
+                items.iter().map(|(_, _, rank, _)| *rank).collect();
+            let versions: HashSet<u64> = items.iter().map(|(_, _, _, version)| *version).collect();
+            let all_supported = items
+                .iter()
+                .all(|(_, worker, _, _)| worker.supports_dyn_weight_version_update());
+            let reject_reason = if expected_ranks.is_some_and(|ranks| requested_ranks != *ranks) {
+                Some(format!(
+                    "replica update must cover all DP ranks: expected {expected_ranks:?}, got {requested_ranks:?}"
+                ))
+            } else if requested_ranks.len() != items.len() {
+                Some("replica update contains duplicate DP ranks".to_string())
+            } else if versions.len() != 1 {
+                Some(
+                    "all DP ranks in a replica update must use the same weight version".to_string(),
+                )
+            } else if !all_supported {
+                Some("worker does not support dynamic weight version updates".to_string())
+            } else {
+                None
+            };
+
+            if let Some(reason) = reject_reason {
+                for (worker_id, worker, rank, weight_version) in items {
+                    results.push(WorkerWeightVersionUpdateResultItem {
+                        status: "rejected".to_string(),
+                        worker_id: worker_id.as_str().to_string(),
+                        url: worker.url().to_string(),
+                        weight_version,
+                        dp_rank: worker.dp_rank().map(|_| rank),
+                        reason: Some(reason.clone()),
+                    });
+                }
+                continue;
+            }
+
+            for (worker_id, worker, rank, weight_version) in items {
+                let updated = worker.update_dyn_weight_version(weight_version);
+                debug_assert!(updated, "support check must make update infallible");
+                if let Ok(version_tag) = i64::try_from(weight_version) {
+                    self.instance_to_version_after_sync
+                        .insert((base_worker_id.clone(), rank), version_tag);
+                }
+                results.push(WorkerWeightVersionUpdateResultItem {
+                    status: "updated".to_string(),
+                    worker_id: worker_id.as_str().to_string(),
+                    url: worker.url().to_string(),
+                    weight_version,
+                    dp_rank: worker.dp_rank().map(|_| rank),
+                    reason: None,
+                });
             }
         }
 

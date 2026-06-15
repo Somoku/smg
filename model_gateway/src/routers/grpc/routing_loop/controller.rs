@@ -1,9 +1,6 @@
 //! Control-plane handlers for the request routing loop.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
@@ -11,7 +8,6 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use tokio::time::sleep;
 
 use super::runtime::RoutingLoopRuntime;
 use crate::{routers::error, server::AppState};
@@ -30,17 +26,10 @@ fn runtime_from_state(state: &AppState) -> Result<Arc<RoutingLoopRuntime>, Box<R
 /// Query params for `POST /routing_loop/pause`.
 #[derive(Deserialize)]
 pub(crate) struct PauseParams {
-    /// When `true`, poll until every dispatch task has exited the
-    /// worker-selection stage before returning.
-    /// 
-    /// This is the precise drain barrier the sync coordinator relies on:
-    /// once it returns, no in-flight worker selection can issue a
-    /// `reserve_rollout_instance_requests` against the pre-sync
-    /// `version_after_sync`.
-    /// 
-    /// Polls every 10 ms up to a 30-second deadline;
-    /// the caller can detect a timeout by inspecting the `selecting` field of
-    /// the returned status object.
+    /// When `true`, wait until all admitted decisions and commit/dispatch
+    /// handoffs have exited before returning.
+    ///
+    /// The response is the pause acknowledgement used by the sync coordinator.
     wait: Option<bool>,
 }
 
@@ -53,15 +42,7 @@ pub(crate) async fn pause_routing_loop(
             runtime.pause();
 
             if params.wait.unwrap_or(false) {
-                let deadline = Duration::from_secs(30);
-                let poll_interval = Duration::from_millis(10);
-                let start = Instant::now();
-                while runtime.is_selecting() {
-                    if start.elapsed() >= deadline {
-                        break;
-                    }
-                    sleep(poll_interval).await;
-                }
+                runtime.wait_for_pause_barrier().await;
             }
 
             Json(runtime.status().await).into_response()

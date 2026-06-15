@@ -41,6 +41,11 @@ pub trait PipelineStage: Send + Sync {
     /// - `Err(response)` - Error occurred, return this error response
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response>;
 
+    /// Commit side effects produced by an earlier decision-stage execution.
+    async fn commit(&self, _ctx: &mut RequestContext) -> Result<(), Response> {
+        Ok(())
+    }
+
     /// Stage name for logging
     fn name(&self) -> &'static str;
 

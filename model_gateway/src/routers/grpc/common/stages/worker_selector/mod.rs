@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use axum::response::Response;
 
 use crate::{
     config::types::{PsrlConfig, WorkerSelectionStrategy},
@@ -52,6 +53,17 @@ pub(crate) trait WorkerSelectorStrategy: Send + Sync {
         headers: Option<&http::HeaderMap>,
         routing_meta: Option<&RoutingMeta>,
     ) -> Option<Arc<dyn Worker>>;
+
+    /// Commit external side effects for a selected worker.
+    async fn commit_single_worker(
+        &self,
+        _model_id: &str,
+        _tokens: Option<&[u32]>,
+        _routing_meta: Option<&RoutingMeta>,
+        _selected: &Arc<dyn Worker>,
+    ) -> Result<(), Response> {
+        Ok(())
+    }
 }
 
 pub(crate) fn build_strategy(

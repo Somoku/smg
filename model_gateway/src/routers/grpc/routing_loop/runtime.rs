@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::Duration,
@@ -18,7 +18,7 @@ use metrics::{counter, gauge, histogram};
 use openai_protocol::chat::ChatCompletionResponse;
 use serde::Serialize;
 use tokio::{
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, Mutex, Notify},
     task::{yield_now, JoinSet},
     time::sleep,
 };
@@ -94,7 +94,10 @@ impl RequestPriority for RoutingQueueEntry {
 pub(crate) struct RoutingLoopStatus {
     pub(crate) enabled: bool,
     pub(crate) paused: bool,
+    pub(crate) routing: bool,
     pub(crate) selecting: bool,
+    pub(crate) routing_epoch: u64,
+    pub(crate) active_dispatch_handoffs: usize,
     pub(crate) queue_len: usize,
     pub(crate) pending_request_num: usize,
     pub(crate) running_tasks: usize,
@@ -119,8 +122,11 @@ pub struct RoutingLoopRuntime {
     queue: Mutex<MultiPriorityRequestQueue<RoutingQueueEntry>>,
     tx: mpsc::UnboundedSender<RoutingQueueEntry>,
     paused: AtomicBool,
+    routing_epoch: AtomicU64,
     running_tasks: AtomicUsize,
-    running_selections: AtomicUsize,
+    active_decisions: AtomicUsize,
+    active_dispatch_handoffs: AtomicUsize,
+    admission_notify: Notify,
     running_requests: AtomicUsize,
     check_interval_ms: u64,
     receive_batch_size: usize,
@@ -169,8 +175,11 @@ impl RoutingLoopRuntime {
             )),
             tx,
             paused: AtomicBool::new(false),
+            routing_epoch: AtomicU64::new(0),
             running_tasks: AtomicUsize::new(0),
-            running_selections: AtomicUsize::new(0),
+            active_decisions: AtomicUsize::new(0),
+            active_dispatch_handoffs: AtomicUsize::new(0),
+            admission_notify: Notify::new(),
             running_requests: AtomicUsize::new(0),
             check_interval_ms: config.check_interval_ms,
             receive_batch_size: config.receive_batch_size.max(1),
@@ -264,11 +273,14 @@ impl RoutingLoopRuntime {
     }
 
     pub(crate) fn pause(&self) {
-        self.paused.store(true, Ordering::Release);
+        if !self.paused.swap(true, Ordering::AcqRel) {
+            self.routing_epoch.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub(crate) fn resume(&self) {
         self.paused.store(false, Ordering::Release);
+        self.admission_notify.notify_waiters();
     }
 
     pub(crate) fn is_paused(&self) -> bool {
@@ -278,18 +290,74 @@ impl RoutingLoopRuntime {
     /// Returns `true` while at least one dispatch task is still inside the
     /// worker-selection stage.
     pub(crate) fn is_selecting(&self) -> bool {
-        self.running_selections.load(Ordering::Acquire) > 0
+        self.active_decisions.load(Ordering::Acquire) > 0
     }
 
-    /// Acquire a guard that increments `running_selections` and decrements it
-    /// when dropped (including on panic / `.await` cancellation, because
-    /// `Drop::drop` runs unconditionally).
-    pub(crate) fn selection_guard(self: &Arc<Self>) -> SelectionGuard {
-        self.running_selections.fetch_add(1, Ordering::AcqRel);
-        gauge!("smg_routing_loop_running_selections")
-            .set(self.running_selections.load(Ordering::Acquire) as f64);
-        SelectionGuard {
+    pub(crate) fn is_routing(&self) -> bool {
+        self.is_selecting() || self.active_dispatch_handoffs.load(Ordering::Acquire) > 0
+    }
+
+    pub(crate) fn routing_epoch(&self) -> u64 {
+        self.routing_epoch.load(Ordering::Acquire)
+    }
+
+    /// Atomically admit a new side-effect-free routing decision.
+    pub(crate) fn try_acquire_decision(self: &Arc<Self>) -> Option<DecisionPermit> {
+        loop {
+            if self.is_paused() {
+                return None;
+            }
+            let epoch = self.routing_epoch();
+            self.active_decisions.fetch_add(1, Ordering::AcqRel);
+            if !self.is_paused() && self.routing_epoch() == epoch {
+                gauge!("smg_routing_loop_running_selections")
+                    .set(self.active_decisions.load(Ordering::Acquire) as f64);
+                return Some(DecisionPermit {
+                    runtime: Arc::clone(self),
+                    epoch,
+                });
+            }
+            self.release_decision();
+        }
+    }
+
+    /// Admit the commit/backend-dispatch handoff for a previously made decision.
+    pub(crate) fn try_acquire_dispatch_handoff(
+        self: &Arc<Self>,
+        epoch: u64,
+    ) -> Option<DispatchHandoffPermit> {
+        if self.is_paused() || self.routing_epoch() != epoch {
+            return None;
+        }
+        self.active_dispatch_handoffs.fetch_add(1, Ordering::AcqRel);
+        if self.is_paused() || self.routing_epoch() != epoch {
+            self.release_dispatch_handoff();
+            return None;
+        }
+        Some(DispatchHandoffPermit {
             runtime: Arc::clone(self),
+        })
+    }
+
+    fn release_decision(&self) {
+        self.active_decisions.fetch_sub(1, Ordering::AcqRel);
+        gauge!("smg_routing_loop_running_selections")
+            .set(self.active_decisions.load(Ordering::Acquire) as f64);
+        self.admission_notify.notify_waiters();
+    }
+
+    fn release_dispatch_handoff(&self) {
+        self.active_dispatch_handoffs.fetch_sub(1, Ordering::AcqRel);
+        self.admission_notify.notify_waiters();
+    }
+
+    pub(crate) async fn wait_for_pause_barrier(&self) {
+        loop {
+            let notified = self.admission_notify.notified();
+            if !self.is_routing() {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -299,7 +367,10 @@ impl RoutingLoopRuntime {
         RoutingLoopStatus {
             enabled: true,
             paused: self.is_paused(),
+            routing: self.is_routing(),
             selecting: self.is_selecting(),
+            routing_epoch: self.routing_epoch(),
+            active_dispatch_handoffs: self.active_dispatch_handoffs.load(Ordering::Acquire),
             queue_len,
             pending_request_num: queue_len,
             running_tasks: self.running_tasks.load(Ordering::Acquire),
@@ -397,7 +468,21 @@ pub(crate) async fn run_routing_loop(
         }
 
         if runtime.is_paused() {
-            sleep(runtime.idle_interval()).await;
+            tokio::select! {
+                maybe_entry = rx.recv() => {
+                    match maybe_entry {
+                        Some(entry) => {
+                            let mut entries = Vec::with_capacity(runtime.receive_batch_size);
+                            entries.push(entry);
+                            entries.extend(drain_receiver(&mut rx, runtime.receive_batch_size - 1));
+                            runtime.push_entries(entries).await;
+                        }
+                        None => break,
+                    }
+                }
+                () = runtime.admission_notify.notified() => {}
+                () = sleep(runtime.idle_interval()) => {}
+            }
             continue;
         }
 
@@ -538,51 +623,52 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
     let prompt_id = entry.routing_meta.as_ref().map(|meta| meta.prompt_id);
 
     if entry.routing_meta.is_none() {
-        // ── Worker selection (drain barrier for `pause?wait=true`) ───────────
-        // The guard increments `running_selections` until the future
-        // completes; PSRL's post-select reserve happens inside this call.
-        let select_result = {
-            let _guard = runtime.selection_guard();
-            entry
-                .pipeline
-                .execute_worker_selection(&mut entry.ctx)
-                .await
+        let Some(decision_permit) = runtime.try_acquire_decision() else {
+            runtime.push_entries(vec![entry]).await;
+            return;
         };
+        let decision_epoch = decision_permit.epoch();
+        let select_result = entry
+            .pipeline
+            .execute_worker_selection(&mut entry.ctx)
+            .await;
+        drop(decision_permit);
         if select_result.is_err() {
-            // Worker selection found no available worker — re-enqueue.
             runtime.push_entries(vec![entry]).await;
             return;
         }
 
-        // ── Run remaining execution stages (client acquisition → dispatch) ──
+        let Some(handoff_permit) = runtime.try_acquire_dispatch_handoff(decision_epoch) else {
+            entry.ctx.state.workers = None;
+            runtime.push_entries(vec![entry]).await;
+            return;
+        };
+        if let Err(response) = entry.pipeline.commit_worker_selection(&mut entry.ctx).await {
+            drop(handoff_permit);
+            send_completion_error(entry.completion, response);
+            runtime.cleanup_tracking(request_id, prompt_id);
+            return;
+        }
         if let Err(response) = entry
             .pipeline
             .execute_post_selection_execution(&mut entry.ctx)
             .await
         {
-            // A post-selection execution stage failed — propagate to caller.
-            match entry.completion {
-                RoutingLoopCompletion::Http(tx) => {
-                    let _ = tx.send(response);
-                }
-                RoutingLoopCompletion::ChatForResponses(tx) => {
-                    let _ = tx.send(Err(response));
-                }
-                RoutingLoopCompletion::HarmonyResponses(tx) => {
-                    let _ = tx.send(Err(response));
-                }
-                RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
-                    let _ = tx.send(Err(response));
-                }
-            }
+            drop(handoff_permit);
+            send_completion_error(entry.completion, response);
             runtime.cleanup_tracking(request_id, prompt_id);
             return;
         }
+        drop(handoff_permit);
 
         // ── Execution succeeded — run post-execution stages and send result ──
         match entry.completion {
             RoutingLoopCompletion::Http(tx) => {
-                let response = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                let response = match entry
+                    .pipeline
+                    .execute_remaining_stages(&mut entry.ctx)
+                    .await
+                {
                     Ok(Some(r)) => r,
                     Ok(None) => extract_final_response(&mut entry.ctx),
                     Err(r) => r,
@@ -590,7 +676,11 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
                 let _ = tx.send(response);
             }
             RoutingLoopCompletion::ChatForResponses(tx) => {
-                let result = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                let result = match entry
+                    .pipeline
+                    .execute_remaining_stages(&mut entry.ctx)
+                    .await
+                {
                     Ok(_) => match entry.ctx.state.response.final_response.take() {
                         Some(FinalResponse::Chat(r)) => Ok(r),
                         Some(_) => Err(router_error::internal_error(
@@ -607,7 +697,11 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
                 let _ = tx.send(result);
             }
             RoutingLoopCompletion::HarmonyResponses(tx) => {
-                let result = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                let result = match entry
+                    .pipeline
+                    .execute_remaining_stages(&mut entry.ctx)
+                    .await
+                {
                     Ok(_) => entry
                         .ctx
                         .state
@@ -625,7 +719,11 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
                 let _ = tx.send(result);
             }
             RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
-                let result = match entry.pipeline.execute_remaining_stages(&mut entry.ctx).await {
+                let result = match entry
+                    .pipeline
+                    .execute_remaining_stages(&mut entry.ctx)
+                    .await
+                {
                     Ok(_) => match entry.ctx.state.response.execution_result.take() {
                         Some(execution_result) => {
                             let load_guards = entry.ctx.state.load_guards.take();
@@ -644,6 +742,23 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
         runtime.cleanup_tracking(request_id, prompt_id);
     } else {
         dispatch_entry_with_partial_rollout(runtime, entry, request_id, prompt_id).await;
+    }
+}
+
+fn send_completion_error(completion: RoutingLoopCompletion, response: Response) {
+    match completion {
+        RoutingLoopCompletion::Http(tx) => {
+            let _ = tx.send(response);
+        }
+        RoutingLoopCompletion::ChatForResponses(tx) => {
+            let _ = tx.send(Err(response));
+        }
+        RoutingLoopCompletion::HarmonyResponses(tx) => {
+            let _ = tx.send(Err(response));
+        }
+        RoutingLoopCompletion::HarmonyResponsesStreaming(tx) => {
+            let _ = tx.send(Err(response));
+        }
     }
 }
 
@@ -715,21 +830,219 @@ async fn dispatch_entry_with_partial_rollout(
     // Snapshot `preparation` before the loop starts
     ctx.state.preparation_snapshot = ctx.state.preparation.clone();
 
-    loop {
-        // ── Step 1: publish accumulated response-token count for selection ───
-        let headers = ctx.input.headers.get_or_insert_with(Default::default);
-        if let Ok(v) = HeaderValue::from_str(&partial_state.response_token_count().to_string()) {
-            headers.insert("x-response-token-count", v);
-        }
+    // ── Step 1: publish accumulated response-token count for selection ───
+    let headers = ctx.input.headers.get_or_insert_with(Default::default);
+    if let Ok(v) = HeaderValue::from_str(&partial_state.response_token_count().to_string()) {
+        headers.insert("x-response-token-count", v);
+    }
 
-        // ── Step 2: run execution-phase stages (worker select → dispatch) ────
-        let select_result = {
-            let _guard = runtime.selection_guard();
-            pipeline.execute_worker_selection(&mut ctx).await
-        };
-        if select_result.is_err() {
-            // Worker selection found no available worker — restore accumulated
-            // partial-rollout state and re-enqueue for the next tick.
+    // ── Step 2: run decision, fenced commit, and backend dispatch ────────
+    let Some(decision_permit) = runtime.try_acquire_decision() else {
+        ctx.state.partial_rollout_state = Some(partial_state);
+        runtime
+            .push_entries(vec![RoutingQueueEntry {
+                ctx,
+                pipeline,
+                completion,
+                routing_meta,
+            }])
+            .await;
+        return;
+    };
+    let decision_epoch = decision_permit.epoch();
+    let select_result = pipeline.execute_worker_selection(&mut ctx).await;
+    drop(decision_permit);
+    if select_result.is_err() {
+        ctx.state.partial_rollout_state = Some(partial_state);
+        runtime
+            .push_entries(vec![RoutingQueueEntry {
+                ctx,
+                pipeline,
+                completion,
+                routing_meta,
+            }])
+            .await;
+        return;
+    }
+
+    let Some(handoff_permit) = runtime.try_acquire_dispatch_handoff(decision_epoch) else {
+        ctx.state.workers = None;
+        ctx.state.partial_rollout_state = Some(partial_state);
+        runtime
+            .push_entries(vec![RoutingQueueEntry {
+                ctx,
+                pipeline,
+                completion,
+                routing_meta,
+            }])
+            .await;
+        return;
+    };
+    if let Err(response) = pipeline.commit_worker_selection(&mut ctx).await {
+        drop(handoff_permit);
+        send_http_completion(completion, response);
+        runtime.cleanup_tracking(request_id, prompt_id);
+        return;
+    }
+    if let Err(response) = pipeline.execute_post_selection_execution(&mut ctx).await {
+        drop(handoff_permit);
+        send_http_completion(completion, response);
+        runtime.cleanup_tracking(request_id, prompt_id);
+        return;
+    }
+    drop(handoff_permit);
+
+    // ── Step 3: extract the raw gRPC stream ──────────────────────────────
+    let stream = match ctx.state.response.execution_result.take() {
+        Some(ExecutionResult::Single { stream }) => stream,
+        Some(ExecutionResult::Dual { decode, .. }) => *decode,
+        other => {
+            // Non-generate result (embedding, etc.) — put it back and run
+            // post-execution stages normally (no loopback needed).
+            ctx.state.response.execution_result = other;
+            let response = match pipeline.execute_remaining_stages(&mut ctx).await {
+                Ok(Some(r)) => r,
+                Ok(None) => extract_final_response(&mut ctx),
+                Err(r) => r,
+            };
+            send_http_completion(completion, response);
+            runtime.cleanup_tracking(request_id, prompt_id);
+            return;
+        }
+    };
+
+    // ── Step 4: drain the stream, collecting tokens and finish_reason ────
+    let mut stream = stream;
+    let drained = match drain_stream_for_partial_rollout(&mut stream).await {
+        Ok(d) => d,
+        Err(msg) => {
+            let response = router_error::internal_error("stream_drain_failed", msg.as_str());
+            send_http_completion(completion, response);
+            runtime.cleanup_tracking(request_id, prompt_id);
+            return;
+        }
+    };
+
+    // ── Step 5: branch on finish_reason ─────────────────────────────────
+    match drained.finish_reason.as_str() {
+        "stop" | "length" => {
+            // ── ROLLOUT_COMPLETED ────────────────────────────────────────
+            if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
+                let response =
+                    router_error::internal_error(re_err.error_code(), re_err.to_string().as_str());
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+                return;
+            }
+
+            // Emit completion metrics.
+            histogram!("smg_partial_rollout_loopback_count")
+                .record(partial_state.iteration_count as f64);
+            let accumulated_tokens = partial_state.token_ids.len();
+            histogram!("smg_partial_rollout_accumulated_tokens").record(accumulated_tokens as f64);
+            counter!("smg_partial_rollout_completed_total").increment(1);
+
+            // Override the output_ids in the final complete frame with the
+            // full accumulated token sequence from all loopback iterations.
+            //
+            // Multi-iteration *or* RE opt-in: rewrite `output_logprobs`
+            // and `routed_experts` together so the frame is internally
+            // consistent.
+            let mut complete = drained.complete;
+            let merged_token_ids = std::mem::take(&mut partial_state.token_ids);
+            let needs_full_rewrite =
+                partial_state.iteration_count > 1 || partial_state.routed_experts.is_some();
+            if needs_full_rewrite {
+                let merged_re = partial_state
+                    .routed_experts
+                    .take()
+                    .map(|acc| acc.into_proto());
+                if let Err(re_err) = complete.set_partial_rollout_outputs(
+                    merged_token_ids,
+                    partial_state.logprobs.take(),
+                    merged_re,
+                    partial_state.prompt_len,
+                    partial_state.first_iter_prompt_start,
+                ) {
+                    let response = router_error::internal_error(
+                        re_err.error_code(),
+                        re_err.to_string().as_str(),
+                    );
+                    send_http_completion(completion, response);
+                    runtime.cleanup_tracking(request_id, prompt_id);
+                    return;
+                }
+            } else {
+                complete.set_output_ids(merged_token_ids);
+            }
+
+            // Place the assembled complete frame back for PostExecution stages.
+            ctx.state.response.execution_result = Some(ExecutionResult::Complete(complete));
+
+            let response = match pipeline.execute_remaining_stages(&mut ctx).await {
+                Ok(Some(r)) => r,
+                Ok(None) => extract_final_response(&mut ctx),
+                Err(r) => r,
+            };
+            send_http_completion(completion, response);
+            runtime.cleanup_tracking(request_id, prompt_id);
+        }
+        "abort" => {
+            // ── ROLLOUT_INTERRUPTED — loopback to newly-synced instance ──
+            if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
+                let response =
+                    router_error::internal_error(re_err.error_code(), re_err.to_string().as_str());
+                send_http_completion(completion, response);
+                runtime.cleanup_tracking(request_id, prompt_id);
+                return;
+            }
+            counter!("smg_partial_rollout_abort_total").increment(1);
+
+            // Determine the instance that was just used so we can pin the
+            // loopback request to the same worker (which now has the fresh
+            // weights after the sync that triggered the abort).
+            let worker = match ctx.state.workers.as_ref() {
+                Some(WorkerSelection::Single { worker }) => worker.clone(),
+                Some(WorkerSelection::Dual { decode, .. }) => decode.clone(),
+                None => {
+                    let response =
+                        router_error::internal_error("loopback_no_instance", "no worker selected");
+                    send_http_completion(completion, response);
+                    runtime.cleanup_tracking(request_id, prompt_id);
+                    return;
+                }
+            };
+            let (base_id, dp_rank) = runtime.instance_id_for_worker(&worker);
+
+            // Reset ctx for the next iteration (clears workers, clients,
+            // proto_request, dispatch, load_guards, and execution_result).
+            reset_ctx_for_loopback(&mut ctx);
+
+            // Inject the loopback `routed_experts_prompt_start` override
+            // so the next iteration's vLLM `SamplingParams` only captures
+            // RE for token positions not already covered by prior
+            // iterations' segments.
+            let prompt_start_next = partial_state.first_iter_prompt_start
+                + partial_state
+                    .routed_experts
+                    .as_ref()
+                    .map(|acc| acc.num_tokens() as u32)
+                    .unwrap_or(0);
+            ctx.state
+                .partial_rollout_overrides
+                .routed_experts_prompt_start = Some(prompt_start_next);
+
+            // Inject loopback routing headers so that on the next iteration
+            // `parse_routing_request_meta_from_context` picks up the hint.
+            let headers = ctx.input.headers.get_or_insert_with(Default::default);
+            if let Ok(v) = HeaderValue::from_str(&base_id) {
+                headers.insert("x-base-worker-id", v);
+            }
+            if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
+                headers.insert("x-target-dp-rank", v);
+            }
+
+            counter!("smg_partial_rollout_abort_reenqueue_total").increment(1);
             ctx.state.partial_rollout_state = Some(partial_state);
             runtime
                 .push_entries(vec![RoutingQueueEntry {
@@ -739,185 +1052,16 @@ async fn dispatch_entry_with_partial_rollout(
                     routing_meta,
                 }])
                 .await;
-            return;
         }
-
-        if let Err(response) = pipeline.execute_post_selection_execution(&mut ctx).await {
+        other => {
+            error!(
+                finish_reason = other,
+                request_id = ?request_id,
+                "unexpected finish_reason in partial rollout; terminating"
+            );
+            let response = router_error::internal_error("unexpected_finish_reason", other);
             send_http_completion(completion, response);
             runtime.cleanup_tracking(request_id, prompt_id);
-            return;
-        }
-
-        // ── Step 3: extract the raw gRPC stream ──────────────────────────────
-        let stream = match ctx.state.response.execution_result.take() {
-            Some(ExecutionResult::Single { stream }) => stream,
-            Some(ExecutionResult::Dual { decode, .. }) => *decode,
-            other => {
-                // Non-generate result (embedding, etc.) — put it back and run
-                // post-execution stages normally (no loopback needed).
-                ctx.state.response.execution_result = other;
-                let response = match pipeline.execute_remaining_stages(&mut ctx).await {
-                    Ok(Some(r)) => r,
-                    Ok(None) => extract_final_response(&mut ctx),
-                    Err(r) => r,
-                };
-                send_http_completion(completion, response);
-                runtime.cleanup_tracking(request_id, prompt_id);
-                return;
-            }
-        };
-
-        // ── Step 4: drain the stream, collecting tokens and finish_reason ────
-        let mut stream = stream;
-        let drained = match drain_stream_for_partial_rollout(&mut stream).await {
-            Ok(d) => d,
-            Err(msg) => {
-                let response = router_error::internal_error("stream_drain_failed", msg.as_str());
-                send_http_completion(completion, response);
-                runtime.cleanup_tracking(request_id, prompt_id);
-                return;
-            }
-        };
-
-        // ── Step 5: branch on finish_reason ─────────────────────────────────
-        match drained.finish_reason.as_str() {
-            "stop" | "length" => {
-                // ── ROLLOUT_COMPLETED ────────────────────────────────────────
-                if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
-                    let response = router_error::internal_error(
-                        re_err.error_code(),
-                        re_err.to_string().as_str(),
-                    );
-                    send_http_completion(completion, response);
-                    runtime.cleanup_tracking(request_id, prompt_id);
-                    return;
-                }
-
-                // Emit completion metrics.
-                histogram!("smg_partial_rollout_loopback_count")
-                    .record(partial_state.iteration_count as f64);
-                let accumulated_tokens = partial_state.token_ids.len();
-                histogram!("smg_partial_rollout_accumulated_tokens")
-                    .record(accumulated_tokens as f64);
-                counter!("smg_partial_rollout_completed_total").increment(1);
-
-                // Override the output_ids in the final complete frame with the
-                // full accumulated token sequence from all loopback iterations.
-                //
-                // Multi-iteration *or* RE opt-in: rewrite `output_logprobs`
-                // and `routed_experts` together so the frame is internally
-                // consistent.
-                let mut complete = drained.complete;
-                let merged_token_ids = std::mem::take(&mut partial_state.token_ids);
-                let needs_full_rewrite =
-                    partial_state.iteration_count > 1 || partial_state.routed_experts.is_some();
-                if needs_full_rewrite {
-                    let merged_re = partial_state
-                        .routed_experts
-                        .take()
-                        .map(|acc| acc.into_proto());
-                    if let Err(re_err) = complete.set_partial_rollout_outputs(
-                        merged_token_ids,
-                        partial_state.logprobs.take(),
-                        merged_re,
-                        partial_state.prompt_len,
-                        partial_state.first_iter_prompt_start,
-                    ) {
-                        let response = router_error::internal_error(
-                            re_err.error_code(),
-                            re_err.to_string().as_str(),
-                        );
-                        send_http_completion(completion, response);
-                        runtime.cleanup_tracking(request_id, prompt_id);
-                        return;
-                    }
-                } else {
-                    complete.set_output_ids(merged_token_ids);
-                }
-
-                // Place the assembled complete frame back for PostExecution stages.
-                ctx.state.response.execution_result = Some(ExecutionResult::Complete(complete));
-
-                let response = match pipeline.execute_remaining_stages(&mut ctx).await {
-                    Ok(Some(r)) => r,
-                    Ok(None) => extract_final_response(&mut ctx),
-                    Err(r) => r,
-                };
-                send_http_completion(completion, response);
-                runtime.cleanup_tracking(request_id, prompt_id);
-                return;
-            }
-            "abort" => {
-                // ── ROLLOUT_INTERRUPTED — loopback to newly-synced instance ──
-                if let Err(re_err) = merge_into_partial_state(&mut partial_state, &drained) {
-                    let response = router_error::internal_error(
-                        re_err.error_code(),
-                        re_err.to_string().as_str(),
-                    );
-                    send_http_completion(completion, response);
-                    runtime.cleanup_tracking(request_id, prompt_id);
-                    return;
-                }
-                counter!("smg_partial_rollout_abort_total").increment(1);
-
-                // Determine the instance that was just used so we can pin the
-                // loopback request to the same worker (which now has the fresh
-                // weights after the sync that triggered the abort).
-                let worker = match ctx.state.workers.as_ref() {
-                    Some(WorkerSelection::Single { worker }) => worker.clone(),
-                    Some(WorkerSelection::Dual { decode, .. }) => decode.clone(),
-                    None => {
-                        let response = router_error::internal_error(
-                            "loopback_no_instance",
-                            "no worker selected",
-                        );
-                        send_http_completion(completion, response);
-                        runtime.cleanup_tracking(request_id, prompt_id);
-                        return;
-                    }
-                };
-                let (base_id, dp_rank) = runtime.instance_id_for_worker(&worker);
-
-                // Reset ctx for the next iteration (clears workers, clients,
-                // proto_request, dispatch, load_guards, and execution_result).
-                reset_ctx_for_loopback(&mut ctx);
-
-                // Inject the loopback `routed_experts_prompt_start` override
-                // so the next iteration's vLLM `SamplingParams` only captures
-                // RE for token positions not already covered by prior
-                // iterations' segments.
-                let prompt_start_next = partial_state.first_iter_prompt_start
-                    + partial_state
-                        .routed_experts
-                        .as_ref()
-                        .map(|acc| acc.num_tokens() as u32)
-                        .unwrap_or(0);
-                ctx.state.partial_rollout_overrides.routed_experts_prompt_start =
-                    Some(prompt_start_next);
-
-                // Inject loopback routing headers so that on the next iteration
-                // `parse_routing_request_meta_from_context` picks up the hint.
-                let headers = ctx.input.headers.get_or_insert_with(Default::default);
-                if let Ok(v) = HeaderValue::from_str(&base_id) {
-                    headers.insert("x-base-worker-id", v);
-                }
-                if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
-                    headers.insert("x-target-dp-rank", v);
-                }
-
-                // continue loop
-            }
-            other => {
-                error!(
-                    finish_reason = other,
-                    request_id = ?request_id,
-                    "unexpected finish_reason in partial rollout; terminating"
-                );
-                let response = router_error::internal_error("unexpected_finish_reason", other);
-                send_http_completion(completion, response);
-                runtime.cleanup_tracking(request_id, prompt_id);
-                return;
-            }
         }
     }
 }
@@ -936,16 +1080,105 @@ fn drain_receiver(
     entries
 }
 
-pub(crate) struct SelectionGuard {
+pub(crate) struct DecisionPermit {
+    runtime: Arc<RoutingLoopRuntime>,
+    epoch: u64,
+}
+
+impl DecisionPermit {
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+}
+
+impl Drop for DecisionPermit {
+    fn drop(&mut self) {
+        self.runtime.release_decision();
+    }
+}
+
+pub(crate) struct DispatchHandoffPermit {
     runtime: Arc<RoutingLoopRuntime>,
 }
 
-impl Drop for SelectionGuard {
+impl Drop for DispatchHandoffPermit {
     fn drop(&mut self) {
-        self.runtime
-            .running_selections
-            .fetch_sub(1, Ordering::AcqRel);
-        gauge!("smg_routing_loop_running_selections")
-            .set(self.runtime.running_selections.load(Ordering::Acquire) as f64);
+        self.runtime.release_dispatch_handoff();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_runtime() -> Arc<RoutingLoopRuntime> {
+        RoutingLoopRuntime::new(
+            &RoutingLoopConfig::default(),
+            Arc::new(DashMap::new()),
+            Arc::new(WorkerRegistry::new()),
+        )
+        .0
+    }
+
+    #[tokio::test]
+    async fn pause_barrier_waits_for_active_decision() {
+        let runtime = make_runtime();
+        let permit = runtime
+            .try_acquire_decision()
+            .expect("decision should be admitted");
+        runtime.pause();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), runtime.wait_for_pause_barrier())
+                .await
+                .is_err()
+        );
+
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_pause_barrier())
+            .await
+            .expect("pause barrier should complete after decision exits");
+    }
+
+    #[tokio::test]
+    async fn pause_barrier_waits_for_active_dispatch_handoff() {
+        let runtime = make_runtime();
+        let decision = runtime
+            .try_acquire_decision()
+            .expect("decision should be admitted");
+        let epoch = decision.epoch();
+        drop(decision);
+        let handoff = runtime
+            .try_acquire_dispatch_handoff(epoch)
+            .expect("handoff should be admitted");
+        runtime.pause();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), runtime.wait_for_pause_barrier())
+                .await
+                .is_err()
+        );
+
+        drop(handoff);
+        tokio::time::timeout(Duration::from_secs(1), runtime.wait_for_pause_barrier())
+            .await
+            .expect("pause barrier should complete after handoff exits");
+    }
+
+    #[test]
+    fn pause_invalidates_old_decision_before_handoff() {
+        let runtime = make_runtime();
+        let permit = runtime
+            .try_acquire_decision()
+            .expect("decision should be admitted");
+        let epoch = permit.epoch();
+        drop(permit);
+
+        runtime.pause();
+        assert!(runtime.try_acquire_dispatch_handoff(epoch).is_none());
+        assert!(runtime.try_acquire_decision().is_none());
+
+        runtime.resume();
+        assert!(runtime.try_acquire_decision().is_some());
     }
 }

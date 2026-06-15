@@ -141,14 +141,9 @@ impl RequestPipeline {
 
     /// Run the worker-selection stage(s) only.
     ///
-    /// This is the precise drain barrier the routing loop uses for
-    /// `pause?wait=true`: by tracking entry/exit of this method via
-    /// `RoutingLoopRuntime::selection_guard`, the gateway can wait for all
-    /// in-flight worker selections (including the PSRL post-select
-    /// `reserve_rollout_instance_requests` call) to complete before the
-    /// coordinator pushes a new `version_after_sync` and issues the SYNC
-    /// command — eliminating the TOCTOU window where in-flight requests
-    /// would otherwise reserve with the pre-sync model version.
+    /// Routing-loop callers run this under a decision permit. External
+    /// selection side effects are deferred to [`Self::commit_worker_selection`]
+    /// after the decision epoch has passed the pause fence.
     pub(crate) async fn execute_worker_selection(
         &self,
         ctx: &mut RequestContext,
@@ -182,6 +177,21 @@ impl RequestPipeline {
                     return Err(response);
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Commit side effects associated with the selected worker.
+    pub(crate) async fn commit_worker_selection(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<(), Response> {
+        for stage in self
+            .stages
+            .iter()
+            .filter(|stage| stage.phase() == StagePhase::WorkerSelection)
+        {
+            stage.commit(ctx).await?;
         }
         Ok(())
     }

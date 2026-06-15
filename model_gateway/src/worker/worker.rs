@@ -246,6 +246,11 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         false
     }
 
+    /// Whether runtime weight-version updates are supported.
+    fn supports_dyn_weight_version_update(&self) -> bool {
+        false
+    }
+
     /// Check if this worker is administratively paused from new routing decisions.
     fn is_paused(&self) -> bool {
         false
@@ -973,6 +978,10 @@ impl Worker for BasicWorker {
 
     fn update_dyn_weight_version(&self, weight_version: u64) -> bool {
         self.runtime.load().set_dyn_weight_version(weight_version);
+        true
+    }
+
+    fn supports_dyn_weight_version_update(&self) -> bool {
         true
     }
 

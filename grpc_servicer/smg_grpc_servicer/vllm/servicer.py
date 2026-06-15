@@ -41,7 +41,7 @@ from vllm.multimodal.inputs import (
     MultiModalKwargsItems,
     PlaceholderRange,
 )
-from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.outputs import STREAM_FINISHED, CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
@@ -117,6 +117,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             preemption_queue if preemption_queue is not None else asyncio.Queue()
         )
         self.kv_cache_manager = kv_cache_manager
+        self.generate_admission_open = True
+        self.active_generate_admissions = 0
+        self.generate_admissions_drained = asyncio.Event()
+        self.generate_admissions_drained.set()
 
         # Parse the native vLLM KV-event publisher config so SubscribeKvEvents
         # can bridge the local ZMQ stream to gRPC (event-driven cache-aware
@@ -137,6 +141,39 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # Monotonic event-id counter for converted KvCacheEvents.
         self.kv_event_id_counter = 0
         logger.info("VllmEngineServicer initialized")
+
+    async def close_generate_admission(self) -> None:
+        """Reject new Generate calls and wait for admitted calls to register."""
+        self.generate_admission_open = False
+        await self.generate_admissions_drained.wait()
+
+    async def open_generate_admission(self) -> None:
+        self.generate_admission_open = True
+
+    def begin_generate_admission(self) -> bool:
+        if not self.generate_admission_open:
+            return False
+        self.active_generate_admissions += 1
+        self.generate_admissions_drained.clear()
+        return True
+
+    def finish_generate_admission(self) -> None:
+        self.active_generate_admissions -= 1
+        if self.active_generate_admissions == 0:
+            self.generate_admissions_drained.set()
+
+    @staticmethod
+    def abort_response() -> vllm_engine_pb2.GenerateResponse:
+        return vllm_engine_pb2.GenerateResponse(
+            complete=vllm_engine_pb2.GenerateComplete(
+                output_ids=[],
+                finish_reason="abort",
+                prompt_tokens=0,
+                completion_tokens=0,
+                cached_tokens=0,
+                index=0,
+            )
+        )
 
     async def Generate(
         self,
@@ -169,6 +206,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             has_preprocessed_mm,
         )
 
+        admitted = self.begin_generate_admission()
+        if not admitted:
+            yield self.abort_response()
+            return
+
+        output_collector = None
+        registration_pending = True
         try:
             arrival_time = time.time()
 
@@ -203,12 +247,29 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
-            async for output in self.engine.generate(
-                prompt=prompt,
-                sampling_params=sampling_params,
+            output_collector = await self.engine.add_request(
                 request_id=request_id,
+                prompt=prompt,
+                params=sampling_params,
                 tokenization_kwargs=tokenization_kwargs,
-            ):
+            )
+            registration_pending = False
+            self.finish_generate_admission()
+
+            # Send gRPC response headers immediately so the tonic client's
+            # `client.generate().await` resolves without waiting for the first
+            # output token.  This is critical for the SMG pause barrier: the
+            # dispatch handoff permit is held until `generate().await` returns,
+            # and without this call the permit would be blocked until the vLLM
+            # scheduler produces the first token.
+            await context.send_initial_metadata(())
+
+            finished = False
+            while not finished:
+                output = output_collector.get_nowait() or await output_collector.get()
+                if output is STREAM_FINISHED:
+                    break
+                finished = output.finished
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -244,12 +305,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             num_prompt_logprobs=num_prompt_logprobs,
                         )
 
+        except (asyncio.CancelledError, GeneratorExit):
+            if output_collector is not None:
+                await self.engine.abort(output_collector.request_id, internal=True)
+            raise
         except ValueError as e:
             # Invalid request error (equiv to 400).
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.exception("Error in Generate for request %s", request_id)
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        finally:
+            if registration_pending:
+                self.finish_generate_admission()
+            if output_collector is not None:
+                output_collector.close()
 
     async def Embed(
         self,

@@ -144,6 +144,34 @@ impl PipelineStage for WorkerSelectionStage {
         Ok(None)
     }
 
+    async fn commit(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+        let WorkerSelectionMode::Regular { strategy } = &self.inner else {
+            return Ok(());
+        };
+        let Some(WorkerSelection::Single { worker }) = ctx.state.workers.as_ref() else {
+            return Err(error::internal_error(
+                "worker_selection_not_completed",
+                "Worker selection must complete before commit",
+            ));
+        };
+        let tokens = ctx
+            .state
+            .preparation
+            .as_ref()
+            .or(ctx.state.preparation_snapshot.as_ref())
+            .map(|preparation| preparation.token_ids())
+            .filter(|ids| !ids.is_empty());
+        let routing_meta = parse_routing_request_meta_from_context(ctx);
+        strategy
+            .commit_single_worker(
+                ctx.input.model_id.as_str(),
+                tokens,
+                routing_meta.as_ref(),
+                worker,
+            )
+            .await
+    }
+
     fn name(&self) -> &'static str {
         "WorkerSelection"
     }

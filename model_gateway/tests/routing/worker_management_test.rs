@@ -428,7 +428,17 @@ mod worker_management_tests {
             .app_context
             .worker_registry
             .reserve_id_for_url("http://worker-weight-version-dp:8080");
-        let dp_worker: Arc<dyn Worker> = Arc::new(
+        let dp_worker_0: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker-weight-version-dp:8080")
+                .dp_config(0, 2)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let dp_worker_1: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://worker-weight-version-dp:8080")
                 .dp_config(1, 2)
                 .worker_type(WorkerType::Regular)
@@ -438,21 +448,75 @@ mod worker_management_tests {
                 })
                 .build(),
         );
+        ctx.app_context
+            .worker_registry
+            .register(dp_worker_0.clone())
+            .unwrap();
         let dp_worker_id = ctx
             .app_context
             .worker_registry
-            .register(dp_worker.clone())
+            .register(dp_worker_1.clone())
             .unwrap();
 
         let body = post_worker_weight_version(
             app,
-            weight_version_update_payload(base_id.as_str(), Some(1), 7),
+            json!([
+                {"worker_id": base_id.as_str(), "dp_rank": 0, "weight_version": 7},
+                {"worker_id": base_id.as_str(), "dp_rank": 1, "weight_version": 7}
+            ]),
         )
         .await;
 
-        assert_eq!(body["updated"], 1);
-        assert_eq!(body["results"][0]["worker_id"], dp_worker_id.as_str());
-        assert_eq!(dp_worker.dyn_weight_version(), 7);
+        assert_eq!(body["updated"], 2);
+        assert!(body["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["worker_id"] == dp_worker_id.as_str()));
+        assert_eq!(dp_worker_0.dyn_weight_version(), 7);
+        assert_eq!(dp_worker_1.dyn_weight_version(), 7);
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_update_worker_weight_version_rejects_partial_replica_update() {
+        let config = TestRouterConfig::round_robin(3918);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        let app = ctx.create_app();
+        let base_url = "http://worker-weight-version-partial:8080";
+        let base_id = ctx.app_context.worker_registry.reserve_id_for_url(base_url);
+
+        let mut workers = Vec::new();
+        for rank in 0..2 {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(base_url)
+                    .dp_config(rank, 2)
+                    .worker_type(WorkerType::Regular)
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            );
+            ctx.app_context
+                .worker_registry
+                .register(worker.clone())
+                .unwrap();
+            workers.push(worker);
+        }
+
+        let body = post_worker_weight_version(
+            app,
+            weight_version_update_payload(base_id.as_str(), Some(0), 9),
+        )
+        .await;
+
+        assert_eq!(body["updated"], 0);
+        assert_eq!(body["rejected"], 1);
+        assert!(workers
+            .iter()
+            .all(|worker| worker.dyn_weight_version() == 0));
 
         ctx.shutdown().await;
     }
