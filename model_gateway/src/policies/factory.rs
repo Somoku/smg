@@ -39,6 +39,7 @@ impl PolicyFactory {
                     block_size: *block_size,
                     gpu_overlap_weight: *gpu_overlap_weight,
                     lmcache_overlap_weight: *lmcache_overlap_weight,
+                    ..Default::default()
                 };
                 Ok(Arc::new(CacheAwarePolicy::with_config(config)))
             }
@@ -61,6 +62,7 @@ impl PolicyFactory {
                     block_size: *block_size,
                     gpu_overlap_weight: *gpu_overlap_weight,
                     lmcache_overlap_weight: *lmcache_overlap_weight,
+                    ..Default::default()
                 };
                 Ok(Arc::new(CacheAwareV1Policy::with_config(config)))
             }

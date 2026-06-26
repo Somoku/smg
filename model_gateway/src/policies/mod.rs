@@ -141,6 +141,14 @@ pub struct CacheAwareConfig {
     /// A hit still requires loading the prefix back onto the GPU, so it scores
     /// below a GPU hit. Set 0.0 to ignore the off-GPU tier. Default: 0.5.
     pub lmcache_overlap_weight: f64,
+    /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
+    /// the pool is treated as imbalanced and cache affinity is abandoned for
+    /// shortest-queue. `>= 1.0` disables it (default).
+    pub balance_token_usage_threshold: f32,
+    /// Backend KV-cache utilization ceiling (0.0–1.0): when the hottest engine
+    /// exceeds it the pool is treated as imbalanced regardless of spread.
+    /// `>= 1.0` disables it (default).
+    pub overload_token_usage_threshold: f32,
 }
 
 impl Default for CacheAwareConfig {
@@ -154,6 +162,8 @@ impl Default for CacheAwareConfig {
             block_size: 16,
             gpu_overlap_weight: 1.0,
             lmcache_overlap_weight: 0.5,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         }
     }
 }
