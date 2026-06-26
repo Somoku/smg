@@ -1823,7 +1823,7 @@ mod tests {
             indexer.set_block_size(Tier::GPU, first.len());
         }
         let pi = indexer.tier(Tier::GPU);
-        let worker_id = pi.intern_worker(worker_url);
+        let worker_id = pi.intern_worker(worker_url).unwrap();
         let mut wb = WorkerBlockMap::default();
         let blocks: Vec<StoredBlock> = token_chunks
             .iter()
@@ -1937,8 +1937,8 @@ mod tests {
         let indexer = Arc::new(TieredIndexer::new(4));
         indexer.set_block_size(Tier::GPU, 4);
         let pi = indexer.tier(Tier::GPU);
-        let w1_id = pi.intern_worker("http://w1:8000");
-        let w2_id = pi.intern_worker("http://w2:8000");
+        let w1_id = pi.intern_worker("http://w1:8000").unwrap();
+        let w2_id = pi.intern_worker("http://w2:8000").unwrap();
         let mut wb1 = WorkerBlockMap::default();
         let mut wb2 = WorkerBlockMap::default();
         let blocks = vec![StoredBlock {
@@ -1979,8 +1979,8 @@ mod tests {
         let indexer = Arc::new(TieredIndexer::new(4));
         indexer.set_block_size(Tier::GPU, 4);
         let pi = indexer.tier(Tier::GPU);
-        let w1_id = pi.intern_worker("http://w1:8000");
-        let w2_id = pi.intern_worker("http://w2:8000");
+        let w1_id = pi.intern_worker("http://w1:8000").unwrap();
+        let w2_id = pi.intern_worker("http://w2:8000").unwrap();
         let mut wb1 = WorkerBlockMap::default();
         let mut wb2 = WorkerBlockMap::default();
 
@@ -2048,8 +2048,8 @@ mod tests {
         let indexer = Arc::new(TieredIndexer::new(4));
         indexer.set_block_size(Tier::GPU, 4);
         let pi = indexer.tier(Tier::GPU);
-        let w1_id = pi.intern_worker("http://w1:8000");
-        let w2_id = pi.intern_worker("http://w2:8000");
+        let w1_id = pi.intern_worker("http://w1:8000").unwrap();
+        let w2_id = pi.intern_worker("http://w2:8000").unwrap();
         let mut wb1 = WorkerBlockMap::default();
         let mut wb2 = WorkerBlockMap::default();
 
@@ -2294,7 +2294,7 @@ mod tests {
         // Store blocks using block_size=8 (tokens chunked in groups of 8)
         let indexer = Arc::new(TieredIndexer::new(4));
         let pi = indexer.tier(Tier::GPU);
-        let w1_id = pi.intern_worker("http://w1:8000");
+        let w1_id = pi.intern_worker("http://w1:8000").unwrap();
         let mut wb = WorkerBlockMap::default();
         let block = vec![StoredBlock {
             seq_hash: SequenceHash(1),

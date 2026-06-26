@@ -622,7 +622,11 @@ struct WorkerTierState {
 impl WorkerTierState {
     fn new(indexer: &TieredIndexer, worker_url: &str) -> Self {
         Self {
-            worker_ids: Tier::ALL.map(|tier| indexer.intern_worker(tier, worker_url)),
+            worker_ids: Tier::ALL.map(|tier| {
+                indexer
+                    .intern_worker(tier, worker_url)
+                    .expect("worker id space exhausted")
+            }),
             blocks: std::array::from_fn(|_| WorkerBlockMap::default()),
         }
     }

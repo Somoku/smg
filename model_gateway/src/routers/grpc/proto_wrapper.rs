@@ -1,7 +1,8 @@
-//! Protocol buffer type wrappers for SGLang, vLLM, and TensorRT-LLM backends
+//! Protocol buffer type wrappers for the supported gRPC backends.
 //!
-//! This module provides unified enums that wrap proto types from SGLang, vLLM, and TensorRT-LLM,
-//! allowing the router to work with any backend transparently.
+//! This module provides unified enums that wrap proto types from each
+//! supported backend, allowing the router to work with any backend
+//! transparently.
 
 use std::collections::HashMap;
 
@@ -11,6 +12,10 @@ use smg_grpc_client::{
     mlx_proto::{self as mlx},
     sglang_proto::{self as sglang, generate_complete::MatchedStop as SglangMatchedStop},
     sglang_scheduler::AbortOnDropStream as SglangStream,
+    tokenspeed_proto::{
+        self as tokenspeed, generate_complete::MatchedStop as TokenSpeedMatchedStop,
+    },
+    tokenspeed_scheduler::AbortOnDropStream as TokenSpeedStream,
     trtllm_proto::{self as trtllm, generate_complete::MatchedStop as TrtllmMatchedStop},
     trtllm_service::AbortOnDropStream as TrtllmStream,
     vllm_engine::AbortOnDropStream as VllmStream,
@@ -24,14 +29,16 @@ use smg_grpc_client::{
 /// Backend-specific multimodal data produced by the assembly stage.
 ///
 /// Each variant carries only the fields its backend needs:
-/// - SGLang: pixel_values + model_specific_tensors + patch-only placeholders
-/// - vLLM: pixel_values + model_specific_tensors + structural placeholders + hashes + field keys
+/// - SGLang: preprocessed vision tensor + model-specific tensors + patch-only placeholders
+/// - vLLM: preprocessed vision tensor + model-specific tensors + structural placeholders + hashes + field keys
 /// - TRT-LLM: raw image bytes only (preprocessing handled server-side)
+/// - TokenSpeed: encoder_input + model_specific_tensors + patch-only placeholders
 #[derive(Debug)]
 pub enum MultimodalData {
     Sglang(SglangMultimodalData),
     Vllm(VllmMultimodalData),
     Trtllm(TrtllmMultimodalData),
+    TokenSpeed(TokenSpeedMultimodalData),
 }
 
 /// SGLang multimodal data: preprocessed tensors with patch-only placeholders.
@@ -66,6 +73,31 @@ pub struct VllmMultimodalData {
 #[derive(Debug)]
 pub struct TrtllmMultimodalData {
     pub image_data: Vec<Vec<u8>>,
+}
+
+/// TokenSpeed multimodal data: preprocessed tensors with patch-only placeholders.
+#[derive(Debug)]
+pub struct TokenSpeedMultimodalData {
+    pub items: Vec<TokenSpeedMultimodalItem>,
+}
+
+#[derive(Debug)]
+pub struct TokenSpeedMultimodalItem {
+    pub modality: TokenSpeedModality,
+    pub encoder_input: Vec<u8>,
+    pub encoder_input_shape: Vec<u32>,
+    pub encoder_input_dtype: String,
+    pub model_specific_tensors: HashMap<String, TensorBytes>,
+    pub placeholder_token_id: Option<u32>,
+    pub mm_placeholders: Vec<(u32, u32)>,
+    pub content_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenSpeedModality {
+    Image,
+    Audio,
+    Video,
 }
 
 /// Raw tensor bytes with shape and dtype metadata.
@@ -167,6 +199,60 @@ impl TrtllmMultimodalData {
         trtllm::MultimodalInput {
             image_data: self.image_data,
         }
+    }
+}
+
+impl TokenSpeedMultimodalData {
+    /// Convert to TokenSpeed proto MultimodalInputs.
+    pub fn into_proto(self) -> tokenspeed::MultimodalInputs {
+        let items = self
+            .items
+            .into_iter()
+            .map(TokenSpeedMultimodalItem::into_proto)
+            .collect();
+        tokenspeed::MultimodalInputs { items }
+    }
+}
+
+impl TokenSpeedMultimodalItem {
+    fn into_proto(self) -> tokenspeed::MultimodalItem {
+        let placeholders = self
+            .mm_placeholders
+            .into_iter()
+            .map(|(offset, length)| tokenspeed::PlaceholderRange { offset, length })
+            .collect::<Vec<_>>();
+
+        let model_specific_tensors = self
+            .model_specific_tensors
+            .into_iter()
+            .map(|(k, v)| (k, tensor_bytes_to_tokenspeed(v)))
+            .collect::<HashMap<_, _>>();
+
+        tokenspeed::MultimodalItem {
+            modality: match self.modality {
+                TokenSpeedModality::Image => tokenspeed::Modality::Image as i32,
+                TokenSpeedModality::Audio => tokenspeed::Modality::Audio as i32,
+                TokenSpeedModality::Video => tokenspeed::Modality::Video as i32,
+            },
+            content_hash: self.content_hash,
+            encoder_input: Some(tensor_bytes_to_tokenspeed(TensorBytes {
+                data: self.encoder_input,
+                shape: self.encoder_input_shape,
+                dtype: self.encoder_input_dtype,
+            })),
+            model_specific_tensors,
+            placeholders,
+            placeholder_token_id: self.placeholder_token_id,
+        }
+    }
+}
+
+fn tensor_bytes_to_tokenspeed(value: TensorBytes) -> tokenspeed::TensorData {
+    let data = value.data;
+    tokenspeed::TensorData {
+        shape: value.shape,
+        dtype: value.dtype,
+        payload: Some(tokenspeed::tensor_data::Payload::Inline(data)),
     }
 }
 
@@ -481,6 +567,7 @@ pub enum ProtoGenerateRequest {
     Vllm(Box<vllm::GenerateRequest>),
     Trtllm(Box<trtllm::GenerateRequest>),
     Mlx(Box<mlx::GenerateRequest>),
+    TokenSpeed(Box<tokenspeed::GenerateRequest>),
 }
 
 impl ProtoGenerateRequest {
@@ -556,6 +643,30 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Get TokenSpeed variant (panics if not TokenSpeed)
+    #[expect(
+        clippy::panic,
+        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
+    )]
+    pub fn as_tokenspeed(&self) -> &tokenspeed::GenerateRequest {
+        match self {
+            Self::TokenSpeed(req) => req,
+            _ => panic!("Expected TokenSpeed GenerateRequest"),
+        }
+    }
+
+    /// Get mutable TokenSpeed variant (panics if not TokenSpeed)
+    #[expect(
+        clippy::panic,
+        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
+    )]
+    pub fn as_tokenspeed_mut(&mut self) -> &mut tokenspeed::GenerateRequest {
+        match self {
+            Self::TokenSpeed(req) => req,
+            _ => panic!("Expected TokenSpeed GenerateRequest"),
+        }
+    }
+
     /// Check if this is SGLang
     pub fn is_sglang(&self) -> bool {
         matches!(self, Self::Sglang(_))
@@ -571,23 +682,31 @@ impl ProtoGenerateRequest {
         matches!(self, Self::Trtllm(_))
     }
 
-    /// Set max_tokens for prefill-only execution (vLLM PD mode).
-    /// The prefill request uses max_tokens=1 to trigger KV cache computation
-    /// without generating unnecessary tokens.
-    pub fn set_max_tokens_for_prefill(&mut self, max_tokens: u32) {
+    /// Check if this is TokenSpeed
+    pub fn is_tokenspeed(&self) -> bool {
+        matches!(self, Self::TokenSpeed(_))
+    }
+
+    /// Sanitize sampling params for the prefill-only leg (vLLM PD mode).
+    /// max_tokens=1 computes KV without generating; min_tokens is cleared so the
+    /// engine accepts it; n=1 so the prefill returns a single kv_transfer_params dict.
+    /// Stop criteria are cleared and EOS ignored so the leg always finishes
+    /// length-capped — vLLM < 0.20 returns the NIXL handoff only for that status.
+    pub fn sanitize_sampling_for_prefill(&mut self, max_tokens: u32) {
         match self {
             Self::Vllm(req) => {
-                if let Some(ref mut params) = req.sampling_params {
-                    params.max_tokens = Some(max_tokens);
-                } else {
-                    req.sampling_params = Some(vllm::SamplingParams {
-                        max_tokens: Some(max_tokens),
-                        ..Default::default()
-                    });
-                }
+                let params = req.sampling_params.get_or_insert_with(Default::default);
+                params.max_tokens = Some(max_tokens);
+                params.min_tokens = 0;
+                params.n = 1;
+                params.stop.clear();
+                params.stop_token_ids.clear();
+                params.ignore_eos = true;
             }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {
-                tracing::warn!("set_max_tokens_for_prefill called on non-vLLM request, ignoring");
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                tracing::warn!(
+                    "sanitize_sampling_for_prefill called on non-vLLM request, ignoring"
+                );
             }
         }
     }
@@ -599,6 +718,7 @@ impl ProtoGenerateRequest {
             Self::Sglang(req) => req.stream = stream,
             Self::Trtllm(req) => req.streaming = stream,
             Self::Mlx(req) => req.stream = stream,
+            Self::TokenSpeed(req) => req.stream = stream,
         }
     }
 
@@ -636,7 +756,9 @@ impl ProtoGenerateRequest {
         match self {
             Self::Sglang(req) => req.mm_inputs = None,
             Self::Vllm(req) => req.mm_inputs = None,
-            Self::Trtllm(_) | Self::Mlx(_) => {} // TRT-LLM and MLX protos have no mm_inputs field
+            Self::TokenSpeed(req) => req.mm_inputs = None,
+            // TRT-LLM and MLX protos have no mm_inputs field
+            Self::Trtllm(_) | Self::Mlx(_) => {}
         }
     }
 
@@ -647,6 +769,7 @@ impl ProtoGenerateRequest {
             Self::Vllm(req) => &req.request_id,
             Self::Trtllm(req) => &req.request_id,
             Self::Mlx(req) => &req.request_id,
+            Self::TokenSpeed(req) => &req.request_id,
         }
     }
 
@@ -660,8 +783,41 @@ impl ProtoGenerateRequest {
                     remote_port,
                 });
             }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 tracing::warn!("set_kv_transfer_params called on non-vLLM request, ignoring");
+            }
+        }
+    }
+
+    /// Pin the request to a data-parallel rank (engines without the field ignore it).
+    pub fn set_data_parallel_rank(&mut self, rank: i32) {
+        match self {
+            Self::Vllm(req) => req.data_parallel_rank = Some(rank),
+            Self::Sglang(req) => req.data_parallel_rank = rank,
+            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {}
+        }
+    }
+
+    /// Number of parallel samples requested (vLLM only; 1 when unset).
+    pub fn sampling_n(&self) -> u32 {
+        match self {
+            Self::Vllm(req) => req
+                .sampling_params
+                .as_ref()
+                .map(|p| p.n)
+                .filter(|&n| n > 0)
+                .unwrap_or(1),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => 1,
+        }
+    }
+
+    /// Set opaque connector KV-transfer params as JSON (vLLM only).
+    /// Passed verbatim to the engine (NIXL handoff, etc.).
+    pub fn set_kv_transfer_params_json(&mut self, json: String) {
+        match self {
+            Self::Vllm(req) => req.kv_transfer_params_json = Some(json),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
+                tracing::warn!("set_kv_transfer_params_json called on non-vLLM request, ignoring");
             }
         }
     }
@@ -673,6 +829,7 @@ pub enum ProtoGenerateResponse {
     Vllm(Box<vllm::GenerateResponse>),
     Trtllm(Box<trtllm::GenerateResponse>),
     Mlx(Box<mlx::GenerateResponse>),
+    TokenSpeed(Box<tokenspeed::GenerateResponse>),
 }
 
 impl ProtoGenerateResponse {
@@ -717,6 +874,15 @@ impl ProtoGenerateResponse {
                 }
                 None => ProtoResponseVariant::None,
             },
+            Self::TokenSpeed(resp) => match resp.response {
+                Some(tokenspeed::generate_response::Response::Chunk(chunk)) => {
+                    ProtoResponseVariant::Chunk(ProtoGenerateStreamChunk::TokenSpeed(chunk))
+                }
+                Some(tokenspeed::generate_response::Response::Complete(complete)) => {
+                    ProtoResponseVariant::Complete(ProtoGenerateComplete::TokenSpeed(complete))
+                }
+                None => ProtoResponseVariant::None,
+            },
         }
     }
 }
@@ -735,6 +901,7 @@ pub enum ProtoGenerateStreamChunk {
     Vllm(vllm::GenerateStreamChunk),
     Trtllm(trtllm::GenerateStreamChunk),
     Mlx(mlx::GenerateStreamChunk),
+    TokenSpeed(tokenspeed::GenerateStreamChunk),
 }
 
 impl ProtoGenerateStreamChunk {
@@ -794,6 +961,11 @@ impl ProtoGenerateStreamChunk {
         matches!(self, Self::Mlx(_))
     }
 
+    /// Check if this is TokenSpeed
+    pub fn is_tokenspeed(&self) -> bool {
+        matches!(self, Self::TokenSpeed(_))
+    }
+
     /// Get token IDs from chunk (common field)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -801,6 +973,7 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(c) => &c.token_ids,
             Self::Trtllm(c) => &c.token_ids,
             Self::Mlx(c) => &c.token_ids,
+            Self::TokenSpeed(c) => &c.token_ids,
         }
     }
 
@@ -812,10 +985,11 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(c) => c.index,
             Self::Trtllm(c) => c.sequence_index,
             Self::Mlx(c) => c.index,
+            Self::TokenSpeed(c) => c.index,
         }
     }
 
-    /// Get output logprobs (SGLang, vLLM, TensorRT-LLM, and MLX)
+    /// Get output logprobs.
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -828,6 +1002,10 @@ impl ProtoGenerateStreamChunk {
                 .map(|lp| convert_output_logprobs!(lp)),
             Self::Trtllm(c) => convert_trtllm_output_logprobs(&c.logprobs),
             Self::Mlx(c) => c
+                .output_logprobs
+                .as_ref()
+                .map(|lp| convert_output_logprobs!(lp)),
+            Self::TokenSpeed(c) => c
                 .output_logprobs
                 .as_ref()
                 .map(|lp| convert_output_logprobs!(lp)),
@@ -845,8 +1023,8 @@ impl ProtoGenerateStreamChunk {
                 .input_logprobs
                 .as_ref()
                 .map(|lp| convert_input_logprobs!(lp)),
-            // TRT-LLM and MLX streaming chunks don't have input_logprobs
-            Self::Trtllm(_) | Self::Mlx(_) => None,
+            // TRT-LLM, MLX, and TokenSpeed streaming chunks don't have input_logprobs
+            Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 
@@ -857,6 +1035,7 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(c) => c.prompt_tokens,
             Self::Trtllm(c) => c.prompt_tokens,
             Self::Mlx(c) => c.prompt_tokens,
+            Self::TokenSpeed(c) => c.prompt_tokens,
         }
     }
 
@@ -867,6 +1046,7 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(c) => c.completion_tokens,
             Self::Trtllm(c) => c.completion_tokens,
             Self::Mlx(c) => c.completion_tokens,
+            Self::TokenSpeed(c) => c.completion_tokens,
         }
     }
 
@@ -877,6 +1057,7 @@ impl ProtoGenerateStreamChunk {
             Self::Vllm(c) => c.cached_tokens,
             Self::Trtllm(c) => c.cached_tokens,
             Self::Mlx(c) => c.cached_tokens,
+            Self::TokenSpeed(c) => c.cached_tokens,
         }
     }
 }
@@ -888,6 +1069,7 @@ pub enum ProtoGenerateComplete {
     Vllm(vllm::GenerateComplete),
     Trtllm(trtllm::GenerateComplete),
     Mlx(mlx::GenerateComplete),
+    TokenSpeed(tokenspeed::GenerateComplete),
 }
 
 impl ProtoGenerateComplete {
@@ -959,6 +1141,11 @@ impl ProtoGenerateComplete {
         matches!(self, Self::Mlx(_))
     }
 
+    /// Check if this is TokenSpeed
+    pub fn is_tokenspeed(&self) -> bool {
+        matches!(self, Self::TokenSpeed(_))
+    }
+
     /// Get token IDs from either backend (output_ids in proto)
     pub fn token_ids(&self) -> &[u32] {
         match self {
@@ -966,6 +1153,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => &c.output_ids,
             Self::Trtllm(c) => &c.output_token_ids,
             Self::Mlx(c) => &c.output_ids,
+            Self::TokenSpeed(c) => &c.output_ids,
         }
     }
 
@@ -976,6 +1164,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.prompt_tokens,
             Self::Trtllm(c) => c.prompt_tokens,
             Self::Mlx(c) => c.prompt_tokens,
+            Self::TokenSpeed(c) => c.prompt_tokens,
         }
     }
 
@@ -986,6 +1175,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.completion_tokens,
             Self::Trtllm(c) => c.completion_tokens,
             Self::Mlx(c) => c.completion_tokens,
+            Self::TokenSpeed(c) => c.completion_tokens,
         }
     }
 
@@ -996,6 +1186,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => &c.finish_reason,
             Self::Trtllm(c) => &c.finish_reason,
             Self::Mlx(c) => &c.finish_reason,
+            Self::TokenSpeed(c) => &c.finish_reason,
         }
     }
 
@@ -1007,6 +1198,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.index,
             Self::Trtllm(c) => c.sequence_index,
             Self::Mlx(c) => c.index,
+            Self::TokenSpeed(c) => c.index,
         }
     }
 
@@ -1044,6 +1236,11 @@ impl ProtoGenerateComplete {
             Self::Mlx(c) => c
                 .matched_stop_token_id
                 .map(|id| serde_json::Value::Number(id.into())),
+            Self::TokenSpeed(c) => convert!(
+                &c.matched_stop,
+                TokenSpeedMatchedStop::MatchedTokenId,
+                TokenSpeedMatchedStop::MatchedStopStr
+            ),
         }
     }
 
@@ -1054,6 +1251,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => &c.output_ids,
             Self::Trtllm(c) => &c.output_token_ids,
             Self::Mlx(c) => &c.output_ids,
+            Self::TokenSpeed(c) => &c.output_ids,
         }
     }
 
@@ -1213,6 +1411,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.cached_tokens,
             Self::Trtllm(c) => c.cached_tokens,
             Self::Mlx(c) => c.cached_tokens,
+            Self::TokenSpeed(c) => c.cached_tokens,
         }
     }
 
@@ -1251,12 +1450,12 @@ impl ProtoGenerateComplete {
                     })
                 }
             }
-            // MLX does not have input_logprobs
-            Self::Mlx(_) => None,
+            // MLX and TokenSpeed do not have input_logprobs
+            Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 
-    /// Get output logprobs (SGLang, vLLM, TensorRT-LLM, and MLX)
+    /// Get output logprobs.
     pub fn output_logprobs(&self) -> Option<ProtoOutputLogProbs> {
         match self {
             Self::Sglang(c) => c
@@ -1272,6 +1471,10 @@ impl ProtoGenerateComplete {
                 .output_logprobs
                 .as_ref()
                 .map(|lp| convert_output_logprobs!(lp)),
+            Self::TokenSpeed(c) => c
+                .output_logprobs
+                .as_ref()
+                .map(|lp| convert_output_logprobs!(lp)),
         }
     }
 
@@ -1283,17 +1486,33 @@ impl ProtoGenerateComplete {
                 .kv_transfer_params
                 .as_ref()
                 .map(|params| (params.remote_host.clone(), params.remote_port)),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
+        }
+    }
+
+    /// Get opaque connector KV-transfer params JSON returned by the engine (vLLM only).
+    pub fn kv_transfer_params_json(&self) -> Option<&str> {
+        match self {
+            Self::Vllm(c) => c
+                .kv_transfer_params_json
+                .as_deref()
+                .filter(|s| !s.is_empty()),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 }
 
-/// Unified stream wrapper
+/// Unified stream wrapper.
+///
+/// One variant per backend. Each yields its own native proto response shape;
+/// the chunk / complete accessors above match on the corresponding
+/// `ProtoGenerateStreamChunk` / `ProtoGenerateComplete` arm.
 pub enum ProtoStream {
     Sglang(SglangStream),
     Vllm(VllmStream),
     Trtllm(TrtllmStream),
     Mlx(MlxStream),
+    TokenSpeed(TokenSpeedStream),
 }
 
 impl ProtoStream {
@@ -1316,6 +1535,10 @@ impl ProtoStream {
                 .next()
                 .await
                 .map(|result| result.map(|r| ProtoGenerateResponse::Mlx(Box::new(r)))),
+            Self::TokenSpeed(stream) => stream
+                .next()
+                .await
+                .map(|result| result.map(|r| ProtoGenerateResponse::TokenSpeed(Box::new(r)))),
         }
     }
 
@@ -1326,6 +1549,7 @@ impl ProtoStream {
             Self::Vllm(stream) => stream.mark_completed(),
             Self::Trtllm(stream) => stream.mark_completed(),
             Self::Mlx(stream) => stream.mark_completed(),
+            Self::TokenSpeed(stream) => stream.mark_completed(),
         }
     }
 }
@@ -1413,5 +1637,136 @@ impl ProtoEmbedComplete {
             Self::Sglang(r) => r.embedding_dim,
             Self::Vllm(r) => r.embedding_dim,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use prost::Message;
+
+    use super::*;
+
+    #[test]
+    fn tokenspeed_image_into_proto_uses_itemized_payload() {
+        let mut model_specific_tensors = HashMap::new();
+        model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            TensorBytes {
+                data: vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+                shape: vec![1, 3],
+                dtype: "uint32".to_string(),
+            },
+        );
+
+        let proto = TokenSpeedMultimodalData {
+            items: vec![TokenSpeedMultimodalItem {
+                modality: TokenSpeedModality::Image,
+                encoder_input: vec![42; 8],
+                encoder_input_shape: vec![1, 2],
+                encoder_input_dtype: "float32".to_string(),
+                model_specific_tensors,
+                placeholder_token_id: Some(151655),
+                mm_placeholders: vec![(4, 2)],
+                content_hash: vec![7; 32],
+            }],
+        }
+        .into_proto();
+
+        assert_eq!(proto.items.len(), 1);
+        let item = &proto.items[0];
+        assert_eq!(item.modality, tokenspeed::Modality::Image as i32);
+        assert_eq!(item.placeholder_token_id, Some(151655));
+        assert_eq!(item.placeholders[0].offset, 4);
+        assert_eq!(item.placeholders[0].length, 2);
+        assert_eq!(
+            inline_tensor_data(item.encoder_input.as_ref().unwrap()),
+            &[42; 8]
+        );
+        assert!(item.model_specific_tensors.contains_key("image_grid_thw"));
+    }
+
+    #[test]
+    fn tokenspeed_video_into_proto_uses_itemized_payload() {
+        let mut model_specific_tensors = HashMap::new();
+        model_specific_tensors.insert(
+            "video_grid_thw".to_string(),
+            TensorBytes {
+                data: vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+                shape: vec![1, 3],
+                dtype: "uint32".to_string(),
+            },
+        );
+
+        let proto = TokenSpeedMultimodalData {
+            items: vec![TokenSpeedMultimodalItem {
+                modality: TokenSpeedModality::Video,
+                encoder_input: vec![42; 8],
+                encoder_input_shape: vec![1, 2],
+                encoder_input_dtype: "float32".to_string(),
+                model_specific_tensors,
+                placeholder_token_id: Some(151656),
+                mm_placeholders: vec![(4, 2)],
+                content_hash: vec![7; 32],
+            }],
+        }
+        .into_proto();
+
+        assert_eq!(proto.items.len(), 1);
+        let item = &proto.items[0];
+        assert_eq!(item.modality, tokenspeed::Modality::Video as i32);
+        assert_eq!(item.placeholder_token_id, Some(151656));
+        assert_eq!(item.placeholders[0].offset, 4);
+        assert_eq!(item.placeholders[0].length, 2);
+        assert_eq!(
+            inline_tensor_data(item.encoder_input.as_ref().unwrap()),
+            &[42; 8]
+        );
+        assert!(item.model_specific_tensors.contains_key("video_grid_thw"));
+    }
+
+    #[test]
+    fn tokenspeed_tensor_data_uses_clean_payload_tags() {
+        let tensor = tensor_bytes_to_tokenspeed(TensorBytes {
+            data: vec![0xaa, 0xbb],
+            shape: vec![2, 3],
+            dtype: "uint32".to_string(),
+        });
+
+        assert_eq!(
+            tensor.encode_to_vec(),
+            vec![
+                0x0a, 0x02, 0x02, 0x03, // shape = 1, packed uint32 [2, 3]
+                0x12, 0x06, b'u', b'i', b'n', b't', b'3', b'2', // dtype = 2
+                0x1a, 0x02, 0xaa, 0xbb, // inline = 3
+            ]
+        );
+    }
+
+    fn inline_tensor_data(tensor: &tokenspeed::TensorData) -> &[u8] {
+        match tensor.payload.as_ref() {
+            Some(tokenspeed::tensor_data::Payload::Inline(data)) => data,
+            _ => panic!("expected inline TensorData payload"),
+        }
+    }
+
+    #[test]
+    fn set_data_parallel_rank_per_engine() {
+        let mut vllm_req = ProtoGenerateRequest::Vllm(Box::default());
+        vllm_req.set_data_parallel_rank(2);
+        assert!(matches!(
+            &vllm_req,
+            ProtoGenerateRequest::Vllm(req) if req.data_parallel_rank == Some(2)
+        ));
+
+        let mut sglang_req = ProtoGenerateRequest::Sglang(Box::default());
+        sglang_req.set_data_parallel_rank(3);
+        assert!(matches!(
+            &sglang_req,
+            ProtoGenerateRequest::Sglang(req) if req.data_parallel_rank == 3
+        ));
+
+        // Engines without the proto field ignore the pin
+        let mut mlx_req = ProtoGenerateRequest::Mlx(Box::default());
+        mlx_req.set_data_parallel_rank(1);
     }
 }

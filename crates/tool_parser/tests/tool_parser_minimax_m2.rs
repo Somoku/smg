@@ -2,7 +2,128 @@
 mod common;
 
 use common::create_test_tools;
+use openai_protocol::common::{Function, Tool};
+use serde_json::json;
 use tool_parser::{MinimaxM2Parser, ToolParser};
+
+/// Tools matching issue #1743: `update_task(taskId: string, subject: string)`.
+fn update_task_tools() -> Vec<Tool> {
+    vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "update_task".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "taskId":  {"type": "string"},
+                    "subject": {"type": "string"}
+                },
+                "required": ["taskId", "subject"]
+            }),
+            strict: None,
+        },
+    }]
+}
+
+const UPDATE_TASK_CALL: &str = r#"<minimax:tool_call>
+<invoke name="update_task">
+<parameter name="taskId">3</parameter>
+<parameter name="subject">X</parameter>
+</invoke>
+</minimax:tool_call>"#;
+
+/// Issue #1743: a `string`-typed parameter whose value looks numeric must be
+/// emitted as a JSON string when the schema is available, not coerced to a number.
+#[tokio::test]
+async fn test_minimax_string_arg_kept_as_string_with_schema() {
+    let parser = MinimaxM2Parser::new();
+    let tools = update_task_tools();
+
+    let (_normal, calls) = parser
+        .parse_complete_with_tools(UPDATE_TASK_CALL, &tools)
+        .await
+        .unwrap();
+
+    assert_eq!(calls.len(), 1);
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(
+        args["taskId"],
+        json!("3"),
+        "string schema -> must stay string"
+    );
+    assert_eq!(args["subject"], json!("X"));
+}
+
+/// Numeric schema types are still coerced: an `integer` field stays a number.
+#[tokio::test]
+async fn test_minimax_integer_arg_coerced_with_schema() {
+    let parser = MinimaxM2Parser::new();
+    let tools = vec![Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "update_task".to_string(),
+            description: None,
+            parameters: json!({
+                "type": "object",
+                "properties": { "taskId": {"type": "integer"} }
+            }),
+            strict: None,
+        },
+    }];
+
+    let (_normal, calls) = parser
+        .parse_complete_with_tools(UPDATE_TASK_CALL, &tools)
+        .await
+        .unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args["taskId"], json!(3), "integer schema -> number");
+}
+
+/// Backward compatible: with no schema, text-based inference is unchanged
+/// (a numeric-looking value becomes a number).
+#[tokio::test]
+async fn test_minimax_no_schema_infers_number() {
+    let parser = MinimaxM2Parser::new();
+    let (_normal, calls) = parser.parse_complete(UPDATE_TASK_CALL).await.unwrap();
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(
+        args["taskId"],
+        json!(3),
+        "no schema -> inferred number (unchanged)"
+    );
+}
+
+/// Streaming honors the schema too (tools were previously received but ignored).
+#[tokio::test]
+async fn test_minimax_streaming_string_arg_kept_as_string_with_schema() {
+    let mut parser = MinimaxM2Parser::new();
+    let tools = update_task_tools();
+
+    let mut args_json = String::new();
+    for chunk in [
+        "<minimax:tool_call>",
+        r#"<invoke name="update_task">"#,
+        r#"<parameter name="taskId">3</parameter>"#,
+        r#"<parameter name="subject">X</parameter>"#,
+        "</invoke>",
+        "</minimax:tool_call>",
+    ] {
+        let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        for call in result.calls {
+            if call.name.is_none() {
+                args_json.push_str(&call.parameters);
+            }
+        }
+    }
+
+    let args: serde_json::Value = serde_json::from_str(&args_json).unwrap();
+    assert_eq!(
+        args["taskId"],
+        json!("3"),
+        "streaming string schema -> stay string"
+    );
+}
 
 #[tokio::test]
 async fn test_minimax_complete_parsing() {
@@ -312,7 +433,7 @@ async fn test_minimax_multiple_tools_boundary() {
 }
 
 #[tokio::test]
-async fn test_minimax_invalid_function_name() {
+async fn test_minimax_unknown_function_name_is_forwarded() {
     let mut parser = MinimaxM2Parser::new();
     let tools = create_test_tools();
 
@@ -324,11 +445,14 @@ async fn test_minimax_invalid_function_name() {
     ];
 
     let mut found_invalid = false;
+    let mut all_normal_text = String::new();
 
     for chunk in chunks {
         let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+        all_normal_text.push_str(&result.normal_text);
 
-        // Invalid function should be skipped
+        // Unknown/hallucinated function names are forwarded as tool calls so the
+        // client gets a clean error, rather than leaking the raw markup as text.
         for call in result.calls {
             if let Some(name) = call.name {
                 if name == "invalid_function" {
@@ -338,7 +462,14 @@ async fn test_minimax_invalid_function_name() {
         }
     }
 
-    assert!(!found_invalid, "Invalid function should not be parsed");
+    assert!(
+        found_invalid,
+        "Unknown function name should be forwarded as a tool call"
+    );
+    assert!(
+        !all_normal_text.contains("<invoke"),
+        "Tool-call markup must not leak into normal text"
+    );
 }
 
 #[tokio::test]
@@ -598,7 +729,7 @@ async fn test_minimax_streaming_with_invalid_function_progressive() {
     ];
 
     let mut all_normal_text = String::new();
-    let mut found_valid_tool = false;
+    let mut forwarded_name = None;
 
     for chunk in chunks {
         let result = parser.parse_incremental(chunk, &tools).await.unwrap();
@@ -606,20 +737,22 @@ async fn test_minimax_streaming_with_invalid_function_progressive() {
 
         for call in result.calls {
             if let Some(name) = call.name {
-                // Should not get here for invalid function
-                if tools.iter().any(|t| t.function.name == name) {
-                    found_valid_tool = true;
-                }
+                forwarded_name = Some(name);
             }
         }
     }
 
-    assert!(
-        !found_valid_tool,
-        "Invalid function should not be parsed as tool call"
+    // The unknown name is forwarded as a tool call, and its markup is NOT
+    // leaked into the user-visible normal text.
+    assert_eq!(
+        forwarded_name.as_deref(),
+        Some("invalid_function"),
+        "Unknown function should be forwarded as a tool call"
     );
-    // The invalid tool call should be returned as normal text
-    assert!(all_normal_text.contains("invalid_function"));
+    assert!(
+        !all_normal_text.contains("<invoke"),
+        "Tool-call markup must not leak into normal text"
+    );
 }
 
 #[tokio::test]

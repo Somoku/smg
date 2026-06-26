@@ -1,6 +1,7 @@
 //! Worker domain — identity, registry, health, resilience, monitoring, service.
 
 pub mod builder;
+pub mod capacity;
 pub mod circuit_breaker;
 pub mod error;
 pub mod event;
@@ -28,6 +29,7 @@ pub mod worker;
 
 // Re-export commonly used types for convenience
 pub use builder::BasicWorkerBuilder;
+pub use capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity};
 pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig};
 pub use error::{WorkerError, WorkerResult};
 pub use hash_ring::HashRing;
@@ -42,7 +44,7 @@ pub use openai_protocol::{
     model_type::{Endpoint, ModelType},
     worker::{ProviderType, WorkerGroupKey},
 };
-pub use registry::WorkerRegistry;
+pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use routing_control::{
     DpRankInput, WorkerRoutingControlRequest, WorkerRoutingControlResult,
@@ -60,5 +62,5 @@ pub use weight_version::{
 };
 pub use worker::{
     AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
-    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
+    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
 };

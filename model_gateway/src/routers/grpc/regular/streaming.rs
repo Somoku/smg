@@ -35,12 +35,15 @@ use tracing::{debug, error, warn};
 
 use crate::{
     observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
-    routers::grpc::{
-        common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
-        context,
-        proto_wrapper::{ProtoResponseVariant, ProtoStream},
-        utils,
-        utils::message_utils,
+    routers::{
+        common::sse::SseEncoder,
+        grpc::{
+            common::{response_formatting::CompletionTokenTracker, responses::build_sse_response},
+            context,
+            proto_wrapper::{ProtoResponseVariant, ProtoStream},
+            utils,
+            utils::message_utils,
+        },
     },
 };
 
@@ -232,6 +235,9 @@ impl StreamingProcessor {
 
         // Reusable SSE formatting buffer to avoid allocations per chunk
         let mut sse_buffer = Vec::with_capacity(512);
+        // Reusable SSE encoder for the post-loop flush / tool / finish / usage
+        // chunks, which previously each did `to_string` + `format!`.
+        let mut sse_encoder = SseEncoder::new();
 
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
@@ -483,10 +489,10 @@ impl StreamingProcessor {
                                         .build();
 
                                 let sse_chunk =
-                                    serde_json::to_string(&content_chunk).map_err(|e| {
+                                    sse_encoder.encode_data(&content_chunk).map_err(|e| {
                                         format!("Failed to serialize content chunk: {e}")
                                     })?;
-                                tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                                tx.send(Ok(sse_chunk))
                                     .map_err(|_| "Failed to send flushed content".to_string())?;
                             }
                         }
@@ -533,9 +539,10 @@ impl StreamingProcessor {
                         .maybe_system_fingerprint(system_fingerprint)
                         .build();
 
-                    let sse_chunk = serde_json::to_string(&tool_chunk)
+                    let sse_chunk = sse_encoder
+                        .encode_data(&tool_chunk)
                         .map_err(|e| format!("Failed to serialize tool chunk: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                    tx.send(Ok(sse_chunk))
                         .map_err(|_| "Failed to send unstreamed tool args".to_string())?;
                 }
             }
@@ -558,9 +565,10 @@ impl StreamingProcessor {
                 .maybe_system_fingerprint(system_fingerprint)
                 .build();
 
-            let sse_chunk = serde_json::to_string(&finish_chunk)
+            let sse_chunk = sse_encoder
+                .encode_data(&finish_chunk)
                 .map_err(|e| format!("Failed to serialize finish chunk: {e}"))?;
-            tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+            tx.send(Ok(sse_chunk))
                 .map_err(|_| "Failed to send finish chunk".to_string())?;
         }
 
@@ -580,9 +588,10 @@ impl StreamingProcessor {
                     .maybe_system_fingerprint(system_fingerprint)
                     .build();
 
-                let sse_chunk = serde_json::to_string(&usage_chunk)
+                let sse_chunk = sse_encoder
+                    .encode_data(&usage_chunk)
                     .map_err(|e| format!("Failed to serialize usage chunk: {e}"))?;
-                tx.send(Ok(Bytes::from(format!("data: {sse_chunk}\n\n"))))
+                tx.send(Ok(sse_chunk))
                     .map_err(|_| "Failed to send usage chunk".to_string())?;
             }
         }
@@ -760,6 +769,8 @@ impl StreamingProcessor {
         // Track state per index for n>1 case
         let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Reusable SSE encoder shared across every chunk emitted for this stream.
+        let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -805,9 +816,10 @@ impl StreamingProcessor {
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&chunk_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&chunk_response)
                         .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -834,9 +846,10 @@ impl StreamingProcessor {
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&finish_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&finish_response)
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
 
                     // Continue to process all completions if n>1
@@ -922,6 +935,8 @@ impl StreamingProcessor {
         let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
             HashMap::new();
         let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        // Reusable SSE encoder shared across every chunk emitted for this stream.
+        let mut sse_encoder = SseEncoder::new();
 
         while let Some(response) = stream.next().await {
             let gen_response = response.map_err(|e| format!("Stream error: {}", e.message()))?;
@@ -993,9 +1008,10 @@ impl StreamingProcessor {
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&chunk_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&chunk_response)
                         .map_err(|e| format!("Failed to serialize generate chunk: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send chunk".to_string())?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -1036,9 +1052,10 @@ impl StreamingProcessor {
                         "index": index
                     });
 
-                    let sse_data = serde_json::to_string(&finish_response)
+                    let sse_data = sse_encoder
+                        .encode_data(&finish_response)
                         .map_err(|e| format!("Failed to serialize generate finish: {e}"))?;
-                    tx.send(Ok(Bytes::from(format!("data: {sse_data}\n\n"))))
+                    tx.send(Ok(sse_data))
                         .map_err(|_| "Failed to send finish chunk".to_string())?;
 
                     // Continue to process all completions if n>1
@@ -1632,7 +1649,10 @@ impl StreamingProcessor {
         // Only run reasoning parser when the user explicitly enabled thinking.
         let separate_reasoning = matches!(
             &original_request.thinking,
-            Some(messages::ThinkingConfig::Enabled { .. })
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                    | messages::ThinkingConfig::Adaptive { .. }
+            )
         );
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
@@ -1643,7 +1663,10 @@ impl StreamingProcessor {
 
         // Determine if thinking is effectively ON (for mark_reasoning_started).
         let user_thinking = match &original_request.thinking {
-            Some(messages::ThinkingConfig::Enabled { .. }) => Some(true),
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
             Some(messages::ThinkingConfig::Disabled) => Some(false),
             None => None,
         };

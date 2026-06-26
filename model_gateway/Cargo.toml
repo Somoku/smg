@@ -1,6 +1,6 @@
 [package]
 name = "smg"
-version = "1.4.1"
+version = "1.6.0"
 edition = "2021"
 description = "High-performance model-routing gateway for large-scale LLM deployments"
 license = "Apache-2.0"
@@ -18,6 +18,7 @@ categories = ["web-programming", "network-programming"]
 default = ["grpc-client"]
 grpc-client = []
 grpc-server = []
+opencv-video = ["llm-multimodal/opencv-video"]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -72,12 +73,10 @@ smg-auth.workspace = true
 smg-mcp.workspace = true
 kv-index.workspace = true
 smg-data-connector.workspace = true
-llm-multimodal.workspace = true
+llm-multimodal = { workspace = true, default-features = false }
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
 smg-grpc-client.workspace = true
-smg-skills.workspace = true
-smg-blob-storage.workspace = true
 psrl-state.workspace = true
 smg-tito.workspace = true
 
@@ -85,8 +84,9 @@ smg-tito.workspace = true
 bincode = "1.3"
 clap = { version = "4", features = ["derive", "env"] }
 axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+ndarray = "0.17"
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
+tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order"] }
 bytes = "1.8.0"
 http-body = "1.0"
@@ -138,13 +138,15 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.4"
-wasm-encoder = "0.247"
+wasm-encoder = "0.252"
 npyz = { version = "0.9", features = ["npz"] }
-opentelemetry-proto = { version = "0.31", features = ["gen-tonic"] }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
 serial_test = "3.0"
 rsa = { version = "0.9", features = ["sha2"] }
 jsonwebtoken = "9.3"
 validator = "0.20.0"
+tracing-test = "0.2"
+tokio = { workspace = true, features = ["test-util"] }
 kv-index.workspace = true
 wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
@@ -205,6 +207,21 @@ path = "benches/sync_alloc_bench.rs"
 name = "routing_loop_bench"
 harness = false
 path = "benches/routing_loop_bench.rs"
+
+[[bench]]
+name = "workers_endpoint"
+harness = false
+path = "benches/workers_endpoint.rs"
+
+[[bench]]
+name = "scheduler_admission"
+harness = false
+path = "benches/scheduler_admission.rs"
+
+[[bench]]
+name = "scheduler_load"
+harness = false
+path = "benches/scheduler_load.rs"
 
 [lints]
 workspace = true

@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use super::{
     BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, CacheAwareV1Policy,
-    ConsistentHashingPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy,
-    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RequestNumBalancePolicy, RoundRobinPolicy,
-    ThroughputOptimalConfig, ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
+    ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
+    PassthroughPolicy, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy, RandomPolicy,
+    RequestNumBalancePolicy, RoundRobinPolicy, ThroughputOptimalConfig, ThroughputOptimalPolicy,
+    ThroughputOptimalWithBudgetPolicy,
 };
 use crate::config::{ConfigError, ConfigResult, PolicyConfig};
 
@@ -19,7 +20,18 @@ impl PolicyFactory {
         match config {
             PolicyConfig::Random => Ok(Arc::new(RandomPolicy::new())),
             PolicyConfig::RoundRobin => Ok(Arc::new(RoundRobinPolicy::new())),
+            PolicyConfig::Passthrough => Ok(Arc::new(PassthroughPolicy::new())),
             PolicyConfig::PowerOfTwo { .. } => Ok(Arc::new(PowerOfTwoPolicy::new())),
+            PolicyConfig::LeastLoad {
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+                ..
+            } => Ok(Arc::new(LeastLoadPolicy::with_params(
+                *kv_pressure_weight,
+                *mean_prefill_tokens,
+                *default_throughput,
+            ))),
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold,
@@ -29,6 +41,8 @@ impl PolicyFactory {
                 block_size,
                 gpu_overlap_weight,
                 lmcache_overlap_weight,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -39,7 +53,8 @@ impl PolicyFactory {
                     block_size: *block_size,
                     gpu_overlap_weight: *gpu_overlap_weight,
                     lmcache_overlap_weight: *lmcache_overlap_weight,
-                    ..Default::default()
+                    balance_token_usage_threshold: *balance_token_usage_threshold,
+                    overload_token_usage_threshold: *overload_token_usage_threshold,
                 };
                 Ok(Arc::new(CacheAwarePolicy::with_config(config)))
             }
@@ -152,7 +167,9 @@ impl PolicyFactory {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
+            "passthrough" => Some(Arc::new(PassthroughPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
+            "least_load" | "leastload" => Some(Arc::new(LeastLoadPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
             "cache_aware_v1" | "cacheawarev1" => Some(Arc::new(CacheAwareV1Policy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
@@ -193,6 +210,9 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RoundRobin).unwrap();
         assert_eq!(policy.name(), "round_robin");
 
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::Passthrough);
+        assert_eq!(policy.name(), "passthrough");
+
         let policy = PolicyFactory::create_from_config(&PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
         })
@@ -208,6 +228,8 @@ mod tests {
             block_size: 16,
             gpu_overlap_weight: 1.0,
             lmcache_overlap_weight: 0.5,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         })
         .unwrap();
         assert_eq!(policy.name(), "cache_aware");
@@ -234,8 +256,6 @@ mod tests {
         let policy = PolicyFactory::create_from_config(&PolicyConfig::RequestNumBalance).unwrap();
         assert_eq!(policy.name(), "request_num_balance");
 
-        // ThroughputOptimal requires a valid cost model path.
-        // Using a nonexistent path should return an error.
         let result = PolicyFactory::create_from_config(&PolicyConfig::ThroughputOptimal {
             cost_model_path: "/nonexistent/cost_model.json".to_string(),
             max_concurrent_seqs_per_instance: 100,
@@ -256,6 +276,13 @@ mod tests {
                 max_num_waiting_reqs_after_preemption: 1000,
             });
         assert!(result.is_err(), "should fail with invalid cost model path");
+
+        let policy = PolicyFactory::create_from_config(&PolicyConfig::PrefixHash {
+            prefix_token_count: 100,
+            load_factor: 0.8,
+        })
+        .unwrap();
+        assert_eq!(policy.name(), "prefix_hash");
     }
 
     #[tokio::test]
@@ -264,6 +291,11 @@ mod tests {
         assert!(PolicyFactory::create_by_name("RANDOM").is_some());
         assert!(PolicyFactory::create_by_name("round_robin").is_some());
         assert!(PolicyFactory::create_by_name("RoundRobin").is_some());
+        assert_eq!(
+            PolicyFactory::create_by_name("passthrough").unwrap().name(),
+            "passthrough"
+        );
+        assert!(PolicyFactory::create_by_name("PASSTHROUGH").is_some());
         assert!(PolicyFactory::create_by_name("power_of_two").is_some());
         assert!(PolicyFactory::create_by_name("PowerOfTwo").is_some());
         assert!(PolicyFactory::create_by_name("cache_aware").is_some());
@@ -276,11 +308,12 @@ mod tests {
         assert!(PolicyFactory::create_by_name("ConsistentHashing").is_some());
         assert!(PolicyFactory::create_by_name("request_num_balance").is_some());
         assert!(PolicyFactory::create_by_name("RequestNumBalance").is_some());
-        // throughput_optimal requires cost_model_path; cannot create by name alone
         assert!(PolicyFactory::create_by_name("throughput_optimal").is_none());
         assert!(PolicyFactory::create_by_name("ThroughputOptimal").is_none());
         assert!(PolicyFactory::create_by_name("throughput_optimal_with_budget").is_none());
         assert!(PolicyFactory::create_by_name("ThroughputOptimalWithBudget").is_none());
+        assert!(PolicyFactory::create_by_name("prefix_hash").is_some());
+        assert!(PolicyFactory::create_by_name("PrefixHash").is_some());
         assert!(PolicyFactory::create_by_name("unknown").is_none());
     }
 }

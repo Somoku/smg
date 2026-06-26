@@ -30,6 +30,15 @@ service SglangScheduler {
   // Get comprehensive load metrics
   rpc GetLoads(GetLoadsRequest) returns (GetLoadsResponse);
 
+  // Flush the KV cache on all scheduler processes
+  rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
+
+  // Start the profiler on all scheduler processes
+  rpc StartProfile(smg.grpc.common.StartProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
+  // Stop the profiler and export traces
+  rpc StopProfile(smg.grpc.common.StopProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
   // Get tokenizer artifacts for remote construction
   rpc GetTokenizer(smg.grpc.common.GetTokenizerRequest) returns (stream smg.grpc.common.GetTokenizerChunk);
 
@@ -517,6 +526,12 @@ message SchedulerLoad {
   double cache_hit_rate = 9;
   double utilization = 10;
   int32 max_running_requests = 11;
+
+  // Queued token-work: waiting-queue tokens not yet served from cache
+  // (SGLang num_waiting_uncached_tokens). Field 17 is intentionally out of
+  // order — appended after the optional-section field numbers to preserve
+  // wire compatibility with existing readers.
+  int32 num_waiting_uncached_tokens = 17;
 
   // Optional sections
   optional MemoryMetrics memory = 12;

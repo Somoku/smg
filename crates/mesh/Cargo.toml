@@ -1,6 +1,6 @@
 [package]
 name = "smg-mesh"
-version = "1.3.0"
+version = "1.4.1"
 edition = "2021"
 description = "Mesh gossip protocol and distributed state synchronization for Shepherd Model Gateway"
 license = "Apache-2.0"
@@ -55,14 +55,9 @@ tonic-prost-build = "0.14.2"
 prost-build = "0.14.1"
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
 lazy_static = "1.5"
 tokio = { workspace = true, features = ["full", "test-util"] }
 tracing-subscriber.workspace = true
-
-[[bench]]
-name = "mesh_serialization"
-harness = false
 
 [lints]
 workspace = true

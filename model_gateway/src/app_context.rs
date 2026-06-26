@@ -6,14 +6,11 @@ use std::{
 use llm_tokenizer::registry::TokenizerRegistry;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
-use smg_blob_storage::create_blob_store;
 use smg_data_connector::{
-    backend_supports_memory_writer, create_storage, BackgroundResponseRepository,
-    ConversationItemStorage, ConversationMemoryWriter, ConversationStorage, ResponseStorage,
+    create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     StorageFactoryConfig,
 };
 use smg_mcp::McpOrchestrator;
-use smg_skills::{SkillService, SkillUploadLimits};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::debug;
 
@@ -70,9 +67,6 @@ pub struct AppContext {
     pub response_storage: Arc<dyn ResponseStorage>,
     pub conversation_storage: Arc<dyn ConversationStorage>,
     pub conversation_item_storage: Arc<dyn ConversationItemStorage>,
-    /// Writer used for long-term-memory persistence (NoOp when backend does not support writes).
-    pub conversation_memory_writer: Arc<dyn ConversationMemoryWriter>,
-    pub background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
     pub worker_monitor: Option<Arc<WorkerMonitor>>,
     pub preemption_monitor: Option<Arc<PreemptionMonitor>>,
     pub configured_reasoning_parser: Option<String>,
@@ -81,7 +75,6 @@ pub struct AppContext {
     pub workflow_engines: Arc<OnceLock<WorkflowEngines>>,
     pub mcp_orchestrator: Arc<OnceLock<Arc<McpOrchestrator>>>,
     pub mcp_format_registry: FormatRegistry,
-    pub skill_service: Option<Arc<SkillService>>,
     pub wasm_manager: Option<Arc<WasmModuleManager>>,
     pub worker_service: Arc<WorkerService>,
     pub inflight_tracker: Arc<InFlightRequestTracker>,
@@ -117,15 +110,12 @@ pub struct AppContextBuilder {
     response_storage: Option<Arc<dyn ResponseStorage>>,
     conversation_storage: Option<Arc<dyn ConversationStorage>>,
     conversation_item_storage: Option<Arc<dyn ConversationItemStorage>>,
-    conversation_memory_writer: Option<Arc<dyn ConversationMemoryWriter>>,
-    background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
     worker_monitor: Option<Arc<WorkerMonitor>>,
     preemption_monitor: Option<Arc<PreemptionMonitor>>,
     worker_job_queue: Option<Arc<OnceLock<Arc<JobQueue>>>>,
     workflow_engines: Option<Arc<OnceLock<WorkflowEngines>>>,
     mcp_orchestrator: Option<Arc<OnceLock<Arc<McpOrchestrator>>>>,
     mcp_format_registry: Option<FormatRegistry>,
-    skill_service: Option<Arc<SkillService>>,
     wasm_manager: Option<Arc<WasmModuleManager>>,
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     routing_loop_runtime: Option<Arc<RoutingLoopRuntime>>,
@@ -176,15 +166,12 @@ impl AppContextBuilder {
             response_storage: None,
             conversation_storage: None,
             conversation_item_storage: None,
-            conversation_memory_writer: None,
-            background_repository: None,
             worker_monitor: None,
             preemption_monitor: None,
             worker_job_queue: None,
             workflow_engines: None,
             mcp_orchestrator: None,
             mcp_format_registry: None,
-            skill_service: None,
             wasm_manager: None,
             kv_event_monitor: None,
             routing_loop_runtime: None,
@@ -260,23 +247,6 @@ impl AppContextBuilder {
         conversation_item_storage: Arc<dyn ConversationItemStorage>,
     ) -> Self {
         self.conversation_item_storage = Some(conversation_item_storage);
-        self
-    }
-
-    /// Inject conversation memory writer for long-term-memory store operations.
-    pub fn conversation_memory_writer(
-        mut self,
-        conversation_memory_writer: Arc<dyn ConversationMemoryWriter>,
-    ) -> Self {
-        self.conversation_memory_writer = Some(conversation_memory_writer);
-        self
-    }
-
-    pub fn background_repository(
-        mut self,
-        background_repository: Option<Arc<dyn BackgroundResponseRepository>>,
-    ) -> Self {
-        self.background_repository = background_repository;
         self
     }
 
@@ -381,9 +351,6 @@ impl AppContextBuilder {
             }
         }
 
-        validate_memory_writer_configuration(&router_config)
-            .map_err(AppContextBuildError::InvalidConfig)?;
-
         let worker_registry = self
             .worker_registry
             .ok_or(AppContextBuildError::MissingField("worker_registry"))?;
@@ -433,10 +400,6 @@ impl AppContextBuilder {
             conversation_item_storage: self.conversation_item_storage.ok_or(
                 AppContextBuildError::MissingField("conversation_item_storage"),
             )?,
-            conversation_memory_writer: self.conversation_memory_writer.ok_or(
-                AppContextBuildError::MissingField("conversation_memory_writer"),
-            )?,
-            background_repository: self.background_repository,
             worker_monitor: self.worker_monitor,
             preemption_monitor: self.preemption_monitor,
             configured_reasoning_parser,
@@ -449,7 +412,6 @@ impl AppContextBuilder {
                 .mcp_orchestrator
                 .ok_or(AppContextBuildError::MissingField("mcp_orchestrator"))?,
             mcp_format_registry: self.mcp_format_registry.unwrap_or_default(),
-            skill_service: self.skill_service,
             wasm_manager: self.wasm_manager,
             worker_service,
             inflight_tracker: InFlightRequestTracker::new(),
@@ -471,10 +433,6 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
-        // Fail fast before storage initialization to avoid side effects
-        // (e.g., migrations) for invalid memory_runtime/backend combinations.
-        validate_memory_writer_configuration(&router_config)?;
-
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -491,7 +449,6 @@ impl AppContextBuilder {
             .with_workflow_engines()
             .with_mcp_orchestrator(&router_config)
             .await?
-            .with_skill_service(&router_config)?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
             .webrtc_bind_addr(webrtc_bind_addr)
@@ -654,8 +611,6 @@ impl AppContextBuilder {
         self.response_storage = Some(bundle.response_storage);
         self.conversation_storage = Some(bundle.conversation_storage);
         self.conversation_item_storage = Some(bundle.conversation_item_storage);
-        self.conversation_memory_writer = Some(bundle.conversation_memory_writer);
-        self.background_repository = bundle.background_repository;
 
         Ok(self)
     }
@@ -737,31 +692,6 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    fn with_skill_service(mut self, config: &RouterConfig) -> Result<Self, String> {
-        if !config.skills_enabled {
-            self.skill_service = None;
-            return Ok(self);
-        }
-
-        let Some(skills_config) = config.skills.as_ref() else {
-            return Err(
-                "Skills are enabled but no validated skills config was loaded at startup"
-                    .to_string(),
-            );
-        };
-
-        let blob_store =
-            create_blob_store(&skills_config.blob_store, Some(&skills_config.cache))
-                .map_err(|error| format!("Failed to initialize skills blob store: {error}"))?;
-        let upload_limits = SkillUploadLimits::from_config(skills_config)
-            .map_err(|error| format!("Invalid skills upload limits: {error}"))?;
-        self.skill_service = Some(Arc::new(SkillService::in_memory_with_limits(
-            blob_store,
-            upload_limits,
-        )));
-        Ok(self)
-    }
-
     /// Create KV event monitor for event-driven cache-aware routing.
     ///
     /// The monitor is created when the default policy is cache_aware, regardless
@@ -781,6 +711,12 @@ impl AppContextBuilder {
             // and any other existing cache-aware policies.
             if let Some(ref registry) = self.policy_registry {
                 registry.set_kv_event_monitor(Some(Arc::clone(&monitor)));
+                // Wire the backend load snapshot so cache-aware policies can use
+                // the KV-usage imbalance trigger. `with_worker_monitor` ran
+                // earlier in the build chain, so this is already set.
+                if let Some(ref worker_monitor) = self.worker_monitor {
+                    registry.set_load_receiver(Some(worker_monitor.subscribe()));
+                }
             }
 
             self.kv_event_monitor = Some(monitor);
@@ -852,34 +788,45 @@ pub fn init_routing_loop(context: &mut AppContext) {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{anyhow, Result};
-    use smg_skills::{SkillServiceMode, SkillsConfig};
-    use tempfile::TempDir;
+    use super::*;
+    use crate::config::types::PolicyConfig;
 
-    use super::AppContextBuilder;
-    use crate::config::RouterConfig;
+    fn config_with_policy(policy: PolicyConfig) -> RouterConfig {
+        RouterConfig {
+            policy,
+            ..Default::default()
+        }
+    }
 
+    /// `with_kv_event_monitor` only creates a monitor for the cache-aware policy.
+    /// This run of the builder needs no storage or network, so it exercises the
+    /// real gating path rather than the predicate in isolation.
+    fn kv_monitor_created_for(policy: PolicyConfig) -> bool {
+        let config = config_with_policy(policy);
+        AppContextBuilder::new()
+            .with_policy_registry(&config)
+            .with_kv_event_monitor(&config)
+            .kv_event_monitor
+            .is_some()
+    }
+
+    /// The #1794-relevant guarantee: passthrough never starts the KV-event
+    /// monitor, so single-backend gateways skip the `SubscribeKvEvents` overhead.
     #[test]
-    fn with_skill_service_builds_single_process_service_when_enabled() -> Result<()> {
-        let blob_root = TempDir::new()?;
-        let cache_root = TempDir::new()?;
-        let mut config = RouterConfig {
-            skills_enabled: true,
-            ..RouterConfig::default()
-        };
-        let mut skills = SkillsConfig::default();
-        skills.blob_store.path = blob_root.path().display().to_string();
-        skills.cache.path = cache_root.path().display().to_string();
-        config.skills = Some(skills);
-
-        let builder = AppContextBuilder::new()
-            .with_skill_service(&config)
-            .map_err(anyhow::Error::msg)?;
-        let service = builder
-            .skill_service
-            .ok_or_else(|| anyhow!("skill service should be built"))?;
-
-        assert_eq!(service.mode(), SkillServiceMode::SingleProcess);
-        Ok(())
+    fn test_passthrough_does_not_create_kv_event_monitor() {
+        assert!(!kv_monitor_created_for(PolicyConfig::Passthrough));
+        // Other non-cache-aware policies are likewise skipped.
+        assert!(!kv_monitor_created_for(PolicyConfig::RoundRobin));
+        // Control: cache-aware still creates the monitor.
+        assert!(kv_monitor_created_for(PolicyConfig::CacheAware {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 32,
+            balance_rel_threshold: 1.1,
+            eviction_interval_secs: 30,
+            max_tree_size: 1000,
+            block_size: 16,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
+        }));
     }
 }

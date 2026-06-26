@@ -83,7 +83,11 @@ impl TieredIndexer {
 
     /// Intern a worker URL in a tier and return its internal id.
     #[inline]
-    pub fn intern_worker(&self, tier: Tier, worker: &str) -> u32 {
+    pub fn intern_worker(
+        &self,
+        tier: Tier,
+        worker: &str,
+    ) -> Result<u32, crate::event_tree::WorkerIdExhausted> {
         self.tiers[tier.index()].intern_worker(worker)
     }
 
@@ -138,8 +142,8 @@ mod tests {
     #[test]
     fn tiers_intern_independently() {
         let idx = TieredIndexer::new(4);
-        let g = idx.intern_worker(Tier::GPU, "http://w1:8000");
-        let l = idx.intern_worker(Tier::Lmcache, "http://w1:8000");
+        let g = idx.intern_worker(Tier::GPU, "http://w1:8000").unwrap();
+        let l = idx.intern_worker(Tier::Lmcache, "http://w1:8000").unwrap();
         // Both tiers know the worker; ids are per-tier (here both start at 0).
         assert_eq!(idx.worker_id(Tier::GPU, "http://w1:8000"), Some(g));
         assert_eq!(idx.worker_id(Tier::Lmcache, "http://w1:8000"), Some(l));

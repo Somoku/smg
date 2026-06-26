@@ -7,18 +7,8 @@ use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gau
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::Lazy;
 
-// =============================================================================
-// STRING INTERNING
-// =============================================================================
-//
-// Dynamic strings (model_id, worker URLs, paths) are interned to avoid repeated
-// heap allocations. The interner uses Arc<str> which is cheap to clone and
-// allows the metrics crate to store references without repeated allocations.
-//
-// Performance characteristics:
-// - First occurrence: One allocation + DashMap insert
-// - Subsequent occurrences: DashMap lookup + Arc::clone (very cheap)
-// - Memory: Strings are never freed (acceptable for bounded label cardinality)
+// Interned strings are never freed; only intern low-cardinality, server-controlled
+// labels (model IDs, worker URLs, normalized paths), never user-controlled input.
 
 /// Global string interner for metric labels.
 /// Uses DashMap for lock-free concurrent access.
@@ -110,8 +100,6 @@ pub fn method_to_static_str(method: &str) -> &'static str {
         "PATCH" => http_methods::PATCH,
         "HEAD" => http_methods::HEAD,
         "OPTIONS" => http_methods::OPTIONS,
-        // For unknown methods, we return a static "OTHER" to avoid allocation
-        // This is acceptable since unknown methods are rare in practice
         _ => "OTHER",
     }
 }
@@ -242,6 +230,11 @@ pub(crate) fn init_metrics() {
         "smg_worker_errors_total",
         "Worker-level errors by worker_type, connection_mode, error_type"
     );
+    describe_counter!(
+        "smg_kv_event_subscription_failures_total",
+        "KV event subscription task failures by worker and reason \
+         (panic, join_error, intern_failed)"
+    );
     describe_gauge!(
         "smg_manual_policy_cache_entries",
         "Number of routing entries in manual policy cache"
@@ -331,44 +324,16 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
-    // Layer 7: Routing-loop metrics
-    describe_gauge!(
-        "smg_routing_loop_queue_length",
-        "Total number of requests currently queued in the routing-loop"
-    );
-    describe_gauge!(
-        "smg_routing_loop_partition_queue_length",
-        "Number of requests queued in a specific version partition"
-    );
-    describe_gauge!(
-        "smg_routing_loop_running_tasks",
-        "Number of routing-loop dispatch tasks currently executing"
-    );
-    describe_histogram!(
-        "smg_routing_loop_dispatch_duration_seconds",
-        "End-to-end dispatch duration for a single routing-loop entry (preparation already done)"
-    );
-
-    // Layer 8: KV-cache transfer metrics (migration A → B)
-    describe_counter!(
-        "smg_kv_transfer_total",
-        "KV-cache transfers attempted on migration by result (ok/src_miss/timeout/error)"
-    );
-    describe_counter!(
-        "smg_kv_transfer_skipped_total",
-        "KV-cache transfers skipped by reason (no_overlap/disabled/no_dst_endpoint)"
-    );
-    describe_histogram!(
-        "smg_kv_transfer_latency_seconds",
-        "Latency of the TransferKv RPC issued to the migration source instance"
-    );
-    describe_counter!(
-        "smg_kv_pin_total",
-        "Pin/unpin operations on the source prefix by op (pin/unpin) and result"
-    );
+    // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
+    super::runtime_metrics::describe();
 
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
+
+    // Priority scheduler metrics (no-op at scrape time unless the scheduler
+    // is enabled and recording).
+    use crate::middleware::scheduler::metrics as scheduler_metrics;
+    scheduler_metrics::describe();
 }
 
 #[expect(
@@ -387,10 +352,33 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
         ]
     });
 
+    // The event-loop canary needs its own buckets: its name does not end in
+    // `duration_seconds`, and the request-latency buckets above are far too
+    // coarse for 0-1s wake drift. Without explicit buckets the recorder would
+    // render it as a summary.
+    let canary_matcher = Matcher::Full(super::runtime_metrics::EVENT_LOOP_DELAY_SECONDS.into());
+
+    // TTFT and TPOT (per-request mean inter-token latency) end in `_seconds`
+    // but NOT `duration_seconds`, so without explicit buckets the recorder
+    // renders them as summaries (quantile lines only) — not heatmap-able. Reuse
+    // the request-latency buckets: they span 0.001-7200s, fine for both the
+    // sub-second-to-seconds TTFT and the tens-of-ms TPOT.
+    let ttft_matcher = Matcher::Suffix(String::from("ttft_seconds"));
+    let tpot_matcher = Matcher::Suffix(String::from("tpot_seconds"));
+
     PrometheusBuilder::new()
         .upkeep_timeout(Duration::from_secs(UPKEEP_INTERVAL_SECS))
         .set_buckets_for_metric(duration_matcher, &duration_bucket)
         .expect("failed to set duration bucket")
+        .set_buckets_for_metric(ttft_matcher, &duration_bucket)
+        .expect("failed to set ttft bucket")
+        .set_buckets_for_metric(tpot_matcher, &duration_bucket)
+        .expect("failed to set tpot bucket")
+        .set_buckets_for_metric(
+            canary_matcher,
+            super::runtime_metrics::EVENT_LOOP_DELAY_BUCKETS,
+        )
+        .expect("failed to set event loop delay buckets")
         .install_recorder()
         .expect("failed to install Prometheus recorder")
 }
@@ -985,6 +973,18 @@ impl Metrics {
             "worker" => worker_interned
         )
         .set(if healthy { 1.0 } else { 0.0 });
+    }
+
+    /// Record a KV event subscription task failure (panic, join error, or
+    /// worker-id intern failure)
+    pub fn record_kv_event_subscription_failure(worker_url: &str, reason: &'static str) {
+        let worker_interned = intern_string(worker_url);
+        counter!(
+            "smg_kv_event_subscription_failures_total",
+            "worker" => worker_interned,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     // ========================================================================

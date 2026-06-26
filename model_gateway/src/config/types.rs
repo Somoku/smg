@@ -7,7 +7,7 @@ pub use smg_data_connector::{
     HistoryBackend, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
 
-use super::{validation::ConfigValidator, ConfigResult, SkillsConfig};
+use super::{validation::ConfigValidator, ConfigResult};
 use crate::{tenant::DEFAULT_TENANT_HEADER_NAME, worker::ConnectionMode};
 
 /// Sort key used by the routing loop after validation/version priority.
@@ -209,6 +209,7 @@ impl BackgroundConfig {
     }
 }
 
+
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
@@ -218,6 +219,16 @@ pub struct RouterConfig {
     pub policy: PolicyConfig,
     pub host: String,
     pub port: u16,
+    /// Dedicated port for the isolated Kubernetes liveness/readiness/health
+    /// probe listener. `None` means the dedicated listener is off; the probe
+    /// routes always remain available on the main `port` regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_port: Option<u16>,
+    /// Explicit async runtime worker-thread count. `None` uses tokio's default
+    /// (`available_parallelism()`), which already honors the cgroup CPU quota on
+    /// Rust 1.95+ and is therefore container-aware. `Some` pins a count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_worker_threads: Option<usize>,
     pub max_payload_size: usize,
     pub request_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
@@ -237,10 +248,6 @@ pub struct RouterConfig {
     #[serde(default)]
     pub storage_context_headers: HashMap<String, String>,
     #[serde(default)]
-    pub memory_runtime: MemoryRuntimeConfig,
-    #[serde(default)]
-    pub background: BackgroundConfig,
-    #[serde(default)]
     pub tenant_resolution: TenantResolutionConfig,
     /// Set to -1 to disable rate limiting
     pub max_concurrent_requests: i32,
@@ -257,6 +264,23 @@ pub struct RouterConfig {
     /// Staleness threshold for engine stats updates
     #[serde(default)]
     pub engine_stats_staleness_threshold_ms: u64,
+    /// Enable the priority-aware admission scheduler. When false (default),
+    /// the legacy concurrency-limit middleware stays wired — zero behavior
+    /// change for existing deployments.
+    #[serde(default)]
+    pub priority_scheduler_enabled: bool,
+    /// Max priority class applied to tenants not listed in the scheduler
+    /// YAML (`system` | `interactive` | `default` | `bulk`).
+    #[serde(default = "default_priority_scheduler_max_class")]
+    pub priority_scheduler_default_max_class: String,
+    /// Optional path to the priority-scheduler YAML (per-class + per-tenant
+    /// overrides). Absent → built-in defaults, empty tenant policy map.
+    #[serde(default)]
+    pub priority_scheduler_config: Option<String>,
+    /// Cap on per-tenant scheduler metric label cardinality (top-N tenants
+    /// by inflight; the remainder bucket under `tenant="other"`).
+    #[serde(default = "default_priority_scheduler_tenant_metric_top_n")]
+    pub priority_scheduler_tenant_metric_top_n: u32,
     pub cors_allowed_origins: Vec<String>,
     pub retry: RetryConfig,
     pub circuit_breaker: CircuitBreakerConfig,
@@ -309,13 +333,6 @@ pub struct RouterConfig {
     /// Loaded from mcp_config_path during config creation
     #[serde(skip)]
     pub mcp_config: Option<smg_mcp::McpConfig>,
-    /// Enables the skills subsystem without forcing the nested skills
-    /// configuration tree into CLI flags.
-    #[serde(default)]
-    pub skills_enabled: bool,
-    /// Loaded from skills_config_path during config creation.
-    #[serde(skip)]
-    pub skills: Option<SkillsConfig>,
     /// Enable WASM support
     #[serde(default)]
     pub enable_wasm: bool,
@@ -397,6 +414,14 @@ impl Default for TokenizerCacheConfig {
             l1_max_memory: default_l1_max_memory(),
         }
     }
+}
+
+fn default_priority_scheduler_max_class() -> String {
+    "default".to_string()
+}
+
+fn default_priority_scheduler_tenant_metric_top_n() -> u32 {
+    32
 }
 
 fn default_history_backend() -> HistoryBackend {
@@ -492,6 +517,12 @@ pub enum PolicyConfig {
     #[serde(rename = "round_robin")]
     RoundRobin,
 
+    /// Forward every request to the single backend with no load balancing,
+    /// load monitoring, or KV-event subscription. Intended for single-worker
+    /// gateways. See `policies/passthrough.rs`.
+    #[serde(rename = "passthrough")]
+    Passthrough,
+
     #[serde(rename = "cache_aware")]
     CacheAware {
         cache_threshold: f32,
@@ -505,6 +536,14 @@ pub enum PolicyConfig {
         gpu_overlap_weight: f64,
         #[serde(default = "default_lmcache_overlap_weight")]
         lmcache_overlap_weight: f64,
+        /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
+        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        #[serde(default = "default_balance_token_usage_threshold")]
+        balance_token_usage_threshold: f32,
+        /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it
+        /// triggers shedding regardless of spread. `>= 1.0` disables (default).
+        #[serde(default = "default_balance_token_usage_threshold")]
+        overload_token_usage_threshold: f32,
     },
 
     /// Cache-aware routing (v1): identical to `cache_aware` but every load
@@ -524,10 +563,41 @@ pub enum PolicyConfig {
         gpu_overlap_weight: f64,
         #[serde(default = "default_lmcache_overlap_weight")]
         lmcache_overlap_weight: f64,
+        /// KV-usage spread (hottest minus coldest backend, 0.0–1.0) above which
+        /// cache affinity is abandoned for shortest-queue. `>= 1.0` disables.
+        #[serde(default = "default_balance_token_usage_threshold")]
+        balance_token_usage_threshold: f32,
+        /// Backend KV-utilization ceiling (0.0–1.0): a single engine above it
+        /// triggers shedding regardless of spread. `>= 1.0` disables (default).
+        #[serde(default = "default_balance_token_usage_threshold")]
+        overload_token_usage_threshold: f32,
     },
 
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
+
+    /// Least-(token-)work policy: routes to the worker minimizing the expected
+    /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
+    /// — token-work drain time plus a convex KV-cache pressure barrier, computed
+    /// from the load monitor with in-flight correction. See `policies/least_load.rs`.
+    #[serde(rename = "least_load")]
+    LeastLoad {
+        #[serde(default = "default_least_load_interval")]
+        load_check_interval_secs: u64,
+        /// KV-pressure weight `λ_t` (seconds): the time-cost of KV contention,
+        /// commensurate with the expected-queue-wait term.
+        #[serde(default = "default_least_load_kv_pressure_weight")]
+        kv_pressure_weight: f64,
+        /// Mean prefill length (tokens) used to estimate in-flight token-work
+        /// when a request's token count is unknown at routing time.
+        #[serde(default = "default_least_load_mean_prefill")]
+        mean_prefill_tokens: u32,
+        /// Fallback generation throughput (tokens/s) for the expected-wait term
+        /// when a backend reports no live `gen_throughput`. Set to the fleet's
+        /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
+        #[serde(default = "default_least_load_throughput")]
+        default_throughput: f64,
+    },
 
     #[serde(rename = "bucket")]
     Bucket {
@@ -664,6 +734,11 @@ fn default_lmcache_overlap_weight() -> f64 {
     0.5
 }
 
+fn default_balance_token_usage_threshold() -> f32 {
+    1.0
+}
+
+
 fn default_prefix_token_count() -> usize {
     256
 }
@@ -700,14 +775,32 @@ fn default_manual_max_idle_secs() -> u64 {
     4 * 3600
 }
 
+fn default_least_load_interval() -> u64 {
+    10
+}
+
+fn default_least_load_kv_pressure_weight() -> f64 {
+    0.15
+}
+
+fn default_least_load_mean_prefill() -> u32 {
+    1024
+}
+
+fn default_least_load_throughput() -> f64 {
+    2000.0
+}
+
 impl PolicyConfig {
     pub fn name(&self) -> &'static str {
         match self {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
+            PolicyConfig::Passthrough => "passthrough",
             PolicyConfig::CacheAware { .. } => "cache_aware",
             PolicyConfig::CacheAwareV1 { .. } => "cache_aware_v1",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
+            PolicyConfig::LeastLoad { .. } => "least_load",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",
             PolicyConfig::ConsistentHashing => "consistent_hashing",
@@ -806,6 +899,16 @@ pub struct HealthCheckConfig {
     pub disable_health_check: bool,
     #[serde(default)]
     pub remove_unhealthy_workers: bool,
+    /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
+    /// is submitted before the registry entry is removed. Lets in-flight
+    /// requests complete naturally. Set to `0` to skip draining and
+    /// remove immediately. Default: 5.
+    #[serde(default = "default_drain_settle_secs")]
+    pub drain_settle_secs: u64,
+}
+
+fn default_drain_settle_secs() -> u64 {
+    5
 }
 
 impl Default for HealthCheckConfig {
@@ -818,6 +921,7 @@ impl Default for HealthCheckConfig {
             endpoint: "/health".to_string(),
             disable_health_check: false,
             remove_unhealthy_workers: false,
+            drain_settle_secs: default_drain_settle_secs(),
         }
     }
 }
@@ -831,6 +935,7 @@ impl HealthCheckConfig {
             success_threshold: self.success_threshold,
             failure_threshold: self.failure_threshold,
             disable_health_check: self.disable_health_check,
+            drain_settle_secs: self.drain_settle_secs,
         }
     }
 }
@@ -895,6 +1000,8 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             host: "0.0.0.0".to_string(),
             port: 3001,
+            health_check_port: None,
+            runtime_worker_threads: None,
             max_payload_size: 536_870_912,     // 512MB
             request_timeout_secs: 1800,        // 30 minutes
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
@@ -910,8 +1017,6 @@ impl Default for RouterConfig {
             log_level: None,
             request_id_headers: None,
             storage_context_headers: HashMap::new(),
-            memory_runtime: MemoryRuntimeConfig::default(),
-            background: BackgroundConfig::default(),
             tenant_resolution: TenantResolutionConfig::default(),
             max_concurrent_requests: -1,
             queue_size: 100,
@@ -921,6 +1026,11 @@ impl Default for RouterConfig {
             psrl: PsrlConfig::default(),
             rate_limit_tokens_per_second: None,
             engine_stats_staleness_threshold_ms: 0,
+            priority_scheduler_enabled: false,
+            priority_scheduler_default_max_class: default_priority_scheduler_max_class(),
+            priority_scheduler_config: None,
+            priority_scheduler_tenant_metric_top_n: default_priority_scheduler_tenant_metric_top_n(
+            ),
             cors_allowed_origins: vec![],
             retry: RetryConfig::default(),
             circuit_breaker: CircuitBreakerConfig::default(),
@@ -943,8 +1053,6 @@ impl Default for RouterConfig {
             client_identity: None,
             ca_certificates: vec![],
             mcp_config: None,
-            skills_enabled: false,
-            skills: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
             server_cert: None,
@@ -1054,84 +1162,6 @@ mod tests {
             config.tenant_resolution.tenant_header_name,
             DEFAULT_TENANT_HEADER_NAME
         );
-        assert!(!config.skills_enabled);
-        assert!(config.skills.is_none());
-    }
-
-    #[test]
-    fn test_background_config_defaults_match_design() {
-        let bg = BackgroundConfig::default();
-        assert_eq!(bg.worker_concurrency, 16);
-        assert_eq!(bg.max_queue_depth, 10_000);
-        assert_eq!(bg.lease_duration_secs, 60);
-        assert_eq!(bg.max_retries, 3);
-        assert_eq!(bg.retry_base_delay_secs, 2);
-        assert_eq!(bg.retry_max_delay_secs, 60);
-        assert_eq!(bg.sweep_interval_secs, 30);
-        assert_eq!(bg.poll_interval_ms, 500);
-        assert_eq!(bg.stream_retention_secs, 15 * 60);
-    }
-
-    #[test]
-    fn test_background_config_accessors_convert_units() {
-        let bg = BackgroundConfig::default();
-        assert_eq!(bg.lease_duration(), std::time::Duration::from_secs(60));
-        assert_eq!(bg.poll_interval(), std::time::Duration::from_millis(500));
-        assert_eq!(bg.stream_retention(), std::time::Duration::from_secs(900));
-    }
-
-    #[test]
-    fn test_validate_rejects_zero_background_fields() {
-        type BgMutator = fn(&mut BackgroundConfig);
-        let cases: &[(&str, BgMutator)] = &[
-            ("worker_concurrency", |b| b.worker_concurrency = 0),
-            ("max_queue_depth", |b| b.max_queue_depth = 0),
-            ("lease_duration_secs", |b| b.lease_duration_secs = 0),
-            ("max_retries", |b| b.max_retries = 0),
-            ("retry_base_delay_secs", |b| b.retry_base_delay_secs = 0),
-            ("retry_max_delay_secs", |b| b.retry_max_delay_secs = 0),
-            ("sweep_interval_secs", |b| b.sweep_interval_secs = 0),
-            ("poll_interval_ms", |b| b.poll_interval_ms = 0),
-            ("stream_retention_secs", |b| b.stream_retention_secs = 0),
-        ];
-        for (field, mutate) in cases {
-            let mut cfg = RouterConfig::default();
-            mutate(&mut cfg.background);
-            let err = cfg.validate().expect_err(field);
-            assert!(
-                format!("{err:?}").contains(field),
-                "{field} validation must fail with field in error: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_validate_rejects_retry_base_exceeding_max() {
-        let mut cfg = RouterConfig::default();
-        cfg.background.retry_base_delay_secs = 30;
-        cfg.background.retry_max_delay_secs = 10;
-        assert!(cfg.validate().is_err());
-    }
-
-    #[test]
-    fn test_background_config_yaml_round_trip_with_custom_values() {
-        let yaml = r"
-worker_concurrency: 32
-max_queue_depth: 5000
-lease_duration_secs: 120
-max_retries: 5
-retry_base_delay_secs: 4
-retry_max_delay_secs: 300
-sweep_interval_secs: 10
-poll_interval_ms: 250
-stream_retention_secs: 3600
-";
-        let bg: BackgroundConfig = serde_yaml::from_str(yaml).expect("deserialize");
-        assert_eq!(bg.worker_concurrency, 32);
-        assert_eq!(bg.max_queue_depth, 5000);
-        assert_eq!(bg.lease_duration(), std::time::Duration::from_secs(120));
-        assert_eq!(bg.retry_max_delay(), std::time::Duration::from_secs(300));
-        assert_eq!(bg.poll_interval(), std::time::Duration::from_millis(250));
     }
 
     #[test]
@@ -1179,8 +1209,6 @@ stream_retention_secs: 3600
         assert!(deserialized.discovery.is_none());
         assert!(deserialized.metrics.is_none());
         assert!(deserialized.trace_config.is_none());
-        assert!(!deserialized.skills_enabled);
-        assert!(deserialized.skills.is_none());
     }
 
     #[test]
@@ -1236,6 +1264,34 @@ stream_retention_secs: 3600
             deserialized.tenant_resolution.tenant_header_name,
             DEFAULT_TENANT_HEADER_NAME
         );
+    }
+
+    #[test]
+    fn test_health_check_port_serde_roundtrip_and_backward_compat() {
+        // Default: dedicated probe listener off, and `skip_serializing_if`
+        // keeps the key out of serialized output entirely.
+        let config = RouterConfig::default();
+        assert_eq!(config.health_check_port, None);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("health_check_port"),
+            "None health_check_port must be omitted from serialized config"
+        );
+
+        // Existing config files predating the field deserialize cleanly via
+        // `#[serde(default)]` (→ None).
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(without.health_check_port, None);
+
+        // When set, the value round-trips.
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .health_check_port(Some(8081))
+            .build_unchecked();
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("health_check_port"));
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.health_check_port, Some(8081));
     }
 
     #[test]
@@ -1311,6 +1367,7 @@ stream_retention_secs: 3600
     fn test_policy_config_name() {
         assert_eq!(PolicyConfig::Random.name(), "random");
         assert_eq!(PolicyConfig::RoundRobin.name(), "round_robin");
+        assert_eq!(PolicyConfig::Passthrough.name(), "passthrough");
 
         let cache_aware = PolicyConfig::CacheAware {
             cache_threshold: 0.8,
@@ -1321,6 +1378,8 @@ stream_retention_secs: 3600
             block_size: 16,
             gpu_overlap_weight: 1.0,
             lmcache_overlap_weight: 0.5,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         assert_eq!(cache_aware.name(), "cache_aware");
 
@@ -1345,6 +1404,8 @@ stream_retention_secs: 3600
             block_size: 16,
             gpu_overlap_weight: 1.0,
             lmcache_overlap_weight: 0.5,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
         let json = serde_json::to_string(&cache_aware).unwrap();
         assert!(json.contains("\"type\":\"cache_aware\""));
@@ -1370,6 +1431,8 @@ stream_retention_secs: 3600
             block_size: 16,
             gpu_overlap_weight: 1.0,
             lmcache_overlap_weight: 0.5,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
 
         match cache_aware {
@@ -1778,6 +1841,8 @@ stream_retention_secs: 3600
                 block_size: 16,
                 gpu_overlap_weight: 1.0,
                 lmcache_overlap_weight: 0.5,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
@@ -1811,6 +1876,8 @@ stream_retention_secs: 3600
                 block_size: 16,
                 gpu_overlap_weight: 1.0,
                 lmcache_overlap_weight: 0.5,
+                balance_token_usage_threshold: 1.0,
+                overload_token_usage_threshold: 1.0,
             }),
             decode_policy: None,
         };
@@ -1870,6 +1937,8 @@ stream_retention_secs: 3600
             block_size: 16,
             gpu_overlap_weight: 1.0,
             lmcache_overlap_weight: 0.5,
+            balance_token_usage_threshold: 1.0,
+            overload_token_usage_threshold: 1.0,
         };
 
         match pd.get_prefill_policy(&main_policy) {
