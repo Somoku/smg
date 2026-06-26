@@ -26,7 +26,7 @@ use dashmap::DashMap;
 use metrics::{counter, histogram};
 use smg_grpc_client::vllm_proto::{PinKvRequest, TransferKvRequest, UnpinKvRequest};
 use tokio::sync::Semaphore;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::{
     config::types::{KvTransferConfig, KvTransferMode},
@@ -100,7 +100,7 @@ impl KvTransferCoordinator {
         let Some((dst_instance_id, dst_peer_url)) = destination_endpoint(dst) else {
             warn!(
                 dst = dst.url(),
-                "KV transfer skipped: destination missing lmcache_instance_id/peer_url labels"
+                "KV transfer skipped: destination missing lmcache_instance_id label"
             );
             record_skip("no_dst_endpoint");
             return;
@@ -112,7 +112,14 @@ impl KvTransferCoordinator {
             dst_peer_url,
             src_backend: DEFAULT_BACKEND.to_string(),
             dst_backend: DEFAULT_BACKEND.to_string(),
-            copy: false,
+            // copy=true: keep the prefix on the source after the push and let
+            // its LRU evict naturally. copy=false makes move() remove the source
+            // chunks immediately; under group-sticky routing many concurrent
+            // migrations share the same prefix (e.g. the SWE-agent system
+            // prompt), so racing removals double-free shared MemoryObjs and trip
+            // the forced-eviction KeyError path. The destination re-prefills at
+            // worst; it never depends on the source dropping its copy.
+            copy: true,
         };
 
         match self.config.transfer_mode {
@@ -185,7 +192,7 @@ impl KvTransferCoordinator {
 
         match outcome {
             Ok(Ok(resp)) if resp.success => {
-                debug!(
+                info!(
                     src = src.url(),
                     num_tokens = resp.num_tokens,
                     "KV transfer succeeded"
@@ -270,13 +277,23 @@ impl KvTransferCoordinator {
 }
 
 /// Read the LMCache destination addressing from a worker's registration labels.
+///
+/// Only `lmcache_instance_id` is required: the source instance's servicer
+/// resolves the real per-rank peer URLs from its own broadcast registry, keyed
+/// by this id. `lmcache_peer_url` is an optional single-rank fallback seed,
+/// consumed only when the destination is absent from that registry (e.g. an
+/// instance added after the broadcast); when missing we pass an empty string,
+/// which the servicer treats as "no seed, use the registry".
 fn destination_endpoint(dst: &Arc<dyn Worker>) -> Option<(String, String)> {
     let labels = &dst.metadata().spec.labels;
     let instance_id = labels.get(LABEL_LMCACHE_INSTANCE_ID)?.clone();
-    let peer_url = labels.get(LABEL_LMCACHE_PEER_URL)?.clone();
-    if instance_id.is_empty() || peer_url.is_empty() {
+    if instance_id.is_empty() {
         return None;
     }
+    let peer_url = labels
+        .get(LABEL_LMCACHE_PEER_URL)
+        .cloned()
+        .unwrap_or_default();
     Some((instance_id, peer_url))
 }
 
@@ -328,11 +345,12 @@ mod tests {
     }
 
     #[test]
-    fn destination_endpoint_missing_labels_is_none() {
+    fn destination_endpoint_requires_only_instance_id() {
+        // Missing instance_id (the only required label) → None.
         let dst = worker_with_labels("http://b:8000", HashMap::new());
         assert_eq!(destination_endpoint(&dst), None);
 
-        // Empty values are treated as missing.
+        // Empty instance_id is treated as missing.
         let mut labels = HashMap::new();
         labels.insert(LABEL_LMCACHE_INSTANCE_ID.to_string(), String::new());
         labels.insert(
@@ -341,6 +359,19 @@ mod tests {
         );
         let dst = worker_with_labels("http://b:8000", labels);
         assert_eq!(destination_endpoint(&dst), None);
+
+        // instance_id present but peer_url absent → Some with empty seed. The
+        // servicer resolves the real per-rank URLs from its broadcast registry.
+        let mut labels = HashMap::new();
+        labels.insert(
+            LABEL_LMCACHE_INSTANCE_ID.to_string(),
+            "psrl_instance_7".to_string(),
+        );
+        let dst = worker_with_labels("http://b:8000", labels);
+        assert_eq!(
+            destination_endpoint(&dst),
+            Some(("psrl_instance_7".to_string(), String::new()))
+        );
     }
 
     #[test]

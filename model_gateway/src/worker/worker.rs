@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::HashMap,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -212,6 +213,30 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Decrement the load counter
     fn decrement_load(&self);
+
+    /// Register an admission's token estimate and return its admission id.
+    ///
+    /// Paired with [`Worker::unregister_inflight_tokens`] by `WorkerLoadGuard`
+    /// so the inflight-token lifecycle matches the load counter (post-commit
+    /// increment, drop-time decrement, loopback-aware). Default no-op for
+    /// worker types that don't track engine token load.
+    fn register_inflight_tokens(&self, _token_estimate: usize) -> u64 {
+        0
+    }
+
+    /// Remove a previously-registered admission token estimate.
+    fn unregister_inflight_tokens(&self, _id: u64) {}
+
+    /// Sum of all outstanding inflight token estimates not yet reflected in an
+    /// engine snapshot. Used by load-aware policies as an optimistic delta on
+    /// top of the engine token base.
+    fn inflight_tokens_sum(&self) -> usize {
+        0
+    }
+
+    /// Clear all inflight token estimates because a fresh engine snapshot now
+    /// incorporates the corresponding requests (agreement-gated rebase).
+    fn rebase_inflight_tokens(&self) {}
 
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
@@ -619,6 +644,26 @@ pub struct WorkerRuntime {
     load_counter: AtomicUsize,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
+    /// Per-admission token estimates for requests routed but not yet reflected
+    /// in an engine-stats snapshot.
+    ///
+    /// Keyed by a monotonically-increasing admission id (see `inflight_seq`).
+    /// A request's prompt+budget token estimate is inserted when its
+    /// `WorkerLoadGuard` is created (post-commit, in the execution stage) and
+    /// removed when the guard drops (request departs — completion *or*
+    /// partial-rollout loopback). Summed on demand by load-aware policies and
+    /// added on top of the engine token base, so routing decisions made
+    /// between snapshots account for just-admitted requests.
+    ///
+    /// Rebased (cleared) by `rebase_inflight_tokens` when an engine snapshot
+    /// arrives whose queue size agrees with `load_counter`: at that point the
+    /// snapshot already incorporates every admitted request, so the local
+    /// estimates are absorbed and must not be double-counted. A subsequent
+    /// guard drop whose entry was already cleared is a harmless no-op (the map
+    /// `remove` simply finds nothing).
+    inflight_tokens: parking_lot::Mutex<HashMap<u64, usize>>,
+    /// Monotonic source of admission ids for `inflight_tokens` keys.
+    inflight_seq: AtomicU64,
     revision: AtomicU64,
     engine_stats: ArcSwap<EngineStats>,
     engine_stats_timestamp_ms: AtomicU64,
@@ -637,6 +682,8 @@ impl WorkerRuntime {
             load_counter: AtomicUsize::new(0),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
+            inflight_tokens: parking_lot::Mutex::new(HashMap::new()),
+            inflight_seq: AtomicU64::new(0),
             revision: AtomicU64::new(0),
             engine_stats: ArcSwap::from_pointee(EngineStats::default()),
             engine_stats_timestamp_ms: AtomicU64::new(0),
@@ -712,6 +759,38 @@ impl WorkerRuntime {
                 current.checked_sub(1)
             })
             .is_ok()
+    }
+
+    // ── Inflight token estimates ─────────────────────────────────────
+
+    /// Register an admission's token estimate and return its admission id.
+    ///
+    /// Called from `WorkerLoadGuard::new` (post-commit) so the lifecycle
+    /// matches `load_counter`. `token_estimate == 0` still registers an entry
+    /// so the id round-trips cleanly through `unregister_inflight_tokens`.
+    pub fn register_inflight_tokens(&self, token_estimate: usize) -> u64 {
+        let id = self.inflight_seq.fetch_add(1, Ordering::Relaxed);
+        self.inflight_tokens.lock().insert(id, token_estimate);
+        id
+    }
+
+    /// Remove a previously-registered admission entry (guard drop).
+    ///
+    /// A no-op when the entry was already cleared by `rebase_inflight_tokens`,
+    /// which is the expected case once a fresh snapshot has absorbed it.
+    pub fn unregister_inflight_tokens(&self, id: u64) {
+        self.inflight_tokens.lock().remove(&id);
+    }
+
+    /// Sum of all outstanding inflight token estimates.
+    pub fn inflight_tokens_sum(&self) -> usize {
+        self.inflight_tokens.lock().values().copied().sum()
+    }
+
+    /// Clear all inflight token estimates because a fresh engine snapshot now
+    /// incorporates the corresponding requests (agreement-gated rebase).
+    pub fn rebase_inflight_tokens(&self) {
+        self.inflight_tokens.lock().clear();
     }
 
     // ── Routing-key load ────────────────────────────────────────────
@@ -1019,6 +1098,22 @@ impl Worker for BasicWorker {
         self.update_running_requests_metrics();
     }
 
+    fn register_inflight_tokens(&self, token_estimate: usize) -> u64 {
+        self.runtime.load().register_inflight_tokens(token_estimate)
+    }
+
+    fn unregister_inflight_tokens(&self, id: u64) {
+        self.runtime.load().unregister_inflight_tokens(id);
+    }
+
+    fn inflight_tokens_sum(&self) -> usize {
+        self.runtime.load().inflight_tokens_sum()
+    }
+
+    fn rebase_inflight_tokens(&self) {
+        self.runtime.load().rebase_inflight_tokens();
+    }
+
     fn routing_key_load(&self) -> usize {
         self.runtime.load().routing_key_load()
     }
@@ -1226,6 +1321,11 @@ impl Worker for BasicWorker {
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,
     routing_key: Option<String>,
+    /// Admission id for the worker's inflight-token map, when this guard
+    /// registered a token estimate (see [`WorkerLoadGuard::with_inflight_tokens`]).
+    /// `None` for guards created via [`WorkerLoadGuard::new`], which only track
+    /// the request-count load.
+    inflight_id: Option<u64>,
 }
 
 impl WorkerLoadGuard {
@@ -1241,6 +1341,56 @@ impl WorkerLoadGuard {
         Self {
             worker,
             routing_key,
+            inflight_id: None,
+        }
+    }
+
+    /// Like [`WorkerLoadGuard::new`] but also registers an admit-time token
+    /// estimate in the worker's inflight-token map. The estimate is removed
+    /// when the guard drops, mirroring the load-counter lifecycle (post-commit
+    /// increment, drop-time decrement, partial-rollout-loopback aware).
+    pub fn with_inflight_tokens(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        token_estimate: usize,
+    ) -> Self {
+        worker.increment_load();
+
+        let routing_key = extract_routing_key(headers).map(String::from);
+        if let Some(ref key) = routing_key {
+            worker.increment_routing_key_load(key);
+        }
+
+        let inflight_id = Some(worker.register_inflight_tokens(token_estimate));
+
+        Self {
+            worker,
+            routing_key,
+            inflight_id,
+        }
+    }
+
+    /// Like [`WorkerLoadGuard::with_inflight_tokens`] but skips the initial
+    /// `increment_load()` — load was already incremented atomically inside
+    /// the worker selector (see `NaiveWorkerSelector`/`PsrlWorkerSelector`)
+    /// to close the TOCTOU window where all concurrent dispatch tasks read
+    /// equal loads and pick the same worker. All other bookkeeping (routing
+    /// key, inflight tokens) and the full decrement on drop are unchanged.
+    pub fn from_pre_incremented(
+        worker: Arc<dyn Worker>,
+        headers: Option<&http::HeaderMap>,
+        token_estimate: Option<usize>,
+    ) -> Self {
+        // increment_load() intentionally omitted — already done atomically.
+        let routing_key = extract_routing_key(headers).map(String::from);
+        if let Some(ref key) = routing_key {
+            worker.increment_routing_key_load(key);
+        }
+        let inflight_id = token_estimate.map(|tokens| worker.register_inflight_tokens(tokens));
+        Self {
+            worker,
+            routing_key,
+            inflight_id,
         }
     }
 }
@@ -1250,6 +1400,9 @@ impl Drop for WorkerLoadGuard {
         self.worker.decrement_load();
         if let Some(ref key) = self.routing_key {
             self.worker.decrement_routing_key_load(key);
+        }
+        if let Some(id) = self.inflight_id {
+            self.worker.unregister_inflight_tokens(id);
         }
     }
 }

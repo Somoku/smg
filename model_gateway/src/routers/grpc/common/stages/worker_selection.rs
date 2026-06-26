@@ -13,7 +13,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            context::{RequestContext, WorkerSelection},
+            context::{LoadGuards, RequestContext, WorkerSelection},
             routing_loop::metadata::parse_routing_request_meta_from_context,
         },
     },
@@ -140,7 +140,37 @@ impl PipelineStage for WorkerSelectionStage {
             }
         };
 
+        // Capture the admit-time token estimate while `preparation` is still
+        // present (request_building consumes it via `.take()` before the
+        // execution stage runs). Prompt tokens + response-tokens-so-far gives
+        // the request's current token footprint; the execution stage feeds it
+        // into the worker's inflight-token counter when minting LoadGuards so
+        // load-aware policies account for just-admitted requests between
+        // engine snapshots. Computed before the mutable `ctx.state.workers`
+        // write so the immutable `ids`/`ctx` borrows end first.
+        let response_so_far = parse_routing_request_meta_from_context(ctx)
+            .and_then(|meta| meta.response_token_count)
+            .unwrap_or(0);
+        let admit_token_estimate = ids.len() + response_so_far;
+
         ctx.state.workers = Some(workers);
+        ctx.state.admit_token_estimate = Some(admit_token_estimate);
+        // Use from_pre_incremented for Regular mode: the selector already
+        // called increment_load() atomically with select_worker() to prevent
+        // the TOCTOU race. For PD mode the load was not pre-incremented, so
+        // it falls through to with_token_estimate via the else branch below.
+        ctx.state.load_guards = Some(match &self.inner {
+            WorkerSelectionMode::Regular { .. } => LoadGuards::from_pre_incremented(
+                ctx.state.workers.as_ref().unwrap(),
+                ctx.input.headers.as_ref(),
+                ctx.state.admit_token_estimate,
+            ),
+            WorkerSelectionMode::PrefillDecode { .. } => LoadGuards::with_token_estimate(
+                ctx.state.workers.as_ref().unwrap(),
+                ctx.input.headers.as_ref(),
+                ctx.state.admit_token_estimate,
+            ),
+        });
         Ok(None)
     }
 

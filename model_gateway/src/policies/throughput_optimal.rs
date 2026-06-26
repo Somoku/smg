@@ -8,19 +8,38 @@
 //! 3. Estimates the marginal throughput gain of routing the next request to
 //!    each worker and selects the worker with the largest gain.
 //!
+//! ## In-flight accounting
+//!
+//! Request and running counts come from [`Worker::load`] — the per-worker load
+//! counter maintained by [`WorkerLoadGuard`] (post-commit increment, drop-time
+//! decrement, partial-rollout-loopback aware, on both transports). This is the
+//! exact analogue of psrl_agent's persistent `instance_to_request_num`: a
+//! single counter that needs no snapshot reconciliation because the guard
+//! lifecycle is exact.
+//!
+//! Token load is different: a request's KV footprint *grows* during decode, so
+//! only the engine snapshot knows the true current token count. The runtime
+//! therefore uses the engine snapshot as the token base and adds
+//! [`Worker::inflight_tokens_sum`] — the sum of admit-time token estimates for
+//! requests not yet reflected in a snapshot. Those estimates are cleared
+//! (rebased) by the worker-stats update path once a snapshot's request count
+//! agrees with the load counter, exactly mirroring psrl_agent's `is_staled`
+//! count-agreement gate. There is no unconditional per-snapshot reset.
+//!
 //! ## Budget variant
 //!
 //! [`ThroughputOptimalWithBudgetPolicy`] accounts for KV-cache page
 //! granularity by rounding response tokens up to the nearest multiple of
 //! `request_budget` when computing the current token load of each worker
 //! (via [`EngineStats::token_num_with_budget`]).
+//!
+//! [`Worker::load`]: crate::worker::Worker::load
+//! [`Worker::inflight_tokens_sum`]: crate::worker::Worker::inflight_tokens_sum
+//! [`WorkerLoadGuard`]: crate::worker::WorkerLoadGuard
 
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
 };
 
 use tracing::{error, warn};
@@ -37,30 +56,6 @@ use crate::worker::Worker;
 
 // One-shot guard for missing-tokens warning
 static REPORTED_MISSING_TOKENS: AtomicBool = AtomicBool::new(false);
-
-// ---------------------------------------------------------------------------
-// Local state for optimistic local tracking
-// ---------------------------------------------------------------------------
-
-/// Per-worker delta state maintained locally by the policy to compensate for
-/// the lag between routing a request and receiving the next engine-stats snapshot.
-///
-/// When a request is routed to a worker the policy immediately adds the token
-/// count and increments the running-request counter.  When the request
-/// completes, the same amounts are subtracted.  When fresh engine stats arrive
-/// (via [`ThroughputRuntime::reset_delta`]) the delta is zeroed because the
-/// engine snapshot already incorporates the request.
-///
-/// This keeps routing decisions aware of requests admitted after the latest
-/// engine snapshot, so concurrent selection does not repeatedly choose the same
-/// stale-low-load worker.
-#[derive(Debug, Default, Clone)]
-struct WorkerLocalDeltaState {
-    /// Extra tokens not yet reflected in the latest engine snapshot.
-    tokens: i64,
-    /// Extra running requests not yet reflected in the latest engine snapshot.
-    running_requests: i64,
-}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -97,12 +92,6 @@ pub struct ThroughputOptimalConfig {
 struct ThroughputRuntime {
     cfg: ThroughputOptimalConfig,
     cost_model: CostModel,
-    /// Per-worker optimistic delta state, keyed by worker URL.
-    ///
-    /// Guards against the lag between routing decisions and engine-stats
-    /// snapshots: incremented on route, decremented on completion, reset to
-    /// zero when a fresh snapshot arrives.
-    local_delta: Mutex<HashMap<String, WorkerLocalDeltaState>>,
 }
 
 impl ThroughputRuntime {
@@ -113,11 +102,7 @@ impl ThroughputRuntime {
                 cfg.cost_model_path, e
             )
         })?;
-        Ok(Self {
-            cfg,
-            cost_model,
-            local_delta: Mutex::new(HashMap::new()),
-        })
+        Ok(Self { cfg, cost_model })
     }
 
     // ── Label helpers ────────────────────────────────────────────────────
@@ -190,37 +175,22 @@ impl ThroughputRuntime {
         worker.engine_stats().waiting_queue_size() as i64
     }
 
+    /// In-flight request count: the persistent load counter, which already
+    /// includes requests admitted since the last snapshot and excludes
+    /// completed/looped-back ones (maintained by `WorkerLoadGuard`).
     #[inline]
-    fn current_queue(&self, worker: &Arc<dyn Worker>) -> i64 {
-        let stats = worker.engine_stats();
-        let engine_queue = stats.waiting_and_running_queue_size() as i64;
-        // Add locally-tracked pending requests that haven't appeared in the
-        // engine snapshot yet.  These are the requests routed since the last
-        // snapshot (optimistic delta).
-        let pending = self
-            .local_delta
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(worker.url())
-            .map(|d| d.running_requests)
-            .unwrap_or(0)
-            .max(0);
-        engine_queue + pending
+    fn current_queue(worker: &Arc<dyn Worker>) -> i64 {
+        worker.load() as i64
     }
 
+    /// Running-request count used by the cost model. We use the load counter as
+    /// the running estimate: it is the exact count of requests currently
+    /// assigned to the instance, which is what the cost model's concurrency
+    /// term needs. (Unlike token load, request count does not require an engine
+    /// base because the guard lifecycle is exact.)
     #[inline]
-    fn current_running(&self, worker: &Arc<dyn Worker>) -> i64 {
-        let stats = worker.engine_stats();
-        let engine_running = stats.running_queue_size() as i64;
-        let pending = self
-            .local_delta
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(worker.url())
-            .map(|d| d.running_requests)
-            .unwrap_or(0)
-            .max(0);
-        engine_running + pending
+    fn current_running(worker: &Arc<dyn Worker>) -> i64 {
+        worker.load() as i64
     }
 
     #[inline]
@@ -252,18 +222,13 @@ impl ThroughputRuntime {
             0
         };
 
-        // Add locally-tracked pending tokens that haven't appeared in the
-        // engine snapshot yet.
-        let pending_tokens = self
-            .local_delta
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(worker.url())
-            .map(|d| d.tokens)
-            .unwrap_or(0)
-            .max(0);
+        // Add inflight token estimates for requests admitted since the last
+        // snapshot. The worker-stats update path rebases (clears) these once a
+        // snapshot's request count agrees with the load counter, so this never
+        // double-counts a request the engine base already reflects.
+        let inflight_tokens = worker.inflight_tokens_sum() as i64;
 
-        engine_tokens + pending_tokens
+        engine_tokens + inflight_tokens
     }
 
     #[inline]
@@ -340,10 +305,6 @@ impl ThroughputRuntime {
         //
         // When `info.priority_groups` is `None` all healthy workers are treated
         // as a single group, preserving the existing behaviour exactly.
-        //
-        // TODO(psrl-refactor): priority_groups is populated by the psrl worker
-        //   selection path from `route_kwargs.candidate_indicator_list`.
-        //   See psrl-refactor branch commits 100658fe and 2eebc614.
         let groups: Vec<Vec<usize>> = if let Some(priority_groups) = info.priority_groups {
             let mut priority_map: std::collections::BTreeMap<i64, Vec<usize>> =
                 std::collections::BTreeMap::new();
@@ -358,13 +319,8 @@ impl ThroughputRuntime {
 
         // Iterate groups in priority order.  Each group computes its own
         // baseline so that the threshold is relative to the workers in that
-        // group rather than the entire pool (fixes diff 5 — per-group baseline).
+        // group rather than the entire pool (per-group baseline).
         for group in &groups {
-            // Per-group baseline: throughput estimate for 1 request and
-            // req_tokens tokens using the first worker that has a cost-model
-            // entry.  In homogeneous clusters (same TP/PP) this equals the
-            // cluster-wide baseline; in heterogeneous clusters it gives a
-            // group-local reference point.
             let baseline = group
                 .iter()
                 .find_map(|&idx| self.estimate_throughput(&workers[idx], 1, req_tokens))
@@ -377,22 +333,20 @@ impl ThroughputRuntime {
             for &idx in group {
                 let worker = &workers[idx];
 
-                // Capacity check (current_queue includes optimistic local delta).
-                if self.current_queue(worker) as usize >= self.cfg.max_concurrent_seqs_per_instance
+                // Capacity check (load counter = in-flight request count).
+                if Self::current_queue(worker) as usize >= self.cfg.max_concurrent_seqs_per_instance
                 {
                     continue;
                 }
 
-                // KV-cache space check (current_token_num includes optimistic
-                // local delta).
+                // KV-cache space check (engine token base + inflight estimates).
                 let token_num = self.current_token_num(worker, use_budget);
                 if !self.can_run_directly(worker, req_tokens, token_num) {
                     continue;
                 }
 
-                // Marginal throughput gain estimate (current_running includes
-                // optimistic local delta).
-                let running = self.current_running(worker);
+                // Marginal throughput gain estimate.
+                let running = Self::current_running(worker);
                 let curr = match self.estimate_throughput(worker, running, token_num) {
                     Some(t) => t,
                     None => continue,
@@ -410,11 +364,13 @@ impl ThroughputRuntime {
                 }
             }
 
-            // If this group yielded an eligible worker, apply the optimistic
-            // delta and return immediately without falling through to a lower-
-            // priority group.
+            // If this group yielded an eligible worker, return it without
+            // falling through to a lower-priority group. No optimistic delta is
+            // applied here — the worker's load counter and inflight-token map
+            // are updated by the `WorkerLoadGuard` minted post-commit in the
+            // execution stage, so the bookkeeping lifecycle is owned by the
+            // request path rather than the selection call.
             if let Some(idx) = best_idx.filter(|_| best_delta >= threshold) {
-                self.apply_delta(workers[idx].url(), req_tokens, 1);
                 return Some(idx);
             }
 
@@ -422,38 +378,6 @@ impl ThroughputRuntime {
         }
 
         None
-    }
-
-    // ── Local-state helpers ─────────────────────────────────────────────
-
-    /// Add `token_delta` tokens and `running_delta` running requests to the
-    /// local optimistic state for the given worker URL.
-    fn apply_delta(&self, worker_url: &str, token_delta: i64, running_delta: i64) {
-        let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = guard.entry(worker_url.to_string()).or_default();
-        entry.tokens += token_delta;
-        entry.running_requests += running_delta;
-    }
-
-    /// Subtract `token_delta` tokens and `running_delta` running requests from
-    /// the local optimistic state for the given worker URL.  Clamps to zero to
-    /// guard against any accounting asymmetry.
-    fn subtract_delta(&self, worker_url: &str, token_delta: i64, running_delta: i64) {
-        let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get_mut(worker_url) {
-            entry.tokens = (entry.tokens - token_delta).max(0);
-            entry.running_requests = (entry.running_requests - running_delta).max(0);
-        }
-    }
-
-    /// Reset the local delta for `worker_url` to zero because a fresh engine
-    /// snapshot has just been applied and the snapshot already incorporates
-    /// any previously-routed requests.
-    fn reset_delta(&self, worker_url: &str) {
-        let mut guard = self.local_delta.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get_mut(worker_url) {
-            *entry = WorkerLocalDeltaState::default();
-        }
     }
 }
 
@@ -490,23 +414,12 @@ impl LoadBalancingPolicy for ThroughputOptimalPolicy {
         self.rt.select_worker(workers, info, false)
     }
 
-    fn on_request_complete_with_tokens(
-        &self,
-        worker_url: &str,
-        token_delta: Option<i64>,
-        _success: bool,
-    ) {
-        if let Some(delta) = token_delta {
-            self.rt.subtract_delta(worker_url, delta, 1);
-        }
-    }
-
-    fn on_engine_stats_updated(&self, worker_url: &str) {
-        self.rt.reset_delta(worker_url);
-    }
-
     fn name(&self) -> &'static str {
         "throughput_optimal"
+    }
+
+    fn needs_load_guard(&self) -> bool {
+        true // routes on worker.load() + inflight_tokens_sum()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -554,23 +467,12 @@ impl LoadBalancingPolicy for ThroughputOptimalWithBudgetPolicy {
         self.rt.select_worker(workers, info, true)
     }
 
-    fn on_request_complete_with_tokens(
-        &self,
-        worker_url: &str,
-        token_delta: Option<i64>,
-        _success: bool,
-    ) {
-        if let Some(delta) = token_delta {
-            self.rt.subtract_delta(worker_url, delta, 1);
-        }
-    }
-
-    fn on_engine_stats_updated(&self, worker_url: &str) {
-        self.rt.reset_delta(worker_url);
-    }
-
     fn name(&self) -> &'static str {
         "throughput_optimal_with_budget"
+    }
+
+    fn needs_load_guard(&self) -> bool {
+        true // routes on worker.load() + inflight_tokens_sum()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

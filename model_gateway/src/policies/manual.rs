@@ -225,6 +225,13 @@ impl LoadBalancingPolicy for ManualPolicy {
         "manual"
     }
 
+    fn needs_load_guard(&self) -> bool {
+        // `min_load` fallback selection depends on the load being tracked;
+        // preserves the historical behaviour where `manual` was in the HTTP
+        // router's load-guard allow-list.
+        true
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }

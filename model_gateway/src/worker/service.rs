@@ -517,14 +517,20 @@ impl WorkerService {
                     let dp_rank = item.dp_rank;
                     let outcome = worker.update_engine_stats(item.stats, staleness_threshold_ms);
 
-                    // Notify stateful policies that a fresh snapshot has
-                    // been applied so they can reset their optimistic local delta.
-                    if matches!(outcome, EngineStatsUpdateOutcome::Applied) {
-                        if let Some(ref pr) = self.policy_registry {
-                            for policy in pr.get_all_stateful_policies() {
-                                policy.on_engine_stats_updated(&url);
-                            }
-                        }
+                    // Agreement-gated rebase of the worker's inflight-token
+                    // estimates. When a fresh snapshot's request count agrees
+                    // with the locally-tracked load counter, the engine has
+                    // caught up to every admitted request, so the snapshot's
+                    // token totals already incorporate them — clear the local
+                    // estimates to avoid double-counting. When they disagree
+                    // (requests still in transit to the engine), keep the
+                    // estimates so load-aware policies still see them. This
+                    // mirrors psrl_agent's `is_staled` count-agreement gate and
+                    // replaces the old unconditional optimistic-delta reset.
+                    if matches!(outcome, EngineStatsUpdateOutcome::Applied)
+                        && worker.engine_stats().waiting_and_running_queue_size() == worker.load()
+                    {
+                        worker.rebase_inflight_tokens();
                     }
 
                     results.push(Self::build_stats_update_result(

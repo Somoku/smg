@@ -18,6 +18,10 @@ use crate::{
 pub(crate) struct NaiveWorkerSelector {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
+    /// Guards the "find minimum-load worker + increment its load" step so that
+    /// concurrent dispatch tasks cannot all read equal loads and pick the same
+    /// worker before any guard has been created (TOCTOU race).
+    selection_lock: parking_lot::Mutex<()>,
 }
 
 impl NaiveWorkerSelector {
@@ -28,6 +32,7 @@ impl NaiveWorkerSelector {
         Self {
             worker_registry,
             policy_registry,
+            selection_lock: parking_lot::Mutex::new(()),
         }
     }
 }
@@ -72,19 +77,26 @@ impl WorkerSelectorStrategy for NaiveWorkerSelector {
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        // Select worker using the policy
-        let idx = policy.select_worker(
-            &available,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-                priority_groups: None,
-                response_token_count: None,
-            },
-        )?;
-        let selected = available[idx].clone();
+        // Atomically select worker and increment its load to prevent TOCTOU.
+        // All N concurrent dispatch tasks call select_worker simultaneously;
+        // without the lock they all read load=0 and all pick the same worker
+        // (stable tie-break on equal loads → always index 0).
+        let selected = {
+            let _lock = self.selection_lock.lock();
+            let idx = policy.select_worker(
+                &available,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring,
+                    priority_groups: None,
+                    response_token_count: None,
+                },
+            )?;
+            available[idx].increment_load();
+            available[idx].clone()
+        };
 
         // Record worker selection metric
         Metrics::record_worker_selection(

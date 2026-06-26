@@ -10,7 +10,7 @@ use crate::{
         error,
         grpc::{
             context::{
-                ClientSelection, ExecutionResult, LoadGuards, RequestContext, WorkerSelection,
+                ClientSelection, ExecutionResult, RequestContext, WorkerSelection,
             },
             proto_wrapper::{ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoStream},
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
@@ -87,8 +87,6 @@ impl PipelineStage for RequestExecutionStage {
                 "Worker selection not completed",
             )
         })?;
-
-        ctx.state.load_guards = Some(LoadGuards::new(workers, ctx.input.headers.as_ref()));
 
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();

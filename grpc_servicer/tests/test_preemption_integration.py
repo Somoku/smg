@@ -8,6 +8,7 @@ from smg_grpc_proto import vllm_engine_pb2
 
 from smg_grpc_servicer.vllm.preemption import PreemptionStatLogger
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+from vllm.outputs import STREAM_FINISHED
 
 
 def _make_stats(req_ids):
@@ -79,16 +80,144 @@ async def test_subscribe_terminates_on_cancellation():
 @pytest.mark.asyncio
 async def test_generate_admission_close_waits_for_registered_requests():
     servicer = VllmEngineServicer(MagicMock(), start_time=time.time())
-    assert servicer._begin_generate_admission()
+    assert servicer.begin_generate_admission()
 
     close_task = asyncio.create_task(servicer.close_generate_admission())
     await asyncio.sleep(0)
     assert not close_task.done()
-    assert not servicer._begin_generate_admission()
+    assert not servicer.begin_generate_admission()
 
-    servicer._finish_generate_admission()
+    servicer.finish_generate_admission()
     await close_task
 
     await servicer.open_generate_admission()
-    assert servicer._begin_generate_admission()
-    servicer._finish_generate_admission()
+    assert servicer.begin_generate_admission()
+    servicer.finish_generate_admission()
+
+
+def _make_park_servicer():
+    """Build a servicer whose engine.add_request is mocked, suitable for
+    driving the Generate() park path with a `text` input (bypasses renderer)."""
+    mock_llm = MagicMock()
+
+    # add_request returns an output_collector that finishes immediately.
+    async def _add_request(**kwargs):
+        collector = MagicMock()
+        collector.request_id = kwargs["request_id"]
+        collector.get_nowait.return_value = STREAM_FINISHED
+        collector.close = MagicMock()
+        return collector
+
+    mock_llm.add_request = MagicMock(side_effect=_add_request)
+    servicer = VllmEngineServicer(mock_llm, start_time=time.time())
+    # Stub the proto→params converters so we don't depend on real vLLM types.
+    servicer._sampling_params_from_proto = MagicMock(
+        return_value=MagicMock(logprobs=None, prompt_logprobs=None)
+    )
+    servicer._tokenization_kwargs_from_proto = MagicMock(return_value={})
+    return servicer, mock_llm
+
+
+def _make_text_request(request_id="req-park"):
+    req = vllm_engine_pb2.GenerateRequest(request_id=request_id, text="hello", stream=False)
+    return req
+
+
+def _make_generate_context():
+    ctx = MagicMock()
+
+    async def _send_initial_metadata(_md):
+        return None
+
+    ctx.send_initial_metadata = MagicMock(side_effect=_send_initial_metadata)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_generate_parks_until_resume():
+    """A Generate call arriving while the resume event is cleared must park:
+    it sends initial metadata but does not call add_request until resumed."""
+    servicer, mock_llm = _make_park_servicer()
+    servicer.pause_generation_admission()  # clear resume event (engine paused)
+
+    ctx = _make_generate_context()
+    gen = servicer.Generate(_make_text_request(), ctx)
+    step = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0)  # let it run up to the park
+
+    # Parked: initial metadata sent, but add_request NOT called yet.
+    assert ctx.send_initial_metadata.called
+    assert not mock_llm.add_request.called
+    assert not step.done()
+
+    # Resume → parked request proceeds to add_request and completes.
+    servicer.resume_generation_admission()
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(step, timeout=1.0)
+        await gen.__anext__()
+    assert mock_llm.add_request.called
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_park_does_not_block_admission_drain():
+    """A parked request must not hold the admission counter, so
+    close_generate_admission() completes immediately."""
+    servicer, _ = _make_park_servicer()
+    servicer.pause_generation_admission()
+
+    ctx = _make_generate_context()
+    gen = servicer.Generate(_make_text_request(), ctx)
+    step = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0)  # park
+
+    # Drain must not block (parked request released/never took the counter).
+    await asyncio.wait_for(servicer.close_generate_admission(), timeout=1.0)
+
+    # Cleanup: cancel the parked request.
+    step.cancel()
+    with pytest.raises((asyncio.CancelledError, StopAsyncIteration)):
+        await step
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_fail_sync_unblocks_parked_with_abort():
+    """fail_generation_admission() wakes a parked request, which aborts
+    (finish_reason='abort') without ever calling add_request."""
+    servicer, mock_llm = _make_park_servicer()
+    servicer.pause_generation_admission()
+
+    ctx = _make_generate_context()
+    gen = servicer.Generate(_make_text_request(), ctx)
+    step = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0)  # park
+
+    servicer.fail_generation_admission()  # sync failed → wake with failed flag
+    resp = await asyncio.wait_for(step, timeout=1.0)
+    assert resp.complete.finish_reason == "abort"
+    assert not mock_llm.add_request.called
+    await gen.aclose()
+
+
+@pytest.mark.asyncio
+async def test_park_cancellation_clean():
+    """Cancelling a parked request leaks no admission counter and does not
+    call engine.abort (no output_collector yet)."""
+    servicer, mock_llm = _make_park_servicer()
+    mock_llm.abort = MagicMock()
+    servicer.pause_generation_admission()
+
+    ctx = _make_generate_context()
+    gen = servicer.Generate(_make_text_request(), ctx)
+    step = asyncio.ensure_future(gen.__anext__())
+    await asyncio.sleep(0)  # park
+
+    step.cancel()
+    with pytest.raises((asyncio.CancelledError, StopAsyncIteration)):
+        await step
+    await gen.aclose()
+
+    # No counter leak: a fresh admission cycle drains immediately.
+    assert servicer.active_generate_admissions == 0
+    assert not mock_llm.abort.called

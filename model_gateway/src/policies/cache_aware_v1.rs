@@ -1,5 +1,23 @@
 /*
-    Cache-Aware Load Balancing Router
+    Cache-Aware Load Balancing Router (v1)
+
+    A copy of `cache_aware` with one behavioural change: every load comparison
+    reads the per-worker in-flight counter `worker.load()` instead of the engine
+    snapshot `engine_stats().waiting_and_running_queue_size()`.
+
+    The original `cache_aware` is internally inconsistent: its imbalance gate
+    reads `worker.load()` while its min-load fallback and tie-breaks read the
+    engine snapshot. Those two signals disagree between ZMQ pushes, so the
+    policy can judge the cluster "balanced" on one metric and then optimise the
+    other. This v1 uses `worker.load()` everywhere — imbalance detection,
+    min-load fallback, and all tie-breaks — so the balance verdict and the
+    selection are always made against the same number. `worker.load()` is
+    maintained by `WorkerLoadGuard` (incremented post-commit, decremented on
+    completion *or* partial-rollout loopback, on both transports), so it never
+    goes stale between snapshots and lets concurrent selections in one
+    routing-loop batch see each other immediately. Everything else (event-driven
+    indexer, mesh sync, hash index, the three affinity tiers below) is unchanged
+    and will be iterated on separately.
 
     When load is balanced, uses cache-aware routing. When imbalanced, uses
     shortest-queue. A system is imbalanced when both:
@@ -47,13 +65,12 @@ use dashmap::DashMap;
 use kv_index::{compute_request_content_hashes, Tier, TieredIndexer, TokenTree, Tree};
 use parking_lot::RwLock;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use smg_mesh::{OptionalMeshSyncManager, TreeInsertOp, TreeKey, TreeOperation};
 use tracing::{debug, warn};
 
 use super::{
     get_healthy_worker_indices, normalize_model_key, utils::PeriodicTask, CacheAwareConfig,
-    LoadBalancingPolicy, SelectWorkerInfo,
+    LoadBalancingPolicy, SelectWorkerInfo, TreeHandle, TreeKind,
 };
 use crate::{
     mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage},
@@ -72,7 +89,7 @@ use crate::{
 /// - HTTP requests use StringTree (character-based prefix matching)
 /// - gRPC requests use TokenTree (token-based prefix matching, page-aligned)
 #[derive(Debug)]
-pub struct CacheAwarePolicy {
+pub struct CacheAwareV1Policy {
     config: CacheAwareConfig,
     /// String-based trees for HTTP connections (text input)
     string_trees: Arc<DashMap<String, Arc<Tree>>>,
@@ -103,7 +120,7 @@ pub struct CacheAwarePolicy {
     hash_index: Arc<DashMap<String, PerModelHashIndex>>,
 }
 
-/// Per-model inner container for [`CacheAwarePolicy::hash_index`].
+/// Per-model inner container for [`CacheAwareV1Policy::hash_index`].
 /// Keeping both kinds in one struct per model makes the
 /// "separate model-scoped hash indexes for string and token
 /// trees" invariant from spec §7.1 explicit in the type.
@@ -115,7 +132,7 @@ struct PerModelHashIndex {
     token_tree: DashMap<u64, Vec<u32>>,
 }
 
-impl CacheAwarePolicy {
+impl CacheAwareV1Policy {
     pub fn new() -> Self {
         Self::with_config(CacheAwareConfig::default())
     }
@@ -622,7 +639,7 @@ impl CacheAwarePolicy {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let worker_loads: Vec<(&str, usize)> = workers
                 .iter()
-                .map(|w| (w.url(), w.engine_stats().waiting_and_running_queue_size()))
+                .map(|w| (w.url(), w.load()))
                 .collect();
             debug!("Load balancing triggered | workers: {:?}", worker_loads);
         }
@@ -630,7 +647,7 @@ impl CacheAwarePolicy {
         // Use shortest queue when imbalanced
         let min_load_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
+            .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
 
         let worker_url = workers[min_load_idx].url();
@@ -703,61 +720,10 @@ impl CacheAwarePolicy {
 }
 
 /// Which of the two local trees a hash query targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TreeKind {
-    String,
-    Token,
-}
-
-/// Handle the policy exposes so mesh-adjacent consumers can apply
-/// remote tenant inserts against the local tree without reaching
-/// into private fields. Defined here (not in the adapter) to keep
-/// the dependency direction `adapter → policy`.
-pub trait TreeHandle: Send + Sync + std::fmt::Debug {
-    /// If `node_hash` is known locally (resolvable to a stored
-    /// matched-prefix), record `worker_url` as a tenant of the
-    /// matched node and return `true`. Returns `false` if the
-    /// hash isn't known — the caller is expected to request
-    /// repair so the path can be reconstructed from a peer.
-    ///
-    /// This subsumes "is the hash known?" plus "apply the
-    /// insert": the adapter doesn't need separate read+write
-    /// trips, and we never expose the matched value across the
-    /// trait boundary (it stays inside the policy where
-    /// eviction owns its lifecycle).
-    fn apply_known_remote_insert(
-        &self,
-        model_id: &str,
-        tree_kind: TreeKind,
-        node_hash: u64,
-        worker_url: &str,
-    ) -> bool;
-
-    /// Open a stream of `RepairEntry` for one `(model_id,
-    /// tree_kind)`, in the deterministic pre-order produced by
-    /// the underlying tree's `iter_entries`. Returns `None` if
-    /// no tree exists locally for that model. Paging is wire
-    /// shape and lives in the adapter, not on this trait — the
-    /// stream just yields entries one at a time.
-    fn open_repair_stream(
-        &self,
-        model_id: &str,
-        tree_kind: TreeKind,
-    ) -> Option<Box<dyn Iterator<Item = RepairEntry> + Send>>;
-
-    /// Apply every entry in `page` to the local `(model_id,
-    /// tree_kind)` tree, creating the tree if it doesn't yet
-    /// exist locally. Returns the number of entries successfully
-    /// applied (entries whose variant doesn't match `tree_kind`
-    /// are logged and skipped, not applied). Idempotent —
-    /// reapplying the same page is a no-op on the tree state
-    /// because the underlying radix tree's `insert_text` /
-    /// `insert_tokens` are themselves idempotent for the same
-    /// `(path, tenant)` pair.
-    fn apply_repair_page(&self, page: &TreeRepairPage) -> usize;
-}
-
-impl TreeHandle for CacheAwarePolicy {
+///
+/// Reuses the canonical [`TreeKind`]/[`TreeHandle`] defined alongside
+/// `cache_aware` so the mesh adapter ([`TreeRepairPage`]) sees a single type.
+impl TreeHandle for CacheAwareV1Policy {
     fn apply_known_remote_insert(
         &self,
         model_id: &str,
@@ -906,7 +872,7 @@ impl TreeHandle for CacheAwarePolicy {
     }
 }
 
-impl LoadBalancingPolicy for CacheAwarePolicy {
+impl LoadBalancingPolicy for CacheAwareV1Policy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
         let request_text = info.request_text;
         let request_tokens = info.tokens;
@@ -964,7 +930,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
     }
 
     fn name(&self) -> &'static str {
-        "cache_aware"
+        "cache_aware_v1"
     }
 
     fn needs_request_text(&self) -> bool {
@@ -981,7 +947,7 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
 }
 
 // Private helper methods for select_worker
-impl CacheAwarePolicy {
+impl CacheAwareV1Policy {
     /// Check if an event-driven indexer exists with data for this model.
     /// Returns false when the indexer is empty (startup, reconnect) so
     /// routing falls through to the approximate token tree instead of
@@ -1018,7 +984,7 @@ impl CacheAwarePolicy {
         // No cache overlap — min-load fallback (no token tree involved)
         let min_idx = healthy_indices
             .iter()
-            .min_by_key(|&&idx| workers[idx].engine_stats().waiting_and_running_queue_size())
+            .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
         debug!(
             worker = workers[min_idx].url(),
@@ -1083,8 +1049,8 @@ impl CacheAwarePolicy {
             .copied()
             .filter(|&idx| weighted[idx] > 0.0)
             .max_by(|&a, &b| {
-                let load_a = workers[a].engine_stats().waiting_and_running_queue_size();
-                let load_b = workers[b].engine_stats().waiting_and_running_queue_size();
+                let load_a = workers[a].load();
+                let load_b = workers[b].load();
                 weighted[a]
                     .total_cmp(&weighted[b])
                     .then(load_b.cmp(&load_a)) // lower load wins
@@ -1131,7 +1097,7 @@ impl CacheAwarePolicy {
                 healthy_indices
                     .iter()
                     .min_by_key(|&&idx| {
-                        workers[idx].engine_stats().waiting_and_running_queue_size()
+                        workers[idx].load()
                     })
                     .copied()
             };
@@ -1207,7 +1173,7 @@ impl CacheAwarePolicy {
                 healthy_indices
                     .iter()
                     .min_by_key(|&&idx| {
-                        workers[idx].engine_stats().waiting_and_running_queue_size()
+                        workers[idx].load()
                     })
                     .copied()
             };
@@ -1252,7 +1218,7 @@ impl CacheAwarePolicy {
     }
 }
 
-impl Default for CacheAwarePolicy {
+impl Default for CacheAwareV1Policy {
     fn default() -> Self {
         Self::new()
     }
@@ -1280,7 +1246,7 @@ mod tests {
             eviction_interval_secs: 0, // Disable eviction thread
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -1339,7 +1305,7 @@ mod tests {
 
     #[test]
     fn test_cache_aware_with_imbalanced_load() {
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        let policy = CacheAwareV1Policy::with_config(CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 5,
             balance_rel_threshold: 2.0,
@@ -1385,7 +1351,7 @@ mod tests {
             eviction_interval_secs: 0, // Disable eviction thread
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -1449,7 +1415,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         policy.set_mesh_sync(Some(mesh_sync.clone()));
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
@@ -1509,7 +1475,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         policy.set_mesh_sync(Some(mesh_sync.clone()));
 
         // Verify local tree was populated from mesh state
@@ -1533,7 +1499,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         policy.set_mesh_sync(Some(mesh_sync.clone()));
 
         // Apply remote tree operation
@@ -1562,7 +1528,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         policy.set_mesh_sync(Some(mesh_sync));
 
         let remote_op = TreeOperation::Insert(TreeInsertOp {
@@ -1590,7 +1556,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
 
         let text = "remote_text";
         let tokens = vec![1u32, 2, 3, 4];
@@ -1655,7 +1621,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
         let text = "repaired text";
         let tokens = vec![1u32; 16];
 
@@ -1710,7 +1676,7 @@ mod tests {
         // instead. A regression on the matched-prefix apply path
         // would still pass the full-path test, so seed via
         // `select_worker` here and assert apply succeeds.
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        let policy = CacheAwareV1Policy::with_config(CacheAwareConfig {
             eviction_interval_secs: 0,
             ..Default::default()
         });
@@ -1787,9 +1753,9 @@ mod tests {
             ..Default::default()
         };
 
-        let _policy1 = CacheAwarePolicy::with_config(config.clone());
+        let _policy1 = CacheAwareV1Policy::with_config(config.clone());
         _policy1.set_mesh_sync(Some(mesh_sync1.clone()));
-        let _policy2 = CacheAwarePolicy::with_config(config);
+        let _policy2 = CacheAwareV1Policy::with_config(config);
         _policy2.set_mesh_sync(Some(mesh_sync2.clone()));
 
         // Node1 syncs a tree operation
@@ -1815,7 +1781,7 @@ mod tests {
             eviction_interval_secs: 0,
             ..Default::default()
         };
-        let policy = CacheAwarePolicy::with_config(config);
+        let policy = CacheAwareV1Policy::with_config(config);
 
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
@@ -1883,7 +1849,7 @@ mod tests {
 
     #[test]
     fn test_score_overlap_selects_best_match() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -1924,7 +1890,7 @@ mod tests {
 
     #[test]
     fn test_score_overlap_no_match_returns_none() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
                 .worker_type(WorkerType::Regular)
@@ -1948,7 +1914,7 @@ mod tests {
 
     #[test]
     fn test_score_overlap_load_tiebreak() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
 
         let w1 = BasicWorkerBuilder::new("http://w1:8000")
             .worker_type(WorkerType::Regular)
@@ -1993,7 +1959,7 @@ mod tests {
 
     #[test]
     fn test_score_overlap_tree_size_tiebreak() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -2045,7 +2011,7 @@ mod tests {
 
     #[test]
     fn test_score_overlap_short_request_returns_none() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![Arc::new(
             BasicWorkerBuilder::new("http://w1:8000")
                 .worker_type(WorkerType::Regular)
@@ -2062,7 +2028,7 @@ mod tests {
 
     #[test]
     fn test_score_overlap_partial_match() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -2129,7 +2095,7 @@ mod tests {
 
     #[test]
     fn test_event_driven_overlap_selects_cached_worker() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -2168,7 +2134,7 @@ mod tests {
 
     #[test]
     fn test_event_driven_no_overlap_uses_min_load() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
 
         let w1 = BasicWorkerBuilder::new("http://w1:8000")
             .worker_type(WorkerType::Regular)
@@ -2207,7 +2173,7 @@ mod tests {
 
     #[test]
     fn test_event_driven_short_request_uses_min_load() {
-        let policy = CacheAwarePolicy::with_config(test_config()); // block_size=4
+        let policy = CacheAwareV1Policy::with_config(test_config()); // block_size=4
 
         let w1 = BasicWorkerBuilder::new("http://w1:8000")
             .worker_type(WorkerType::Regular)
@@ -2244,7 +2210,7 @@ mod tests {
 
     #[test]
     fn test_no_monitor_uses_token_tree() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")
@@ -2279,7 +2245,7 @@ mod tests {
 
     #[test]
     fn test_set_kv_event_monitor() {
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
 
         // Initially no monitor
         assert!(policy.kv_monitor.read().is_none());
@@ -2301,7 +2267,7 @@ mod tests {
     fn test_event_driven_uses_monitor_block_size() {
         // Test that event-driven routing uses monitor's learned block_size
         // instead of config default when available.
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        let policy = CacheAwareV1Policy::with_config(CacheAwareConfig {
             block_size: 4, // config default
             eviction_interval_secs: 0,
             ..Default::default()
@@ -2360,7 +2326,7 @@ mod tests {
 
     #[test]
     fn test_imbalanced_skips_event_driven() {
-        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        let policy = CacheAwareV1Policy::with_config(CacheAwareConfig {
             balance_abs_threshold: 5,
             balance_rel_threshold: 2.0,
             eviction_interval_secs: 0,
@@ -2407,7 +2373,7 @@ mod tests {
         // When the monitor has an indexer for a model but the indexer is empty
         // (startup, reconnect), routing should fall through to the token tree
         // instead of taking the event-driven path and landing on min-load.
-        let policy = CacheAwarePolicy::with_config(test_config());
+        let policy = CacheAwareV1Policy::with_config(test_config());
         let workers: Vec<Arc<dyn Worker>> = vec![
             Arc::new(
                 BasicWorkerBuilder::new("http://w1:8000")

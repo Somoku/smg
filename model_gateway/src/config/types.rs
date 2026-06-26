@@ -507,6 +507,25 @@ pub enum PolicyConfig {
         lmcache_overlap_weight: f64,
     },
 
+    /// Cache-aware routing (v1): identical to `cache_aware` but every load
+    /// comparison reads the per-worker in-flight counter (`worker.load()`)
+    /// rather than the engine snapshot, so imbalance detection and worker
+    /// selection always use the same load signal.
+    #[serde(rename = "cache_aware_v1")]
+    CacheAwareV1 {
+        cache_threshold: f32,
+        balance_abs_threshold: usize,
+        balance_rel_threshold: f32,
+        eviction_interval_secs: u64,
+        max_tree_size: usize,
+        #[serde(default = "default_block_size")]
+        block_size: usize,
+        #[serde(default = "default_gpu_overlap_weight")]
+        gpu_overlap_weight: f64,
+        #[serde(default = "default_lmcache_overlap_weight")]
+        lmcache_overlap_weight: f64,
+    },
+
     #[serde(rename = "power_of_two")]
     PowerOfTwo { load_check_interval_secs: u64 },
 
@@ -687,6 +706,7 @@ impl PolicyConfig {
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::CacheAware { .. } => "cache_aware",
+            PolicyConfig::CacheAwareV1 { .. } => "cache_aware_v1",
             PolicyConfig::PowerOfTwo { .. } => "power_of_two",
             PolicyConfig::Bucket { .. } => "bucket",
             PolicyConfig::Manual { .. } => "manual",

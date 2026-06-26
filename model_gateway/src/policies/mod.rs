@@ -12,7 +12,7 @@ use crate::worker::{HashRing, Worker};
 
 mod bucket;
 mod cache_aware;
-mod completion_guard;
+mod cache_aware_v1;
 mod consistent_hashing;
 pub(crate) mod cost_model_utils;
 mod dp_min_token;
@@ -29,7 +29,7 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
-pub use completion_guard::PolicyCompletionGuard;
+pub use cache_aware_v1::CacheAwareV1Policy;
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -69,42 +69,30 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
-    /// Update policy local state after request completion, providing the token
-    /// delta that should be subtracted from the worker's local optimistic state.
-    ///
-    /// `token_delta` is the number of tokens that were added to the worker's
-    /// local state when the request was routed.  When `None`, the policy should
-    /// fall back to a conservative (no-op) update.
-    ///
-    /// Supersedes [`on_request_complete`] for state-tracking policies; stateless
-    /// policies can leave this as the default no-op.
-    ///
-    /// [`on_request_complete`]: LoadBalancingPolicy::on_request_complete
-    fn on_request_complete_with_tokens(
-        &self,
-        _worker_url: &str,
-        _token_delta: Option<i64>,
-        _success: bool,
-    ) {
-        // Default: no-op for stateless policies
-    }
-
-    /// Notify the policy that fresh engine stats have just been applied for the
-    /// given worker, so any locally-tracked optimistic delta can be reset.
-    ///
-    /// Called from the worker-stats update path immediately after a successful
-    /// `EngineStats` application (i.e., `EngineStatsUpdateOutcome::Applied`).
-    /// Stateless policies can leave this as the default no-op.
-    fn on_engine_stats_updated(&self, _worker_url: &str) {
-        // Default: no-op for stateless policies
-    }
-
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
     /// Check if this policy needs request text for routing decisions
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
+    }
+
+    /// Whether this policy routes on the per-worker load counter
+    /// ([`Worker::load`]), and therefore requires a [`WorkerLoadGuard`] to be
+    /// minted on the request path so the counter is incremented on admit and
+    /// decremented on departure.
+    ///
+    /// The gRPC routing loop always mints load guards (in the execution stage),
+    /// so this flag only governs the HTTP router, which mints them
+    /// conditionally to avoid the (tiny) overhead for policies that ignore the
+    /// counter. Load-aware policies (`request_num_balance`, `throughput_optimal`,
+    /// `cache_aware`, `manual`) must return `true`; stateless ones
+    /// (`random`, `round_robin`, `consistent_hashing`, …) leave the default.
+    ///
+    /// [`Worker::load`]: crate::worker::Worker::load
+    /// [`WorkerLoadGuard`]: crate::worker::WorkerLoadGuard
+    fn needs_load_guard(&self) -> bool {
+        false // Default: stateless policies don't read the load counter
     }
 
     /// Update worker load information

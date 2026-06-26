@@ -12,7 +12,10 @@ use tracing::{debug, info, warn};
 /// When the first worker of a new model is added, it determines the policy for that model.
 /// All subsequent workers of the same model use the established policy.
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
-use super::{BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy, PolicyFactory};
+use super::{
+    BucketPolicy, CacheAwarePolicy, CacheAwareV1Policy, DPRankLoadPolicy, LoadBalancingPolicy,
+    PolicyFactory,
+};
 use crate::{
     config::types::PolicyConfig,
     worker::{KvEventMonitor, Worker},
@@ -404,57 +407,6 @@ impl PolicyRegistry {
         power_of_two_policies
     }
 
-    /// Get all stateful policies that maintain per-worker optimistic local
-    /// state and need engine-stats notifications and completion callbacks.
-    ///
-    /// Returns a deduplicated list covering the default policy, PD prefill/decode
-    /// policies, and per-model policies.  The caller can iterate over this to
-    /// invoke [`LoadBalancingPolicy::on_engine_stats_updated`] after a fresh
-    /// engine-stats snapshot is applied for a worker.
-    pub fn get_all_stateful_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        const NAMES: [&str; 3] = [
-            "throughput_optimal",
-            "throughput_optimal_with_budget",
-            "request_num_balance",
-        ];
-
-        let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
-
-        if NAMES.contains(&self.default_policy.name()) {
-            policies.push(Arc::clone(&self.default_policy));
-        }
-
-        let prefill_policy_opt = self.prefill_policy.get();
-        let decode_policy_opt = self.decode_policy.get();
-
-        if let Some(policy) = prefill_policy_opt {
-            if NAMES.contains(&policy.name()) && !Arc::ptr_eq(policy, &self.default_policy) {
-                policies.push(Arc::clone(policy));
-            }
-        }
-
-        if let Some(policy) = decode_policy_opt {
-            if NAMES.contains(&policy.name())
-                && !Arc::ptr_eq(policy, &self.default_policy)
-                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
-            {
-                policies.push(Arc::clone(policy));
-            }
-        }
-
-        for entry in self.model_policies.iter() {
-            let policy = entry.value();
-            if NAMES.contains(&policy.name()) {
-                let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
-                if !already_added {
-                    policies.push(Arc::clone(policy));
-                }
-            }
-        }
-
-        policies
-    }
-
     /// This should be called after workers are registered for a model
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
         // Get the policy for this model
@@ -467,6 +419,15 @@ impl PolicyRegistry {
                         model_id
                     );
                     cache_aware.init_workers(workers);
+                }
+            } else if policy.name() == "cache_aware_v1" {
+                if let Some(v1) = policy.as_any().downcast_ref::<CacheAwareV1Policy>() {
+                    debug!(
+                        "Initializing cache_aware_v1 policy with {} workers for model {}",
+                        workers.len(),
+                        model_id
+                    );
+                    v1.init_workers(workers);
                 }
             }
         }
@@ -482,6 +443,14 @@ impl PolicyRegistry {
                     cache_aware.remove_worker_by_url(worker_url);
                     debug!(
                         "Removed worker {} from cache-aware policy for model {}",
+                        worker_url, model_id
+                    );
+                }
+            } else if policy.name() == "cache_aware_v1" {
+                if let Some(v1) = policy.as_any().downcast_ref::<CacheAwareV1Policy>() {
+                    v1.remove_worker_by_url(worker_url);
+                    debug!(
+                        "Removed worker {} from cache_aware_v1 policy for model {}",
                         worker_url, model_id
                     );
                 }
@@ -509,6 +478,16 @@ impl PolicyRegistry {
                         cache_aware.init_workers(prefill_workers);
                     }
                 }
+            } else if prefill_policy.name() == "cache_aware_v1" {
+                if let Some(v1) = prefill_policy.as_any().downcast_ref::<CacheAwareV1Policy>() {
+                    if !prefill_workers.is_empty() {
+                        debug!(
+                            "Initializing prefill cache_aware_v1 policy with {} workers",
+                            prefill_workers.len()
+                        );
+                        v1.init_workers(prefill_workers);
+                    }
+                }
             }
         }
 
@@ -523,6 +502,16 @@ impl PolicyRegistry {
                             decode_workers.len()
                         );
                         cache_aware.init_workers(decode_workers);
+                    }
+                }
+            } else if decode_policy.name() == "cache_aware_v1" {
+                if let Some(v1) = decode_policy.as_any().downcast_ref::<CacheAwareV1Policy>() {
+                    if !decode_workers.is_empty() {
+                        debug!(
+                            "Initializing decode cache_aware_v1 policy with {} workers",
+                            decode_workers.len()
+                        );
+                        v1.init_workers(decode_workers);
                     }
                 }
             }

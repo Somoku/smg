@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use super::{
-    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
-    LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy, PrefixHashConfig,
-    PrefixHashPolicy, RandomPolicy, RequestNumBalancePolicy, RoundRobinPolicy,
+    BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, CacheAwareV1Policy,
+    ConsistentHashingPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy, PowerOfTwoPolicy,
+    PrefixHashConfig, PrefixHashPolicy, RandomPolicy, RequestNumBalancePolicy, RoundRobinPolicy,
     ThroughputOptimalConfig, ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
 };
 use crate::config::{ConfigError, ConfigResult, PolicyConfig};
@@ -41,6 +41,28 @@ impl PolicyFactory {
                     lmcache_overlap_weight: *lmcache_overlap_weight,
                 };
                 Ok(Arc::new(CacheAwarePolicy::with_config(config)))
+            }
+            PolicyConfig::CacheAwareV1 {
+                cache_threshold,
+                balance_abs_threshold,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                gpu_overlap_weight,
+                lmcache_overlap_weight,
+            } => {
+                let config = CacheAwareConfig {
+                    cache_threshold: *cache_threshold,
+                    balance_abs_threshold: *balance_abs_threshold,
+                    balance_rel_threshold: *balance_rel_threshold,
+                    eviction_interval_secs: *eviction_interval_secs,
+                    max_tree_size: *max_tree_size,
+                    block_size: *block_size,
+                    gpu_overlap_weight: *gpu_overlap_weight,
+                    lmcache_overlap_weight: *lmcache_overlap_weight,
+                };
+                Ok(Arc::new(CacheAwareV1Policy::with_config(config)))
             }
             PolicyConfig::Bucket {
                 balance_abs_threshold,
@@ -130,6 +152,7 @@ impl PolicyFactory {
             "round_robin" | "roundrobin" => Some(Arc::new(RoundRobinPolicy::new())),
             "power_of_two" | "poweroftwo" => Some(Arc::new(PowerOfTwoPolicy::new())),
             "cache_aware" | "cacheaware" => Some(Arc::new(CacheAwarePolicy::new())),
+            "cache_aware_v1" | "cacheawarev1" => Some(Arc::new(CacheAwareV1Policy::new())),
             "bucket" => Some(Arc::new(BucketPolicy::new())),
             "manual" => Some(Arc::new(ManualPolicy::new())),
             "consistent_hashing" | "consistenthashing" => {

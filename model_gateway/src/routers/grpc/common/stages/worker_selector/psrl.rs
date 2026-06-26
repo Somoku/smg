@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::response::Response;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::WorkerSelectorStrategy;
 use crate::{
@@ -113,6 +113,10 @@ pub(crate) struct PsrlWorkerSelector {
     candidate_sort_key: CandidateSortKey,
     enable_group_sticky: bool,
     kv_transfer: Option<Arc<KvTransferCoordinator>>,
+    /// Guards the "sort → policy select → increment load" step at Stage 5 so
+    /// that concurrent dispatch tasks cannot all read equal loads and pick the
+    /// same worker before any increment has been registered.
+    selection_lock: parking_lot::Mutex<()>,
 }
 
 impl PsrlWorkerSelector {
@@ -125,6 +129,12 @@ impl PsrlWorkerSelector {
         enable_group_sticky: bool,
         kv_transfer: Option<Arc<KvTransferCoordinator>>,
     ) -> Self {
+        info!(
+            enable_mig_strategy,
+            enable_group_sticky,
+            kv_transfer_enabled = kv_transfer.is_some(),
+            "PSRL worker selector initialized (sticky config)"
+        );
         Self {
             worker_registry,
             policy_registry,
@@ -133,6 +143,7 @@ impl PsrlWorkerSelector {
             candidate_sort_key,
             enable_group_sticky,
             kv_transfer,
+            selection_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -228,7 +239,22 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                     .cloned()
                     .collect();
                 if !pinned.is_empty() {
+                    debug!(
+                        request_id = meta.request_id,
+                        prompt_id = meta.prompt_id,
+                        base_worker_id = %hint.0,
+                        target_dp_rank = hint.1,
+                        "PSRL trajectory sticky HIT: pinned to hinted instance"
+                    );
                     candidates = pinned;
+                } else {
+                    debug!(
+                        request_id = meta.request_id,
+                        prompt_id = meta.prompt_id,
+                        base_worker_id = %hint.0,
+                        target_dp_rank = hint.1,
+                        "PSRL trajectory sticky MISS: hinted instance unavailable, falling through"
+                    );
                 }
             }
         }
@@ -259,7 +285,22 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
                     .cloned()
                     .collect();
                 if !pinned.is_empty() {
+                    debug!(
+                        request_id = meta.request_id,
+                        prompt_id,
+                        base_worker_id = %group_inst.0,
+                        target_dp_rank = group_inst.1,
+                        "PSRL group sticky HIT: pinned to group instance"
+                    );
                     candidates = pinned;
+                } else {
+                    debug!(
+                        request_id = meta.request_id,
+                        prompt_id,
+                        base_worker_id = %group_inst.0,
+                        target_dp_rank = group_inst.1,
+                        "PSRL group sticky MISS: group instance unavailable, falling through"
+                    );
                 }
                 // If pinned is empty the previously-pinned instance is no
                 // longer available; fall through with all candidates so the
@@ -427,19 +468,37 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         let policy = self.policy_registry.get_policy_or_default(model_id);
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let idx = policy.select_worker(
-            &sorted_candidates,
-            &SelectWorkerInfo {
-                request_text: text,
-                tokens,
-                headers,
-                hash_ring,
-                priority_groups: Some(&priority_groups),
-                response_token_count: meta.response_token_count,
-            },
-        )?;
-
-        let selected = sorted_candidates[idx].clone();
+        // Atomically select worker and increment its load to prevent TOCTOU.
+        // All async work (RPCs) in Stages 1–4 completes before this point;
+        // the lock is held only for the synchronous find-min + increment step.
+        let selected = {
+            let _lock = self.selection_lock.lock();
+            // Log per-worker loads before selection so we can confirm balance.
+            let loads_before: Vec<(String, usize)> = sorted_candidates
+                .iter()
+                .map(|w| (w.url().to_string(), w.load()))
+                .collect();
+            let idx = policy.select_worker(
+                &sorted_candidates,
+                &SelectWorkerInfo {
+                    request_text: text,
+                    tokens,
+                    headers,
+                    hash_ring,
+                    priority_groups: Some(&priority_groups),
+                    response_token_count: meta.response_token_count,
+                },
+            )?;
+            sorted_candidates[idx].increment_load();
+            info!(
+                request_id,
+                selected_url = %sorted_candidates[idx].url(),
+                selected_load_before = loads_before[idx].1,
+                candidate_loads = ?loads_before.iter().map(|(u, l)| format!("{}={}", u, l)).collect::<Vec<_>>(),
+                "PSRL Stage 5: worker selected"
+            );
+            sorted_candidates[idx].clone()
+        };
 
         Metrics::record_worker_selection(
             metrics_labels::WORKER_REGULAR,
@@ -526,6 +585,14 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             (&self.kv_transfer, &meta.rollout_instance_hint, tokens)
         {
             if *hint != selected_instance {
+                info!(
+                    request_id = meta.request_id,
+                    src_worker = %hint.0,
+                    src_dp = hint.1,
+                    dst_worker = %selected_instance.0,
+                    dst_dp = selected_instance.1,
+                    "KV migration detected: routing to different instance"
+                );
                 if let Some(src) = self.find_worker_by_instance(model_id, hint) {
                     coordinator
                         .transfer_on_migration(model_id, &src, selected, request_tokens)

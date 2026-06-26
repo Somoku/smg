@@ -36,7 +36,7 @@ use crate::{
         metrics::{bool_to_static_str, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
-    policies::{LoadBalancingPolicy, PolicyCompletionGuard, PolicyRegistry, SelectWorkerInfo},
+    policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     routers::{
         common::{
             header_utils,
@@ -138,8 +138,9 @@ impl Router {
     /// Filters to workers serving the specified model. When model is "unknown"
     /// (generate endpoint without model), considers all HTTP workers.
     ///
-    /// Returns `(worker, policy)` so the caller can create a
-    /// [`PolicyCompletionGuard`] without a second policy lookup.
+    /// Returns `(worker, policy)` so the caller can decide whether to mint a
+    /// [`WorkerLoadGuard`] (via [`LoadBalancingPolicy::needs_load_guard`])
+    /// without a second policy lookup.
     fn select_worker_for_model(
         &self,
         model_id: &str,
@@ -319,21 +320,9 @@ impl Router {
             }
         };
 
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
+        let load_guard = policy
+            .needs_load_guard()
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
-
-        // Create a completion guard that will decrement the policy's optimistic
-        // local state when the request completes (or the response body is dropped).
-        //
-        // For stateless policies `on_request_complete_with_tokens` is a no-op,
-        // so this guard is cheap and safe to create unconditionally.
-        let policy_guard = PolicyCompletionGuard::new(
-            policy,
-            worker.url().to_owned(),
-            Some(1), // matches the fallback token count used by ThroughputRuntime
-            true,    // assume success; overridden to false on server errors below
-        );
 
         // Note: Using borrowed reference avoids heap allocation
         events::RequestSentEvent { url: worker.url() }.emit();
@@ -349,7 +338,6 @@ impl Router {
                 worker.as_ref(),
                 is_stream,
                 load_guard,
-                policy_guard,
             )
             .await;
 
@@ -610,8 +598,8 @@ impl Router {
         );
         let worker = available[idx].clone();
 
-        let load_guard = ["cache_aware", "manual"]
-            .contains(&policy.name())
+        let load_guard = policy
+            .needs_load_guard()
             .then(|| WorkerLoadGuard::new(worker.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
@@ -862,7 +850,6 @@ impl Router {
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
-        mut policy_guard: PolicyCompletionGuard,
     ) -> Response {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
@@ -915,9 +902,8 @@ impl Router {
                     e
                 );
 
-                // Mark the request as failed so the policy guard decrements
-                // the local state with the correct success flag.
-                policy_guard.set_success(false);
+                // The worker load guard (if any) is dropped on early return,
+                // decrementing the load counter for the failed request.
                 return convert_reqwest_error(e);
             }
         };
@@ -968,9 +954,6 @@ impl Router {
             if let Some(guard) = load_guard {
                 response = AttachedBody::wrap_response(response, guard);
             }
-            // Attach policy completion guard so local state is decremented
-            // when the streaming body is fully consumed or the client disconnects.
-            response = AttachedBody::wrap_response(response, policy_guard);
             response
         } else {
             // For non-streaming requests, preserve headers
@@ -989,10 +972,9 @@ impl Router {
                 }
             };
 
-            // load_guard and policy_guard are both dropped here automatically
-            // after the response body is read.
+            // load_guard is dropped here automatically after the response body
+            // is read.
             drop(load_guard);
-            drop(policy_guard);
             response
         }
     }

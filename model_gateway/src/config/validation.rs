@@ -368,6 +368,16 @@ impl ConfigValidator {
                 block_size,
                 gpu_overlap_weight,
                 lmcache_overlap_weight,
+            }
+            | PolicyConfig::CacheAwareV1 {
+                cache_threshold,
+                balance_abs_threshold: _,
+                balance_rel_threshold,
+                eviction_interval_secs,
+                max_tree_size,
+                block_size,
+                gpu_overlap_weight,
+                lmcache_overlap_weight,
             } => {
                 if *block_size == 0 {
                     return Err(ConfigError::InvalidValue {

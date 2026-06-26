@@ -97,7 +97,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - SubscribePreemptionEvents: Stream scheduler-preempted request IDs to SMG
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None,):
+    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None, kv_transfer_stats_log_interval_s: float = 30.0,):
         """
         Initialize the servicer.
 
@@ -121,6 +121,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self.active_generate_admissions = 0
         self.generate_admissions_drained = asyncio.Event()
         self.generate_admissions_drained.set()
+        # Cleared while paused for a weight sync; new Generate calls park on it.
+        self.generation_resume_event = asyncio.Event()
+        self.generation_resume_event.set()
+        self.generation_resume_failed = False
 
         # Parse the native vLLM KV-event publisher config so SubscribeKvEvents
         # can bridge the local ZMQ stream to gRPC (event-driven cache-aware
@@ -140,7 +144,51 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Monotonic event-id counter for converted KvCacheEvents.
         self.kv_event_id_counter = 0
+
+        # KV-transfer statistics, mirroring psrl_agent's RolloutRouter counters.
+        # SMG drives transfers from the Rust gateway, so this servicer's
+        # TransferKv handler is the single source-side choke point where every
+        # migration's outcome is observable. _kv_transfer_stats_logged_at gates
+        # the periodic summary so it prints at most once per interval.
+        self._kv_transfer_stats = {
+            "succeeded": 0,        # transfer_direct moved >0 tokens on all ranks
+            "returned_false": 0,   # transfer_direct returned False (src miss / layout mismatch)
+            "exception": 0,        # transfer_direct raised
+            "empty_tokens": 0,     # request carried no tokens
+        }
+        self._kv_transfer_stats_logged_at = time.time()
+        self._kv_transfer_stats_log_interval_s = kv_transfer_stats_log_interval_s
         logger.info("VllmEngineServicer initialized")
+
+    def _record_kv_transfer(self, outcome: str) -> None:
+        """Increment a TransferKv outcome counter and periodically log a summary.
+
+        Args:
+            outcome: one of the keys in ``self._kv_transfer_stats``.
+        """
+        self._kv_transfer_stats[outcome] = self._kv_transfer_stats.get(outcome, 0) + 1
+        if self._kv_transfer_stats_log_interval_s <= 0:
+            return
+        now = time.time()
+        if now - self._kv_transfer_stats_logged_at < self._kv_transfer_stats_log_interval_s:
+            return
+        self._kv_transfer_stats_logged_at = now
+        s = self._kv_transfer_stats
+        total = sum(s.values())
+        attempted = total - s["empty_tokens"]
+        rate = (s["succeeded"] / attempted * 100.0) if attempted else 0.0
+        logger.warning(
+            "[KVTransfer] instance=%s stats: ok=%d returned_false=%d exc=%d "
+            "empty=%d (total=%d, success_rate=%.1f%%)",
+            getattr(self.kv_cache_manager.config, "lmcache_instance_id", "?")
+            if self.kv_cache_manager is not None else "?",
+            s["succeeded"],
+            s["returned_false"],
+            s["exception"],
+            s["empty_tokens"],
+            total,
+            rate,
+        )
 
     async def close_generate_admission(self) -> None:
         """Reject new Generate calls and wait for admitted calls to register."""
@@ -149,6 +197,31 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     async def open_generate_admission(self) -> None:
         self.generate_admission_open = True
+
+    def pause_generation_admission(self) -> None:
+        """Clear the park gate so new Generate calls wait for engine resume.
+
+        Must be called BEFORE close_generate_admission() to preserve the
+        invariant (event set ⟹ engine live or sync-failed).
+        """
+        self.generation_resume_failed = False
+        self.generation_resume_event.clear()
+
+    def resume_generation_admission(self) -> None:
+        """Set the park gate after a successful sync, waking parked Generate
+        calls so they proceed to add_request on the now-live engine."""
+        self.generation_resume_failed = False
+        self.generation_resume_event.set()
+
+    def fail_generation_admission(self) -> None:
+        """Set the park gate after a FAILED sync (replica quarantined).
+
+        Wakes parked Generate calls with generation_resume_failed=True so they
+        abort → gateway loopback re-routes them to a healthy instance instead
+        of hanging forever on the resume event that will never come.
+        """
+        self.generation_resume_failed = True
+        self.generation_resume_event.set()
 
     def begin_generate_admission(self) -> bool:
         if not self.generate_admission_open:
@@ -206,13 +279,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             has_preprocessed_mm,
         )
 
-        admitted = self.begin_generate_admission()
-        if not admitted:
-            yield self.abort_response()
-            return
-
         output_collector = None
-        registration_pending = True
+        registration_pending = False
         try:
             arrival_time = time.time()
 
@@ -229,6 +297,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 prompt = self.engine.renderer.process_for_engine(prompt, arrival_time=arrival_time)
             else:
                 prompt = request.text
+
+            # Validate prompt length before any park/admission/engine work.
+            # This catches overlong prompts at the SMG boundary and returns
+            # INVALID_ARGUMENT (400) instead of letting them reach the engine
+            # where they'd surface as EngineGenerateError (500).
+            if input_type == "tokenized":
+                prompt_len = len(request.tokenized.input_ids)
+                max_model_len = self.engine.model_config.max_model_len
+                if prompt_len > max_model_len:
+                    raise ValueError(
+                        f"The prompt (length {prompt_len}) is longer than the "
+                        f"maximum model length of {max_model_len}."
+                    )
+                if prompt_len == max_model_len and self.engine.model_config.runner_type == "generate":
+                    raise ValueError(
+                        f"The prompt (length {prompt_len}) plus the number of "
+                        f"requested output tokens (at least 1) is longer than the "
+                        f"maximum model length of {max_model_len}."
+                    )
 
             # Build sampling params with detokenize=False
             sampling_params = self._sampling_params_from_proto(
@@ -247,6 +334,41 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
+            # Send gRPC response headers immediately so the tonic client's
+            # `client.generate().await` resolves without waiting for the first
+            # output token. This is critical for the SMG pause barrier: the
+            # dispatch handoff permit is held until `generate().await` returns,
+            # and without this call the permit would be blocked until the vLLM
+            # scheduler produces the first token. Sending it BEFORE the park
+            # below ensures the permit is released before we wait, so a
+            # concurrent weight-sync pause barrier is never stalled by a parked
+            # request.
+            await context.send_initial_metadata(())
+
+            # Park-and-wait: if the engine is mid weight-sync (resume event
+            # cleared), wait here instead of calling add_request on a not-ready
+            # engine (which would raise EngineDead -> 500 -> circuit breaker).
+            if not self.generation_resume_event.is_set():
+                logger.info("Generate %s parking: engine paused for PS sync", request_id)
+                await self.generation_resume_event.wait()
+                if self.generation_resume_failed:
+                    # Woken by fail_sync: the replica is quarantined (sync
+                    # failed), so abort and let the gateway re-route elsewhere.
+                    logger.warning(
+                        "Generate %s aborting: sync failed, replica quarantined", request_id
+                    )
+                    yield self.abort_response()
+                    return
+                logger.info("Generate %s resumed from park", request_id)
+
+            # Admission counter guards only the add_request registration window.
+            admitted = self.begin_generate_admission()
+            if not admitted:
+                # Rare: a new pause raced in between wake and here.
+                yield self.abort_response()
+                return
+            registration_pending = True
+
             output_collector = await self.engine.add_request(
                 request_id=request_id,
                 prompt=prompt,
@@ -255,14 +377,6 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
             registration_pending = False
             self.finish_generate_admission()
-
-            # Send gRPC response headers immediately so the tonic client's
-            # `client.generate().await` resolves without waiting for the first
-            # output token.  This is critical for the SMG pause barrier: the
-            # dispatch handoff permit is held until `generate().await` returns,
-            # and without this call the permit would be blocked until the vLLM
-            # scheduler produces the first token.
-            await context.send_initial_metadata(())
 
             finished = False
             while not finished:
@@ -764,6 +878,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         tokens = list(request.tokens)
         if not tokens:
+            self._record_kv_transfer("empty_tokens")
             return vllm_engine_pb2.TransferKvResponse(
                 success=False, num_tokens=0, error="empty token sequence"
             )
@@ -772,12 +887,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         src_backend = request.src_backend or "LocalCPUBackend"
         dst_backend = request.dst_backend or "LocalCPUBackend"
 
-        # Seed the peer registry with the explicit dst peer URL if the broadcast
-        # registry has not learned it yet (idempotent — set_peer_registry merges).
-        if request.dst_peer_url:
+        # Fallback seed: the authoritative per-rank peer registry is installed once
+        # at init by RolloutCoordinator._broadcast_peer_registry, so in normal
+        # operation every instance is already present here. The only legitimate case
+        # for seeding from the request is an instance added AFTER that broadcast.
+        # The request carries a single (rank-0) dst_peer_url, so we can only build a
+        # one-rank list — correct just for world_size==1. We therefore only seed when
+        # the instance is absent (never clobbering a fuller broadcast list) and log
+        # loudly, because hitting this path for an existing instance indicates the
+        # broadcast did not run / did not reach this replica and should be fixed.
+        if request.dst_peer_url and request.dst_instance_id not in self.kv_cache_manager.peer_registry:
+            logger.error(
+                "TransferKv seeding peer registry for %s from request dst_peer_url: "
+                "this should not normally trigger (broadcast registry is the source "
+                "of truth) unless this is a newly-added instance. Seeding a single-rank "
+                "list, which is only correct for world_size==1.",
+                request.dst_instance_id,
+            )
             try:
                 self.kv_cache_manager.set_peer_registry(
-                    {request.dst_instance_id: request.dst_peer_url}
+                    {request.dst_instance_id: [request.dst_peer_url]}
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Failed to seed peer registry: %s", e)
@@ -790,13 +919,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 request.copy,
             )
         except Exception as e:  # noqa: BLE001
+            self._record_kv_transfer("exception")
             logger.warning("TransferKv failed: %s", e)
             return vllm_engine_pb2.TransferKvResponse(
                 success=False, num_tokens=0, error=str(e)
             )
 
         if ok:
+            self._record_kv_transfer("succeeded")
             return vllm_engine_pb2.TransferKvResponse(success=True, num_tokens=len(tokens))
+        self._record_kv_transfer("returned_false")
         err = getattr(self.kv_cache_manager, "_last_transfer_error", "transfer returned False")
         return vllm_engine_pb2.TransferKvResponse(success=False, num_tokens=0, error=str(err))
 

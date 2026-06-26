@@ -159,6 +159,13 @@ pub(crate) struct ProcessingState {
     // Load guard for worker load tracking (created at execution stage)
     pub load_guards: Option<LoadGuards>,
 
+    /// Admit-time token estimate (prompt + response-so-far) for the selected
+    /// worker, captured in `WorkerSelectionStage` while `preparation` is still
+    /// present. Consumed by the execution stage when minting `LoadGuards` so
+    /// the worker's inflight-token counter receives the right estimate. `None`
+    /// for request types where no token estimate is meaningful.
+    pub admit_token_estimate: Option<usize>,
+
     // Stage 6: Response processing state
     pub response: ResponseState,
 
@@ -308,16 +315,71 @@ pub(crate) enum LoadGuards {
 }
 
 impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
+    /// Construct load guards for the selected worker(s), optionally registering
+    /// an admit-time token estimate in the selected worker(s)' inflight-token
+    /// counter. The estimate flows to load-aware policies (e.g.
+    /// throughput_optimal) as an optimistic delta on top of the engine token
+    /// base until a fresh snapshot rebases it. Pass `None` to track request
+    /// count only.
+    ///
+    /// For PD (Dual) selection the estimate is registered on the decode worker,
+    /// which carries the generation token load; the prefill worker only tracks
+    /// request count.
+    pub fn with_token_estimate(
+        selection: &WorkerSelection,
+        headers: Option<&HeaderMap>,
+        token_estimate: Option<usize>,
+    ) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
+                _guard: match token_estimate {
+                    Some(tokens) => {
+                        WorkerLoadGuard::with_inflight_tokens(worker.clone(), headers, tokens)
+                    }
+                    None => WorkerLoadGuard::new(worker.clone(), headers),
+                },
             },
             WorkerSelection::Dual {
                 prefill, decode, ..
             } => LoadGuards::Dual {
                 _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                _decode: match token_estimate {
+                    Some(tokens) => {
+                        WorkerLoadGuard::with_inflight_tokens(decode.clone(), headers, tokens)
+                    }
+                    None => WorkerLoadGuard::new(decode.clone(), headers),
+                },
+            },
+        }
+    }
+
+    /// Like [`LoadGuards::with_token_estimate`] but uses
+    /// [`WorkerLoadGuard::from_pre_incremented`] — the load counter was already
+    /// incremented atomically inside the worker selector to close the TOCTOU
+    /// window where all N concurrent dispatch tasks would otherwise read equal
+    /// loads and deterministically pick the same worker.
+    pub fn from_pre_incremented(
+        selection: &WorkerSelection,
+        headers: Option<&HeaderMap>,
+        token_estimate: Option<usize>,
+    ) -> Self {
+        match selection {
+            WorkerSelection::Single { worker } => LoadGuards::Single {
+                _guard: WorkerLoadGuard::from_pre_incremented(
+                    worker.clone(),
+                    headers,
+                    token_estimate,
+                ),
+            },
+            WorkerSelection::Dual {
+                prefill, decode, ..
+            } => LoadGuards::Dual {
+                _prefill: WorkerLoadGuard::from_pre_incremented(prefill.clone(), headers, None),
+                _decode: WorkerLoadGuard::from_pre_incremented(
+                    decode.clone(),
+                    headers,
+                    token_estimate,
+                ),
             },
         }
     }

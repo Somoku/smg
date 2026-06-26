@@ -22,7 +22,7 @@ use tokio::{
     task::{yield_now, JoinSet},
     time::sleep,
 };
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
     metadata::RoutingMeta,
@@ -640,6 +640,7 @@ async fn dispatch_entry(runtime: Arc<RoutingLoopRuntime>, mut entry: RoutingQueu
 
         let Some(handoff_permit) = runtime.try_acquire_dispatch_handoff(decision_epoch) else {
             entry.ctx.state.workers = None;
+            entry.ctx.state.load_guards = None; // drop guard before re-enqueue
             runtime.push_entries(vec![entry]).await;
             return;
         };
@@ -867,6 +868,7 @@ async fn dispatch_entry_with_partial_rollout(
 
     let Some(handoff_permit) = runtime.try_acquire_dispatch_handoff(decision_epoch) else {
         ctx.state.workers = None;
+        ctx.state.load_guards = None; // drop guard before re-enqueue
         ctx.state.partial_rollout_state = Some(partial_state);
         runtime
             .push_entries(vec![RoutingQueueEntry {
@@ -916,6 +918,13 @@ async fn dispatch_entry_with_partial_rollout(
     let drained = match drain_stream_for_partial_rollout(&mut stream).await {
         Ok(d) => d,
         Err(msg) => {
+            error!(
+                function = "dispatch_entry_with_partial_rollout",
+                request_id = request_id,
+                prompt_id = prompt_id,
+                error = %msg,
+                "Partial rollout stream drain failed"
+            );
             let response = router_error::internal_error("stream_drain_failed", msg.as_str());
             send_http_completion(completion, response);
             runtime.cleanup_tracking(request_id, prompt_id);
@@ -979,11 +988,40 @@ async fn dispatch_entry_with_partial_rollout(
             // Place the assembled complete frame back for PostExecution stages.
             ctx.state.response.execution_result = Some(ExecutionResult::Complete(complete));
 
-            let response = match pipeline.execute_remaining_stages(&mut ctx).await {
+            // Capture the served instance BEFORE execute_remaining_stages, which
+            // resets ctx.state.workers. The instance id is echoed back as response
+            // headers so the SessionRouter can pin subsequent turns of the same
+            // trajectory to this instance (trajectory sticky).
+            let served_instance = ctx
+                .state
+                .workers
+                .as_ref()
+                .map(|sel| match sel {
+                    WorkerSelection::Single { worker } => worker.clone(),
+                    WorkerSelection::Dual { decode, .. } => decode.clone(),
+                })
+                .map(|worker| runtime.instance_id_for_worker(&worker));
+
+            let mut response = match pipeline.execute_remaining_stages(&mut ctx).await {
                 Ok(Some(r)) => r,
                 Ok(None) => extract_final_response(&mut ctx),
                 Err(r) => r,
             };
+            if let Some((base_id, dp_rank)) = served_instance {
+                let headers = response.headers_mut();
+                if let Ok(v) = HeaderValue::from_str(&base_id) {
+                    headers.insert("x-base-worker-id", v);
+                }
+                if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
+                    headers.insert("x-target-dp-rank", v);
+                }
+                debug!(
+                    request_id = ?request_id,
+                    base_worker_id = %base_id,
+                    target_dp_rank = dp_rank,
+                    "PSRL trajectory sticky: echoed served instance to response headers"
+                );
+            }
             send_http_completion(completion, response);
             runtime.cleanup_tracking(request_id, prompt_id);
         }
