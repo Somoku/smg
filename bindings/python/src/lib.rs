@@ -11,7 +11,10 @@ use smg_auth as auth;
 pub enum PolicyType {
     Random,
     RoundRobin,
+    Passthrough,
     CacheAware,
+    CacheAwareV1,
+    LeastLoad,
     PowerOfTwo,
     Bucket,
     Manual,
@@ -533,6 +536,7 @@ impl Router {
             Ok(match policy {
                 PolicyType::Random => ConfigPolicyConfig::Random,
                 PolicyType::RoundRobin => ConfigPolicyConfig::RoundRobin,
+                PolicyType::Passthrough => ConfigPolicyConfig::Passthrough,
                 PolicyType::CacheAware => ConfigPolicyConfig::CacheAware {
                     cache_threshold: self.cache_threshold,
                     balance_abs_threshold: self.balance_abs_threshold,
@@ -544,6 +548,24 @@ impl Router {
                     lmcache_overlap_weight: self.lmcache_overlap_weight,
                     balance_token_usage_threshold: 1.0,
                     overload_token_usage_threshold: 1.0,
+                },
+                PolicyType::CacheAwareV1 => ConfigPolicyConfig::CacheAwareV1 {
+                    cache_threshold: self.cache_threshold,
+                    balance_abs_threshold: self.balance_abs_threshold,
+                    balance_rel_threshold: self.balance_rel_threshold,
+                    eviction_interval_secs: self.eviction_interval_secs,
+                    max_tree_size: self.max_tree_size,
+                    block_size: self.block_size,
+                    gpu_overlap_weight: self.gpu_overlap_weight,
+                    lmcache_overlap_weight: self.lmcache_overlap_weight,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
+                },
+                PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
+                    kv_pressure_weight: 0.5,
+                    mean_prefill_tokens: 1024,
+                    default_throughput: 100.0,
+                    load_check_interval_secs: 5,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
