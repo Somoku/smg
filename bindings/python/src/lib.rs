@@ -542,6 +542,8 @@ impl Router {
                     block_size: self.block_size,
                     gpu_overlap_weight: self.gpu_overlap_weight,
                     lmcache_overlap_weight: self.lmcache_overlap_weight,
+                    balance_token_usage_threshold: 1.0,
+                    overload_token_usage_threshold: 1.0,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 5,
@@ -796,6 +798,7 @@ impl Router {
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
                 remove_unhealthy_workers: self.remove_unhealthy_workers,
+                drain_settle_secs: 5,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
@@ -1401,6 +1404,8 @@ impl Router {
                 tito_gc_threshold: self.tito_gc_threshold,
                 webrtc_bind_addr: None,
                 webrtc_stun_server: None,
+                health_check_port: None,
+                runtime_worker_threads: None,
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))

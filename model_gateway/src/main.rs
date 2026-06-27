@@ -1030,6 +1030,8 @@ impl CliArgs {
                 eviction_interval_secs: self.eviction_interval,
                 max_tree_size: self.max_tree_size,
                 block_size: self.block_size,
+                gpu_overlap_weight: self.gpu_overlap_weight,
+                lmcache_overlap_weight: self.lmcache_overlap_weight,
                 balance_token_usage_threshold: self.balance_token_usage_threshold,
                 overload_token_usage_threshold: self.overload_token_usage_threshold,
             },
@@ -1042,6 +1044,8 @@ impl CliArgs {
                 block_size: self.block_size,
                 gpu_overlap_weight: self.gpu_overlap_weight,
                 lmcache_overlap_weight: self.lmcache_overlap_weight,
+                balance_token_usage_threshold: self.balance_token_usage_threshold,
+                overload_token_usage_threshold: self.overload_token_usage_threshold,
             },
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
@@ -1323,10 +1327,6 @@ impl CliArgs {
             HistoryBackend::Redis => (None, None, Some(self.build_redis_config(schema)?)),
             _ => (None, None, None),
         };
-
-        let skills_enabled = self
-            .skills_enabled
-            .unwrap_or_else(|| self.skills_config_path.is_some());
 
         let request_sort_key = match self.routing_loop_request_sort_key.as_str() {
             "long_length" => RequestSortKey::LongLength,
