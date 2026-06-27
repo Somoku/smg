@@ -735,7 +735,7 @@ impl ProtoGenerateRequest {
                     });
                 }
             }
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => {
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {
                 // Non-vLLM backends do not capture routed experts; silently
                 // ignore (keeps the call site backend-agnostic).
             }
@@ -792,7 +792,7 @@ impl ProtoGenerateRequest {
     /// Pin the request to a data-parallel rank (engines without the field ignore it).
     pub fn set_data_parallel_rank(&mut self, rank: i32) {
         match self {
-            Self::Vllm(req) => req.data_parallel_rank = Some(rank),
+            Self::Vllm(req) => req.data_parallel_rank = rank,
             Self::Sglang(req) => req.data_parallel_rank = rank,
             Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => {}
         }
@@ -1266,6 +1266,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.output_ids = tokens,
             Self::Trtllm(c) => c.output_token_ids = tokens,
             Self::Mlx(c) => c.output_ids = tokens,
+            Self::TokenSpeed(c) => c.output_ids = tokens,
         }
     }
 
@@ -1342,6 +1343,7 @@ impl ProtoGenerateComplete {
                         })
                         .collect();
                 }
+                Self::TokenSpeed(_) => {}
             }
         } else {
             match self {
@@ -1349,6 +1351,7 @@ impl ProtoGenerateComplete {
                 Self::Vllm(c) => c.output_logprobs = None,
                 Self::Mlx(c) => c.output_logprobs = None,
                 Self::Trtllm(c) => c.logprobs.clear(),
+                Self::TokenSpeed(_) => {}
             }
         }
 
@@ -1360,6 +1363,7 @@ impl ProtoGenerateComplete {
             Self::Vllm(c) => c.output_ids = token_ids,
             Self::Trtllm(c) => c.output_token_ids = token_ids,
             Self::Mlx(c) => c.output_ids = token_ids,
+            Self::TokenSpeed(c) => c.output_ids = token_ids,
         }
 
         // ── routed_experts ───────────────────────────────────────────────
@@ -1393,7 +1397,7 @@ impl ProtoGenerateComplete {
     pub fn routed_experts(&self) -> Option<ProtoRoutedExperts> {
         match self {
             Self::Vllm(c) => c.routed_experts.as_ref().and_then(ProtoRoutedExperts::from_proto),
-            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) => None,
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => None,
         }
     }
 

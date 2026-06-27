@@ -4,9 +4,9 @@ use smg_mcp::McpConfig;
 
 use super::{
     CandidateSortKey, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KvTransferConfig, MemoryRuntimeConfig, MetricsConfig,
+    HealthCheckConfig, HistoryBackend, KvTransferConfig, MetricsConfig,
     OracleConfig, PolicyConfig, PostgresConfig, PsrlConfig, RedisConfig, RequestSortKey,
-    RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode, SkillsConfig, TokenizerCacheConfig,
+    RetryConfig, RouterConfig, RoutingLoopConfig, RoutingMode, TokenizerCacheConfig,
     TraceConfig, WorkerSelectionStrategy,
 };
 use crate::worker::ConnectionMode;

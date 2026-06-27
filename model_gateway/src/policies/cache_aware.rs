@@ -50,7 +50,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use kv_index::{compute_request_content_hashes, PositionalIndexer, TokenTree, Tree};
+use kv_index::{compute_request_content_hashes, PositionalIndexer, Tier, TokenTree, Tree};
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::Rng;
@@ -897,15 +897,16 @@ impl CacheAwarePolicy {
     ) -> Option<usize> {
         let guard = self.kv_monitor.read();
         let monitor = guard.as_ref()?;
-        let indexer = monitor.get_indexer(model_id)?;
+        let tiered_indexer = monitor.get_indexer(model_id)?;
 
         // Per-model block_size: learned from events > config default
         let block_size = monitor
             .block_size(model_id)
             .unwrap_or(self.config.block_size);
 
+        let indexer = tiered_indexer.tier(Tier::GPU);
         if let Some(idx) =
-            Self::score_overlap(workers, tokens, healthy_indices, &indexer, block_size)
+            Self::score_overlap(workers, tokens, healthy_indices, indexer, block_size)
         {
             return Some(idx);
         }

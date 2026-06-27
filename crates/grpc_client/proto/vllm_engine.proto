@@ -185,6 +185,9 @@ message GenerateRequest {
 
   // Data parallel routing
   int32 data_parallel_rank = 8;
+
+  // Opaque JSON blob for connector KV-transfer params (preferred over the legacy typed field).
+  optional string kv_transfer_params_json = 9;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
@@ -298,6 +301,9 @@ message GenerateComplete {
   // positions [routed_experts_prompt_start, prompt_len + completion_len - 1].
   // Present only when the engine was started with --enable-return-routed-experts.
   RoutedExpertsTensor routed_experts = 12;
+
+  // Opaque JSON blob for connector KV-transfer params returned by the engine.
+  optional string kv_transfer_params_json = 13;
 }
 
 // =====================

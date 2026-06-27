@@ -19,8 +19,7 @@ use std::{
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use openai_protocol::worker::WorkerStatus;
-use parking_lot::RwLock;
-use smg_mesh::OptionalMeshSyncManager;
+
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -63,6 +62,16 @@ impl Default for WorkerId {
     }
 }
 
+/// Tracks whether a worker was registered locally or imported from the mesh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOrigin {
+    /// Registered locally on this gateway instance.
+    Local,
+    /// Imported from a remote peer via mesh synchronization.
+    Mesh,
+}
+
+
 /// Side-effect-free worker snapshot for subscriber bootstrap or lag recovery.
 #[derive(Debug, Clone)]
 pub struct WorkerDescriptor {
@@ -104,12 +113,10 @@ pub struct WorkerRegistry {
     /// Only held during the in-memory model index diff (no I/O, microseconds).
     worker_mutation_locks: Arc<DashMap<WorkerId, Arc<parking_lot::Mutex<()>>>>,
 
-    /// Optional mesh sync manager for state synchronization
-    /// When None, the registry works independently without mesh synchronization
-    /// Uses RwLock for thread-safe access when setting mesh_sync after initialization
-    mesh_sync: Arc<RwLock<OptionalMeshSyncManager>>,
-
-    /// Per-model retry config (last write wins).
+    /// Registration origin per worker (local vs mesh-imported). Written
+    /// under the per-worker mutation lock before the `Registered` event,
+    /// removed in `remove()` teardown.
+    worker_origins: Arc<DashMap<WorkerId, WorkerOrigin>>,
     /// Updated when a worker with non-empty retry overrides registers.
     /// Cleaned up when the last worker for a model is removed.
     /// When retries are disabled, max_retries is set to 1.
@@ -137,7 +144,7 @@ impl WorkerRegistry {
             connection_workers: Arc::new(DashMap::new()),
             url_to_id: Arc::new(DashMap::new()),
             worker_mutation_locks: Arc::new(DashMap::new()),
-            mesh_sync: Arc::new(RwLock::new(None)),
+            worker_origins: Arc::new(DashMap::new()),
             model_retry_configs: Arc::new(DashMap::new()),
             event_tx: broadcast::Sender::new(64),
         }
@@ -152,6 +159,21 @@ impl WorkerRegistry {
     /// and on `RecvError::Lagged`. Holds no locks. Emits no events.
     pub fn subscribe_events(&self) -> broadcast::Receiver<WorkerEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Returns the origin (Local vs Mesh) for a worker, or None if
+    /// the worker is not registered.
+    pub fn origin_of(&self, worker_id: &WorkerId) -> Option<WorkerOrigin> {
+        self.worker_origins.get(worker_id).map(|entry| *entry)
+    }
+
+    /// Remove a mesh-imported worker. Returns None (no-op) if the
+    /// worker is locally owned or unknown.
+    pub fn remove_remote(&self, worker_id: &WorkerId) -> Option<Arc<dyn Worker>> {
+        match self.origin_of(worker_id) {
+            Some(WorkerOrigin::Mesh) => self.remove(worker_id),
+            _ => None,
+        }
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -706,20 +728,6 @@ impl WorkerRegistry {
                 .push(worker_id.clone());
         }
 
-        // Sync to mesh if enabled (no-op if mesh is not enabled)
-        {
-            let guard = self.mesh_sync.read();
-            if let Some(ref mesh_sync) = *guard {
-                mesh_sync.sync_worker_state(
-                    worker_id.as_str().to_string(),
-                    new_worker.model_id().to_string(),
-                    new_worker.url().to_string(),
-                    new_worker.is_healthy(),
-                    0.0,
-                    bincode::serialize(&new_worker.metadata().spec).unwrap_or_default(),
-                );
-            }
-        }
 
         let _ = self.event_tx.send(WorkerEvent::Replaced {
             worker_id: worker_id.clone(),
@@ -873,18 +881,6 @@ impl WorkerRegistry {
         }
     }
 
-    /// Set (or clear) the mesh sync manager after initialisation.
-    ///
-    /// Thread-safe via an internal `RwLock`. The registry forwards worker
-    /// add/replace/remove events to the manager when one is installed.
-    /// Scheduled for removal when `WorkerSyncAdapter` (mesh v2) replaces
-    /// this hook; the registry will then have zero mesh awareness. Emits
-    /// no events.
-    pub fn set_mesh_sync(&self, mesh_sync: OptionalMeshSyncManager) {
-        let mut guard = self.mesh_sync.write();
-        *guard = mesh_sync;
-    }
-
     // ───────────────────────────────────────────────────────────────────
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────
@@ -915,6 +911,7 @@ impl WorkerRegistry {
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
+            self.worker_origins.remove(worker_id);
 
             for model_id in Self::worker_model_ids(&worker) {
                 self.remove_worker_from_model_index(&model_id, worker.url());
@@ -946,13 +943,6 @@ impl WorkerRegistry {
             }
             Metrics::remove_worker_metrics(worker.url());
 
-            // Sync removal to mesh if enabled (no-op if mesh is not enabled)
-            {
-                let guard = self.mesh_sync.read();
-                if let Some(ref mesh_sync) = *guard {
-                    mesh_sync.remove_worker_state(worker_id.as_str());
-                }
-            }
 
             let _ = self.event_tx.send(WorkerEvent::Removed {
                 worker_id: worker_id.clone(),
@@ -1134,22 +1124,11 @@ impl WorkerRegistry {
             .or_default()
             .push(worker_id.clone());
 
-        // Outgoing mesh sync happens under the lock so mesh observers
-        // cannot see a later mutation (Replaced/Removed/StatusChanged)
-        // for this worker_id before the initial state is published.
-        if sync_mesh {
-            let guard = self.mesh_sync.read();
-            if let Some(ref mesh_sync) = *guard {
-                mesh_sync.sync_worker_state(
-                    worker_id.as_str().to_string(),
-                    worker.model_id().to_string(),
-                    worker.url().to_string(),
-                    worker.is_healthy(),
-                    0.0,
-                    bincode::serialize(&worker.metadata().spec).unwrap_or_default(),
-                );
-            }
-        }
+        // Track origin: local registrations (sync_mesh=true) are published
+        // to the mesh by WorkerSyncAdapter; mesh imports (sync_mesh=false)
+        // must never be re-published.
+        let origin = if sync_mesh { WorkerOrigin::Local } else { WorkerOrigin::Mesh };
+        self.worker_origins.insert(worker_id.clone(), origin);
 
         // Broadcast under the lock so event order per worker_id is
         // strictly: Registered → (Replaced | StatusChanged | Removed).
@@ -1267,8 +1246,8 @@ impl Default for WorkerRegistry {
     }
 }
 
-impl smg_mesh::WorkerStateSubscriber for WorkerRegistry {
-    fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
+impl WorkerRegistry {
+    pub fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
         use openai_protocol::model_card::ModelCard;
 
         // If worker already exists at this URL, update its health
@@ -1333,6 +1312,7 @@ impl smg_mesh::WorkerStateSubscriber for WorkerRegistry {
         }
     }
 }
+
 
 /// Statistics for the worker registry
 #[derive(Debug, Clone)]
@@ -2106,7 +2086,7 @@ mod tests {
 
     #[test]
     fn test_mesh_worker_state_subscriber() {
-        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+        use smg_mesh::WorkerState;
 
         let registry = WorkerRegistry::new();
 
@@ -2155,7 +2135,7 @@ mod tests {
 
     #[test]
     fn test_mesh_imported_worker_emits_registered_event() {
-        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+        use smg_mesh::WorkerState;
 
         // Mesh-imported workers must emit `WorkerEvent::Registered` so
         // event-driven subscribers (WorkerManager's health scheduler)
@@ -2192,7 +2172,7 @@ mod tests {
 
     #[test]
     fn test_mesh_worker_state_update_is_silent_on_existing_worker() {
-        use smg_mesh::{WorkerState, WorkerStateSubscriber};
+        use smg_mesh::WorkerState;
 
         // Health updates for an already-registered worker mutate the
         // local status field directly (via `set_status`) without

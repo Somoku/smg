@@ -67,6 +67,8 @@ impl PolicyFactory {
                 block_size,
                 gpu_overlap_weight,
                 lmcache_overlap_weight,
+                balance_token_usage_threshold,
+                overload_token_usage_threshold,
             } => {
                 let config = CacheAwareConfig {
                     cache_threshold: *cache_threshold,
@@ -77,7 +79,8 @@ impl PolicyFactory {
                     block_size: *block_size,
                     gpu_overlap_weight: *gpu_overlap_weight,
                     lmcache_overlap_weight: *lmcache_overlap_weight,
-                    ..Default::default()
+                    balance_token_usage_threshold: *balance_token_usage_threshold,
+                    overload_token_usage_threshold: *overload_token_usage_threshold,
                 };
                 Ok(Arc::new(CacheAwareV1Policy::with_config(config)))
             }

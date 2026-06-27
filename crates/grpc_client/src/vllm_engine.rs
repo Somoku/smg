@@ -324,6 +324,7 @@ impl VllmEngineClient {
             kv_transfer_params: None,
             mm_inputs,
             data_parallel_rank: 0,
+            kv_transfer_params_json: None,
         };
 
         Ok(grpc_request)
@@ -357,6 +358,7 @@ impl VllmEngineClient {
             kv_transfer_params: None,
             mm_inputs: None,
             data_parallel_rank: 0,
+            kv_transfer_params_json: None,
         };
 
         Ok(grpc_request)
@@ -394,6 +396,7 @@ impl VllmEngineClient {
             kv_transfer_params: None,
             mm_inputs: None,
             data_parallel_rank: 0,
+            kv_transfer_params_json: None,
         };
 
         Ok(grpc_request)
@@ -599,6 +602,7 @@ impl VllmEngineClient {
             kv_transfer_params: None,
             mm_inputs: multimodal_inputs,
             data_parallel_rank: 0,
+            kv_transfer_params_json: None,
         };
 
         Ok(grpc_request)
@@ -662,6 +666,7 @@ impl VllmEngineClient {
             kv_transfer_params: None,
             mm_inputs: None,
             data_parallel_rank: 0,
+            kv_transfer_params_json: None,
         };
 
         Ok(grpc_request)
@@ -909,6 +914,7 @@ mod tests {
             kv_transfer_params: None,
             mm_inputs: None,
             data_parallel_rank: 0,
+            kv_transfer_params_json: None,
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");

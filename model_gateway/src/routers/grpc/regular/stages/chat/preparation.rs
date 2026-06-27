@@ -1,6 +1,7 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
 use std::sync::Arc;
+use llm_multimodal::Modality;
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -102,6 +103,7 @@ impl ChatPreparationStage {
                     mm_components,
                     &tokenizer_id,
                     &tokenizer_source,
+                    Modality::Image,
                 )
                 .await
                 .map_err(|e| {

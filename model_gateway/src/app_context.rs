@@ -744,24 +744,6 @@ impl Default for AppContextBuilder {
     }
 }
 
-/// Enforce runtime-aware constraints for conversation memory writer availability.
-fn validate_memory_writer_configuration(config: &RouterConfig) -> Result<(), String> {
-    let backend_supports_memory_writer = backend_supports_memory_writer(&config.history_backend);
-
-    if config.memory_runtime.enabled && !backend_supports_memory_writer {
-        return Err(
-            "memory_runtime.enabled is true but selected storage backend does not support conversation memory writer".to_string(),
-        );
-    }
-
-    if config.memory_runtime.enabled && config.storage_hook_wasm_path.is_some() {
-        return Err(
-            "memory_runtime.enabled cannot be used with storage_hook_wasm_path until conversation memory writer hooks are implemented".to_string(),
-        );
-    }
-
-    Ok(())
-}
 
 /// Initialize the routing loop runtime for an `AppContext` whose configuration
 /// has `routing_loop.enabled = true`.

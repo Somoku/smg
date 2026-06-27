@@ -66,13 +66,12 @@ use crate::{
         openai::realtime::ws::RealtimeQueryParams,
         parse, responses as response_handlers,
         router_manager::RouterManager,
-        skills, tokenize, RouterTrait,
+        tokenize, RouterTrait,
     },
     service_discovery::{start_service_discovery, ServiceDiscoveryConfig},
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
     worker::{
         manager::{WorkerManager, WorkerManagerConfig},
-        worker::WorkerType,
         WorkerRoutingControlRequest, WorkerStatsUpdateRequest, WorkerWeightVersionUpdateRequest,
     },
     workflow::{
@@ -585,7 +584,7 @@ async fn list_workers_rest(
     state
         .context
         .worker_service
-        .list_workers(query.model.as_deref())
+        .list_workers()
         .into_response()
 }
 
@@ -740,86 +739,6 @@ async fn v1_tokenizers_remove(
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
 
-async fn v1_skills_create(State(state): State<Arc<AppState>>, multipart: Multipart) -> Response {
-    skills::create_skill(State(state), multipart).await
-}
-
-async fn v1_skills_list(
-    State(state): State<Arc<AppState>>,
-    query: Query<SkillsListQuery>,
-    headers: HeaderMap,
-) -> Response {
-    skills::list_skills(State(state), query, headers).await
-}
-
-async fn v1_skills_get(
-    State(state): State<Arc<AppState>>,
-    Path(skill_id): Path<String>,
-    query: Query<SkillGetQuery>,
-    headers: HeaderMap,
-) -> Response {
-    skills::get_skill(State(state), Path(skill_id), query, headers).await
-}
-
-async fn v1_skills_patch(
-    State(state): State<Arc<AppState>>,
-    Path(skill_id): Path<String>,
-    query: Query<SkillGetQuery>,
-    ValidatedJson(body): ValidatedJson<SkillPatchRequest>,
-) -> Response {
-    skills::patch_skill(State(state), Path(skill_id), query, Json(body)).await
-}
-
-async fn v1_skills_create_version(
-    State(state): State<Arc<AppState>>,
-    Path(skill_id): Path<String>,
-    multipart: Multipart,
-) -> Response {
-    skills::create_skill_version(State(state), Path(skill_id), multipart).await
-}
-
-async fn v1_skills_list_versions(
-    State(state): State<Arc<AppState>>,
-    Path(skill_id): Path<String>,
-    query: Query<SkillVersionsListQuery>,
-    headers: HeaderMap,
-) -> Response {
-    skills::list_skill_versions(State(state), Path(skill_id), query, headers).await
-}
-
-async fn v1_skills_get_version(
-    State(state): State<Arc<AppState>>,
-    Path((skill_id, version)): Path<(String, String)>,
-    query: Query<SkillGetQuery>,
-    headers: HeaderMap,
-) -> Response {
-    skills::get_skill_version(State(state), Path((skill_id, version)), query, headers).await
-}
-
-async fn v1_skills_patch_version(
-    State(state): State<Arc<AppState>>,
-    Path((skill_id, version)): Path<(String, String)>,
-    query: Query<SkillGetQuery>,
-    ValidatedJson(body): ValidatedJson<SkillVersionPatchRequest>,
-) -> Response {
-    skills::patch_skill_version(State(state), Path((skill_id, version)), query, Json(body)).await
-}
-
-async fn v1_skills_delete(
-    State(state): State<Arc<AppState>>,
-    Path(skill_id): Path<String>,
-    query: Query<SkillGetQuery>,
-) -> Response {
-    skills::delete_skill(State(state), Path(skill_id), query).await
-}
-
-async fn v1_skills_delete_version(
-    State(state): State<Arc<AppState>>,
-    Path((skill_id, version)): Path<(String, String)>,
-    query: Query<SkillGetQuery>,
-) -> Response {
-    skills::delete_skill_version(State(state), Path((skill_id, version)), query).await
-}
 
 /// POST /tito/sessions — create a new TITO session and return its ID.
 async fn tito_create_session(State(state): State<Arc<AppState>>) -> Response {

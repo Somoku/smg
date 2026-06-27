@@ -61,6 +61,6 @@ pub use weight_version::{
     WorkerWeightVersionUpdateResult, WorkerWeightVersionUpdateResultItem,
 };
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType,
-    DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    AttachedBody, BasicWorker, ConnectionMode, RoutingState, RuntimeType, Worker, WorkerLoadGuard,
+    WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
 };

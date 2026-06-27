@@ -9,14 +9,14 @@
 //! functions differ because they work with different input types (`ChatMessage` vs
 //! `InputMessage`).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
-    AsyncMultiModalTracker, FieldLayout, ImageDetail, ImageFrame, ImageProcessorRegistry,
+    AsyncMultiModalTracker, FieldLayout, ImageDetail, ImageFrame, VisionProcessorRegistry,
     MediaConnector, MediaConnectorConfig, MediaContentPart, Modality, ModelMetadata, ModelRegistry,
-    ModelSpecificValue, PlaceholderRange, PreProcessorConfig, PreprocessedImages,
+    ModelSpecificValue, PlaceholderRange, PreProcessorConfig, PreprocessedEncoderInputs,
     PromptReplacement, TrackedMedia, TrackerOutput,
 };
 use llm_tokenizer::TokenizerTrait;
@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 
 use crate::routers::grpc::{
     client::GrpcClient,
+    context::WorkerSelection,
     proto_wrapper::{SglangMultimodalData, TensorBytes, TrtllmMultimodalData, VllmMultimodalData},
     MultimodalData,
 };
@@ -40,6 +41,8 @@ pub(crate) struct MultimodalModelConfig {
     pub config: serde_json::Value,
     /// Preprocessor config (preprocessor_config.json)
     pub preprocessor_config: PreProcessorConfig,
+    /// Video-specific preprocessor config, when provided by the model repo.
+    pub video_preprocessor_config: Option<PreProcessorConfig>,
 }
 
 /// Shared cache of multimodal model configuration files keyed by tokenizer UUID.
@@ -142,9 +145,12 @@ impl MultimodalConfigRegistry {
             PreProcessorConfig::default()
         };
 
+        let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
+
         let model_config = Arc::new(MultimodalModelConfig {
             config,
             preprocessor_config,
+            video_preprocessor_config,
         });
 
         self.configs
@@ -161,10 +167,82 @@ impl Default for MultimodalConfigRegistry {
     }
 }
 
+pub(crate) fn load_preprocessor_config_file(
+    path: &Path,
+    label: &str,
+) -> Option<PreProcessorConfig> {
+    if !path.exists() {
+        return None;
+    }
+
+    match std::fs::read_to_string(path) {
+        Ok(config_str) => match PreProcessorConfig::from_json(&config_str) {
+            Ok(config) => Some(config),
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to parse {label}"
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to read {label}"
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    let video_path = base_dir.join("video_preprocessor_config.json");
+    if let Some(config) =
+        load_preprocessor_config_file(&video_path, "video_preprocessor_config.json")
+    {
+        return Some(config);
+    }
+
+    let processor_path = base_dir.join("processor_config.json");
+    if !processor_path.exists() {
+        return None;
+    }
+
+    let processor_config = match std::fs::read_to_string(&processor_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    {
+        Some(config) => config,
+        None => {
+            warn!(
+                path = %processor_path.display(),
+                "Failed to load processor_config.json for video_processor"
+            );
+            return None;
+        }
+    };
+
+    let video_processor = processor_config.get("video_processor")?;
+    match PreProcessorConfig::from_value(video_processor.clone()) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            warn!(
+                path = %processor_path.display(),
+                error = %error,
+                "Failed to parse video_processor from processor_config.json"
+            );
+            None
+        }
+    }
+}
+
 /// Shared multimodal components injected at router creation time.
 pub(crate) struct MultimodalComponents {
     pub media_connector: Arc<MediaConnector>,
-    pub image_processor_registry: Arc<ImageProcessorRegistry>,
+    pub vision_processor_registry: Arc<VisionProcessorRegistry>,
     pub model_registry: Arc<ModelRegistry>,
     /// Shared reference to the app-level multimodal config cache.
     pub config_registry: Arc<MultimodalConfigRegistry>,
@@ -183,7 +261,7 @@ impl MultimodalComponents {
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
-            image_processor_registry: Arc::new(ImageProcessorRegistry::with_defaults()),
+            vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
         })
@@ -207,7 +285,7 @@ pub(crate) struct MultimodalOutput {
 #[derive(Clone, Debug)]
 pub(crate) struct MultimodalIntermediate {
     /// Preprocessed pixel values and model-specific tensors (not yet serialized).
-    pub preprocessed: PreprocessedImages,
+    pub preprocessed: PreprocessedEncoderInputs,
     /// Raw image frames (bytes + blake3 hashes).
     pub images: Vec<Arc<ImageFrame>>,
     /// Full structural placeholder ranges (offset, length).
@@ -234,6 +312,7 @@ pub(crate) async fn resolve_placeholder_token(
     components: &MultimodalComponents,
     tokenizer_id: &str,
     tokenizer_source: &str,
+    modality: Modality,
 ) -> Result<Option<String>> {
     let model_config = components
         .config_registry
@@ -248,9 +327,10 @@ pub(crate) async fn resolve_placeholder_token(
         Some(s) => s,
         None => return Ok(None),
     };
-    Ok(Some(spec.placeholder_token(&metadata).map_err(|e| {
-        anyhow::anyhow!("Failed to get placeholder token: {e}")
-    })?))
+    Ok(Some(
+        spec.placeholder_token_for(&metadata, modality)
+            .map_err(|e| anyhow::anyhow!("Failed to get placeholder token: {e}"))?,
+    ))
 }
 
 /// Check if any messages in the request contain multimodal content (images).
@@ -508,12 +588,12 @@ async fn process_multimodal_parts(
     // doesn't block the tokio async runtime under concurrent load.
     // TODO: consider making the thread pool size configurable.
     let pp_config = model_config.preprocessor_config.clone();
-    let registry = components.image_processor_registry.clone();
+    let registry = components.vision_processor_registry.clone();
     let model_id_owned = model_id.to_string();
     let model_type_owned = model_type.map(String::from);
     let images_for_preprocess = images.clone(); // cheap Arc refcount bumps
 
-    let preprocessed: PreprocessedImages = tokio::task::spawn_blocking(move || {
+    let preprocessed: PreprocessedEncoderInputs = tokio::task::spawn_blocking(move || {
         // Extract DynamicImages inside the blocking closure so the expensive
         // clone happens off the tokio async runtime.
         let raw_images: Vec<image::DynamicImage> = images_for_preprocess
@@ -533,8 +613,8 @@ async fn process_multimodal_parts(
     .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))??;
 
     debug!(
-        num_images = preprocessed.num_img_tokens.len(),
-        total_tokens = preprocessed.num_img_tokens.iter().sum::<usize>(),
+        num_images = preprocessed.feature_token_counts.len(),
+        total_tokens = preprocessed.feature_token_counts.iter().sum::<usize>(),
         "Image preprocessing complete"
     );
 
@@ -700,11 +780,12 @@ fn expand_tokens(
 pub(crate) fn assemble_multimodal_data(
     intermediate: MultimodalIntermediate,
     client: &GrpcClient,
-) -> MultimodalData {
+    _workers: Option<&WorkerSelection>,
+) -> Result<MultimodalData> {
     match client {
-        GrpcClient::Sglang(_) => MultimodalData::Sglang(assemble_sglang(intermediate)),
-        GrpcClient::Vllm(_) => MultimodalData::Vllm(assemble_vllm(intermediate)),
-        GrpcClient::Trtllm(_) => MultimodalData::Trtllm(assemble_trtllm(intermediate)),
+        GrpcClient::Sglang(_) => Ok(MultimodalData::Sglang(assemble_sglang(intermediate))),
+        GrpcClient::Vllm(_) => Ok(MultimodalData::Vllm(assemble_vllm(intermediate))),
+        GrpcClient::Trtllm(_) => Ok(MultimodalData::Trtllm(assemble_trtllm(intermediate))),
         GrpcClient::Mlx(_) => unreachable!(
             "caller rejects multimodal for MLX in build_chat_request/build_messages_request"
         ),
@@ -750,8 +831,8 @@ fn assemble_vllm(intermediate: MultimodalIntermediate) -> VllmMultimodalData {
         .iter()
         .map(|p| (p.offset as u32, p.length as u32))
         .collect();
-    let batched_keys = PreprocessedImages::batched_keys(&intermediate.field_layouts);
-    let flat_keys = PreprocessedImages::flat_keys(&intermediate.field_layouts);
+    let batched_keys = PreprocessedEncoderInputs::batched_keys(&intermediate.field_layouts);
+    let flat_keys = PreprocessedEncoderInputs::flat_keys(&intermediate.field_layouts);
 
     VllmMultimodalData {
         pixel_values,
@@ -780,11 +861,11 @@ fn assemble_trtllm(intermediate: MultimodalIntermediate) -> TrtllmMultimodalData
 // ---------------------------------------------------------------------------
 
 /// Serialize pixel values ndarray to raw little-endian f32 bytes + shape.
-fn serialize_pixel_values(preprocessed: &PreprocessedImages) -> (Vec<u8>, Vec<u32>) {
+fn serialize_pixel_values(preprocessed: &PreprocessedEncoderInputs) -> (Vec<u8>, Vec<u32>) {
     let pixel_bytes: Vec<u8> = if let Some(pixel_slice) = preprocessed
-        .pixel_values
+        .encoder_input
         .as_slice()
-        .or_else(|| preprocessed.pixel_values.as_slice_memory_order())
+        .or_else(|| preprocessed.encoder_input.as_slice_memory_order())
     {
         // Zero-copy reinterpret: &[f32] → &[u8] on little-endian (x86).
         // This replaces the per-element flat_map(to_le_bytes) which was the
@@ -803,13 +884,13 @@ fn serialize_pixel_values(preprocessed: &PreprocessedImages) -> (Vec<u8>, Vec<u3
         // which matches the shape — unlike as_slice_memory_order() which would
         // silently serialize in wrong dimension order for Fortran-contiguous arrays.
         preprocessed
-            .pixel_values
+            .encoder_input
             .iter()
             .flat_map(|v| v.to_le_bytes())
             .collect()
     };
     let pixel_shape: Vec<u32> = preprocessed
-        .pixel_values
+        .encoder_input
         .shape()
         .iter()
         .map(|&d| d as u32)

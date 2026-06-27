@@ -40,6 +40,9 @@ pub const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 /// vLLM Mooncake KV connector name
 pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 
+/// vLLM NIXL KV connector name
+pub const NIXL_CONNECTOR: &str = "NixlConnector";
+
 pub struct WorkerRoutingKeyLoad {
     url: String,
     active_routing_keys: dashmap::DashMap<String, usize>,
@@ -107,6 +110,19 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
             .field("active_routing_keys", &self.value())
             .finish()
     }
+}
+
+/// One-shot routing snapshot — see [`Worker::routing_state`].
+#[derive(Clone, Copy, Debug)]
+pub struct RoutingState {
+    /// `status == Ready`.
+    pub healthy: bool,
+    /// Circuit breaker permits execution (closed or half-open).
+    pub can_execute: bool,
+    /// Active in-flight request count.
+    pub load: usize,
+    /// Lifetime processed-request count (min-load tie-break).
+    pub processed: usize,
 }
 
 /// Core worker abstraction that represents a backend service
@@ -317,11 +333,51 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.record_circuit_breaker_outcome(!is_failure);
     }
 
+    /// Snapshot all routing-relevant state in a single load burst so callers
+    /// (that guard traffic is a large share of routing CPU at scale). `BasicWorker`
+    /// overrides this to share the runtime guard.
+    fn routing_state(&self) -> RoutingState {
+        RoutingState {
+            healthy: self.is_healthy(),
+            can_execute: self.circuit_breaker_can_execute(),
+            load: self.load(),
+            processed: self.processed_requests(),
+        }
+    }
+
     /// Get the resolved resilience config for this worker.
     fn resilience(&self) -> &ResolvedResilience;
 
     /// Get the per-worker HTTP client.
     fn http_client(&self) -> &reqwest::Client;
+
+    /// Flush the KV cache on this worker (admin operation).
+    async fn flush_cache(&self) -> WorkerResult<()> {
+        Ok(())
+    }
+
+    /// Start profiling on this worker (admin operation).
+    async fn start_profile(
+        &self,
+        _options: &openai_protocol::worker::ProfileOptions,
+    ) -> WorkerResult<()> {
+        Ok(())
+    }
+
+    /// Stop profiling on this worker (admin operation).
+    async fn stop_profile(&self) -> WorkerResult<()> {
+        Ok(())
+    }
+
+    /// Get the maximum number of running requests this worker can handle.
+    /// Parsed from the `max_running_requests` label when present.
+    fn max_running_requests(&self) -> Option<u16> {
+        self.metadata()
+            .spec
+            .labels
+            .get("max_running_requests")
+            .and_then(|s| s.parse::<u16>().ok())
+    }
 
     // ── Metadata convenience delegates ──────────────────────────────
     //
@@ -485,7 +541,7 @@ impl WorkerTypeExt for WorkerType {
 #[derive(Debug, Clone)]
 pub struct WorkerMetadata {
     /// Protocol-level worker identity and configuration.
-    pub spec: WorkerSpec,
+    pub spec: Arc<WorkerSpec>,
     /// Resolved health check config (router defaults + per-worker overrides).
     /// This is the concrete config used at runtime; `spec.health` only stores
     /// the partial overrides from the API layer.
@@ -2216,7 +2272,7 @@ mod tests {
     #[test]
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
-            spec: WorkerSpec::new("http://test:8080"),
+            spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
         };
@@ -2239,7 +2295,7 @@ mod tests {
         let mut spec = WorkerSpec::new("http://test:8080");
         spec.models = WorkerModels::from(vec![model1, model2]);
         let metadata = WorkerMetadata {
-            spec,
+            spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
         };
