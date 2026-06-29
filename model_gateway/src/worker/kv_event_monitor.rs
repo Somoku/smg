@@ -49,6 +49,19 @@ const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
 /// Maximum reconnection delay (caps exponential backoff).
 const MAX_RECONNECT_DELAY_MS: u64 = 30_000;
 
+/// After this many failed replay attempts for the same gap, skip missing sequences.
+const MAX_CONSECUTIVE_GAP_REPLAYS: u32 = 3;
+
+/// If replay cannot fill a gap, advance ``last_seq`` so the indexer can move on.
+/// Returns the new ``last_seq`` (``received - 1``) when force-resync triggers.
+fn force_resync_last_seq(consecutive_gap_replays: u32, expected: u64, received: u64) -> Option<u64> {
+    if consecutive_gap_replays >= MAX_CONSECUTIVE_GAP_REPLAYS && received > expected {
+        Some(received.saturating_sub(1))
+    } else {
+        None
+    }
+}
+
 /// Manages per-worker KV cache event subscriptions.
 ///
 /// Each (gRPC worker, dp_rank) gets a dedicated tokio task that subscribes to
@@ -326,6 +339,7 @@ impl KvEventMonitor {
         let mut state = WorkerTierState::new(&indexer, &worker_url);
         let mut last_seq: u64 = 0;
         let mut reconnect_delay_ms = INITIAL_RECONNECT_DELAY_MS;
+        let mut consecutive_gap_replays: u32 = 0;
 
         /// Sleep with shutdown check. Returns `true` if shutdown was signaled.
         macro_rules! sleep_or_shutdown {
@@ -421,7 +435,7 @@ impl KvEventMonitor {
 
             let stream_result = tokio::select! {
                 result = Self::process_stream(
-                    stream, &worker_url, &indexer, &mut state, &mut last_seq,
+                    stream, &worker_url, &indexer, &mut state, &mut last_seq, &mut consecutive_gap_replays,
                 ) => result,
                 _ = &mut shutdown_rx => {
                     state.cleanup(&indexer);
@@ -431,6 +445,7 @@ impl KvEventMonitor {
 
             match stream_result {
                 StreamResult::Ended => {
+                    consecutive_gap_replays = 0;
                     info!(
                         worker_url = %worker_url,
                         last_seq = last_seq,
@@ -449,6 +464,7 @@ impl KvEventMonitor {
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
                 StreamResult::Error(e) => {
+                    consecutive_gap_replays = 0;
                     warn!(
                         worker_url = %worker_url,
                         error = %e,
@@ -466,10 +482,33 @@ impl KvEventMonitor {
                     reconnect_delay_ms = (reconnect_delay_ms * 2).min(MAX_RECONNECT_DELAY_MS);
                 }
                 StreamResult::GapDetected { expected, received } => {
+                    consecutive_gap_replays = consecutive_gap_replays.saturating_add(1);
+                    if let Some(new_last) =
+                        force_resync_last_seq(consecutive_gap_replays, expected, received)
+                    {
+                        warn!(
+                            worker_url = %worker_url,
+                            ?dp_rank,
+                            expected = expected,
+                            received = received,
+                            old_last_seq = last_seq,
+                            new_last_seq = new_last,
+                            attempts = consecutive_gap_replays,
+                            "Force resync after failed KV event replay; skipping seq {}..={}",
+                            expected,
+                            received.saturating_sub(1),
+                        );
+                        last_seq = new_last;
+                        consecutive_gap_replays = 0;
+                        continue;
+                    }
                     warn!(
                         worker_url = %worker_url,
+                        ?dp_rank,
                         expected = expected,
                         received = received,
+                        last_seq = last_seq,
+                        attempts = consecutive_gap_replays,
                         "Sequence gap detected, reconnecting for replay from seq {last_seq}"
                     );
                     // No backoff — gap replay is a normal recovery path.
@@ -489,6 +528,7 @@ impl KvEventMonitor {
         indexer: &TieredIndexer,
         state: &mut WorkerTierState,
         last_seq: &mut u64,
+        consecutive_gap_replays: &mut u32,
     ) -> StreamResult {
         use tokio_stream::StreamExt;
 
@@ -524,6 +564,7 @@ impl KvEventMonitor {
             }
 
             *last_seq = batch.sequence_number;
+            *consecutive_gap_replays = 0;
         }
 
         StreamResult::Ended
@@ -967,5 +1008,17 @@ mod tests {
 
         monitor.stop().await;
         assert!(monitor.block_size("llama").is_none());
+    }
+
+    #[test]
+    fn test_force_resync_after_max_attempts() {
+        assert_eq!(force_resync_last_seq(2, 510, 511), None);
+        assert_eq!(force_resync_last_seq(3, 510, 511), Some(510));
+        assert_eq!(force_resync_last_seq(5, 509, 55675), Some(55674));
+    }
+
+    #[test]
+    fn test_force_resync_no_op_when_contiguous() {
+        assert_eq!(force_resync_last_seq(3, 511, 511), None);
     }
 }

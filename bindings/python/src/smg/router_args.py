@@ -39,6 +39,8 @@ class RouterArgs:
     block_size: int = 16
     gpu_overlap_weight: float = 1.0  # Weight for GPU-tier cache hits (cache_aware event-driven scoring)
     lmcache_overlap_weight: float = 0.5  # Weight for LMCache-tier (off-GPU) cache hits
+    balance_token_usage_threshold: float = 1.0  # KV spread trigger; >= 1.0 disables
+    overload_token_usage_threshold: float = 1.0  # KV ceiling trigger; >= 1.0 disables
     max_idle_secs: int = 4 * 3600
     assignment_mode: str = "random"  # Mode for manual policy new routing key assignment
     max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
@@ -323,7 +325,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual",
+            choices=["random", "round_robin", "cache_aware", "cache_aware_v1", "power_of_two", "manual",
                      "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"],
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
@@ -338,6 +340,7 @@ class RouterArgs:
                 "random",
                 "round_robin",
                 "cache_aware",
+                "cache_aware_v1",
                 "power_of_two",
                 "manual",
                 "bucket",
@@ -354,7 +357,7 @@ class RouterArgs:
             f"--{prefix}decode-policy",
             type=str,
             default=None,
-            choices=["random", "round_robin", "cache_aware", "power_of_two", "manual",
+            choices=["random", "round_robin", "cache_aware", "cache_aware_v1", "power_of_two", "manual",
                      "request_num_balance", "throughput_optimal", "throughput_optimal_with_budget"],
             help=(
                 "Specific policy for decode nodes in PD mode."
@@ -383,6 +386,24 @@ class RouterArgs:
             help=(
                 "Relative threshold for load difference. Balancing is triggered if"
                 " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-token-usage-threshold",
+            type=float,
+            default=RouterArgs.balance_token_usage_threshold,
+            help=(
+                "KV-utilization spread (hottest minus coldest, 0.0-1.0) above which cache"
+                " affinity is abandoned for shortest-queue. >= 1.0 disables (default)."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}overload-token-usage-threshold",
+            type=float,
+            default=RouterArgs.overload_token_usage_threshold,
+            help=(
+                "KV-utilization ceiling (0.0-1.0): hottest backend above it triggers shedding."
+                " >= 1.0 disables (default)."
             ),
         )
         routing_group.add_argument(

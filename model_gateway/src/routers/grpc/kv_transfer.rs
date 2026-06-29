@@ -120,6 +120,11 @@ impl KvTransferCoordinator {
             // the forced-eviction KeyError path. The destination re-prefills at
             // worst; it never depends on the source dropping its copy.
             copy: true,
+            // Pass the destination's current training-checkpoint version so the
+            // source servicer looks up the matching version pool in LMCache
+            // (multi_version_kv). Falls back to -1 (version-agnostic) when the
+            // u64 version overflows i32, which never happens in practice.
+            dst_model_version: i32::try_from(dst.dyn_weight_version()).unwrap_or(-1),
         };
 
         match self.config.transfer_mode {

@@ -101,6 +101,8 @@ impl PolicyRegistry {
     ) {
         if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
             cache_aware.set_kv_event_monitor(monitor.cloned());
+        } else if let Some(v1) = policy.as_any().downcast_ref::<CacheAwareV1Policy>() {
+            v1.set_kv_event_monitor(monitor.cloned());
         }
     }
 
@@ -127,6 +129,8 @@ impl PolicyRegistry {
     fn maybe_inject_load_rx(policy: &Arc<dyn LoadBalancingPolicy>, rx: Option<&LoadReceiver>) {
         if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
             cache_aware.set_load_receiver(rx.cloned());
+        } else if let Some(v1) = policy.as_any().downcast_ref::<CacheAwareV1Policy>() {
+            v1.set_load_receiver(rx.cloned());
         }
     }
 
@@ -259,6 +263,21 @@ impl PolicyRegistry {
                 }
             }
             Arc::new(cache_aware)
+        } else if policy_type == "cache_aware_v1" {
+            let cache_aware_v1 = CacheAwareV1Policy::new();
+            {
+                let guard = self.kv_event_monitor.read();
+                if let Some(ref monitor) = *guard {
+                    cache_aware_v1.set_kv_event_monitor(Some(Arc::clone(monitor)));
+                }
+            }
+            {
+                let guard = self.load_rx.read();
+                if let Some(ref rx) = *guard {
+                    cache_aware_v1.set_load_receiver(Some(rx.clone()));
+                }
+            }
+            Arc::new(cache_aware_v1)
         } else {
             PolicyFactory::create_by_name(policy_type).unwrap_or_else(|| {
                 warn!("Unknown policy type '{}', using default", policy_type);

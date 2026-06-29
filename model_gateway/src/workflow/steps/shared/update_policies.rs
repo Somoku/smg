@@ -9,6 +9,7 @@ use wfaas::{
 };
 
 use crate::{
+    policies::is_cache_aware_policy_name,
     worker::{ConnectionMode, Worker},
     workflow::data::WorkerRegistrationData,
 };
@@ -123,17 +124,17 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
             // Check for configuration conflicts between prefill and decode
             Self::check_worker_conflicts(&model_id, &all_workers);
             if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
-                if policy.name() == "cache_aware" {
+                if is_cache_aware_policy_name(policy.name()) {
                     app_context
                         .policy_registry
                         .init_cache_aware_policy(&model_id, &all_workers);
                 }
             }
 
-            // Start KV event subscription for gRPC workers with cache_aware policy
+            // Start KV event subscription for gRPC workers with cache-aware policy
             if let Some(ref monitor) = app_context.kv_event_monitor {
                 if let Some(policy) = app_context.policy_registry.get_policy(&model_id) {
-                    if policy.name() == "cache_aware"
+                    if is_cache_aware_policy_name(policy.name())
                         && *worker.connection_mode() == ConnectionMode::Grpc
                     {
                         monitor.on_worker_added(worker).await;

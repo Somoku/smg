@@ -49,6 +49,11 @@ pub use throughput_optimal::{
     ThroughputOptimalConfig, ThroughputOptimalPolicy, ThroughputOptimalWithBudgetPolicy,
 };
 
+/// Returns true for SMG cache-aware routing policy names.
+pub(crate) fn is_cache_aware_policy_name(name: &str) -> bool {
+    matches!(name, "cache_aware" | "cache_aware_v1")
+}
+
 /// Core trait for load balancing policies
 ///
 /// This trait provides a unified interface for implementing routing algorithms

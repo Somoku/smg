@@ -17,9 +17,8 @@ import grpc
 import msgspec
 import numpy as np
 import torch
-import zmq
-import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
+from smg_grpc_servicer.vllm.kv_event_replay import KvEventReplayHub
 from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
@@ -144,6 +143,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Monotonic event-id counter for converted KvCacheEvents.
         self.kv_event_id_counter = 0
+
+        self._kv_replay_hub: KvEventReplayHub | None = None
+        if self.kv_events_config is not None:
+            parallel_config = self.engine.vllm_config.parallel_config
+            dp_size = int(parallel_config.data_parallel_size)
+            kv_decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
+            self._kv_replay_hub = KvEventReplayHub(
+                endpoint=self.kv_events_config.endpoint,
+                topic=self.kv_events_config.topic,
+                dp_size=dp_size,
+                decode=kv_decoder.decode,
+                convert=self._convert_kv_event_batch,
+                offset_endpoint_port=ZmqEventPublisher.offset_endpoint_port,
+            )
+            self._kv_replay_hub.start()
+            logger.info(
+                "KV event replay hub started dp_size=%d endpoint=%s",
+                dp_size,
+                self.kv_events_config.endpoint,
+            )
 
         # KV-transfer statistics, mirroring psrl_agent's RolloutRouter counters.
         # SMG drives transfers from the Rust gateway, so this servicer's
@@ -318,12 +337,19 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
 
             # Build sampling params with detokenize=False
+            _version_tag = (
+                str(self.kv_cache_manager.current_version)
+                if self.kv_cache_manager is not None
+                and getattr(self.kv_cache_manager.config, "multi_version_kv", False)
+                else None
+            )
             sampling_params = self._sampling_params_from_proto(
                 request.sampling_params,
                 stream=request.stream,
                 kv_transfer_params=request.kv_transfer_params
                 if request.HasField("kv_transfer_params")
                 else None,
+                model_version_tag=_version_tag,
             )
             tokenization_kwargs = self._tokenization_kwargs_from_proto(request.sampling_params)
 
@@ -722,7 +748,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         The publisher's native sequence numbers are forwarded as-is so SMG's gap
         detection and ``start_sequence_number`` replay work unchanged.
         """
-        if self.kv_events_config is None:
+        if self._kv_replay_hub is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
                 "KV cache events not enabled. Launch vLLM with a kv_events_config "
@@ -730,55 +756,26 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
             return
 
-        config = self.kv_events_config
         dp_rank = request.dp_rank if request.HasField("dp_rank") else 0
-
-        # The publisher binds e.g. "tcp://*:5557"; connect on localhost and offset
-        # the port by the requested dp_rank to reach that rank's stream.
-        pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
-        pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, dp_rank)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        sub_socket.subscribe(config.topic.encode("utf-8"))
-        sub_socket.connect(pub_endpoint)
+        start_seq = int(request.start_sequence_number)
 
         logger.info(
-            "SubscribeKvEvents: connected to ZMQ endpoint %s (dp_rank=%d)",
-            pub_endpoint,
+            "SubscribeKvEvents: dp_rank=%d start_sequence_number=%d (replay then live)",
             dp_rank,
+            start_seq,
         )
 
-        # Send headers immediately so the tonic client's subscribe future resolves
-        # before the first event arrives.
-        await context.send_initial_metadata(())
-
-        decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
-
         try:
-            while not context.cancelled():
-                try:
-                    frames = await asyncio.wait_for(sub_socket.recv_multipart(), timeout=1.0)
-                except (TimeoutError, asyncio.TimeoutError):
-                    continue
-
-                # ZMQ multipart layout: [topic, seq(8B big-endian), msgpack payload]
-                if len(frames) < 3:
-                    continue
-
-                zmq_seq = int.from_bytes(frames[1], "big")
-                payload = frames[2]
-                try:
-                    raw_batch = decoder.decode(payload)
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("Failed to decode KV event batch: %s", e)
-                    continue
-
-                yield self._convert_kv_event_batch(raw_batch, zmq_seq)
+            async for batch in self._kv_replay_hub.subscribe(
+                dp_rank,
+                start_seq,
+                send_initial_metadata=lambda: context.send_initial_metadata(()),
+                is_cancelled=context.cancelled,
+            ):
+                yield batch
         except asyncio.CancelledError:
             pass
         finally:
-            sub_socket.close(linger=0)
             logger.info("SubscribeKvEvents: stream closed (dp_rank=%d)", dp_rank)
 
     def _convert_kv_event_batch(
@@ -917,6 +914,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 (src_instance, src_backend),
                 (request.dst_instance_id, dst_backend),
                 request.copy,
+                dst_model_version=(
+                    request.dst_model_version
+                    if getattr(self.kv_cache_manager.config, "multi_version_kv", False)
+                    else -1
+                ),
             )
         except Exception as e:  # noqa: BLE001
             self._record_kv_transfer("exception")
@@ -1078,6 +1080,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         params: vllm_engine_pb2.SamplingParams,
         stream: bool = True,
         kv_transfer_params: vllm_engine_pb2.KvTransferParams | None = None,
+        model_version_tag: str | None = None,
     ) -> SamplingParams:
         """
         Convert protobuf SamplingParams to vLLM SamplingParams.
@@ -1086,6 +1089,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             params: Protobuf SamplingParams message
             stream: Whether streaming is enabled
             kv_transfer_params: KV transfer params proto for Mooncake PD
+            model_version_tag: LMCache model-version tag to inject into
+                ``extra_args["kv_transfer_params"]`` when multi-version KV is
+                enabled (e.g. ``"3"`` for version 3).  ``None`` = no injection.
 
         Returns:
             vLLM SamplingParams with detokenize=False and structured_outputs
@@ -1131,6 +1137,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     "remote_port": remote_port,
                 }
             }
+
+        # Inject model-version tag for LMCache version-aware KV store/retrieve.
+        if model_version_tag is not None:
+            if extra_args is None:
+                extra_args = {}
+            extra_args.setdefault("kv_transfer_params", {})
+            extra_args["kv_transfer_params"]["lmcache.tag.model_version"] = model_version_tag
 
         # Create SamplingParams
         # output_kind=DELTA: Return only new tokens in each chunk (for streaming)

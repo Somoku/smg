@@ -701,7 +701,10 @@ impl AppContextBuilder {
     fn with_kv_event_monitor(mut self, config: &RouterConfig) -> Self {
         use crate::config::types::PolicyConfig;
 
-        let is_cache_aware = matches!(config.policy, PolicyConfig::CacheAware { .. });
+        let is_cache_aware = matches!(
+            config.policy,
+            PolicyConfig::CacheAware { .. } | PolicyConfig::CacheAwareV1 { .. }
+        );
 
         if is_cache_aware {
             let monitor = Arc::new(KvEventMonitor::new(None));
