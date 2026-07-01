@@ -54,15 +54,15 @@ use kv_index::{compute_request_content_hashes, Tier, TieredIndexer, TokenTree, T
 use openai_protocol::worker::WorkerLoadResponse;
 use parking_lot::RwLock;
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use super::{
     normalize_model_key, utils::PeriodicTask, CacheAwareConfig, LoadBalancingPolicy,
-    SelectWorkerInfo,
+    SelectWorkerInfo, TreeHandle, TreeKind,
 };
 use crate::{
+    mesh::adapters::tree_sync::{RepairEntry, TreeRepairPage},
     worker::{KvEventMonitor, Worker},
 };
 
@@ -560,13 +560,154 @@ impl CacheAwareV1Policy {
     }
 }
 
-/// Which of the two local trees a hash query targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TreeKind {
-    String,
-    Token,
-}
+impl TreeHandle for CacheAwareV1Policy {
+    fn apply_known_remote_insert(
+        &self,
+        model_id: &str,
+        tree_kind: TreeKind,
+        node_hash: u64,
+        worker_url: &str,
+    ) -> bool {
+        // Normalize empty → UNKNOWN_MODEL_ID so lookups match the
+        // key shape every populate site already uses.
+        let model_id = normalize_model_key(model_id);
+        let Some(model_entry) = self.hash_index.get(model_id) else {
+            return false;
+        };
+        match tree_kind {
+            TreeKind::String => {
+                let Some(path) = model_entry.string_tree.get(&node_hash) else {
+                    return false;
+                };
+                let Some(tree) = self.string_trees.get(model_id) else {
+                    // Hash index entry without a corresponding
+                    // tree means a populate site mutated
+                    // `hash_index` without creating the tree
+                    // (or eviction dropped the tree but left the
+                    // index). Returning false here masks the
+                    // invariant violation as a spurious repair
+                    // request, so log loudly.
+                    warn!(
+                        model_id,
+                        node_hash,
+                        "string hash_index entry without matching string_trees entry; populate-site invariant violated",
+                    );
+                    return false;
+                };
+                tree.insert_text(path.value(), worker_url);
+                true
+            }
+            TreeKind::Token => {
+                let Some(tokens) = model_entry.token_tree.get(&node_hash) else {
+                    return false;
+                };
+                let Some(tree) = self.token_trees.get(model_id) else {
+                    warn!(
+                        model_id,
+                        node_hash,
+                        "token hash_index entry without matching token_trees entry; populate-site invariant violated",
+                    );
+                    return false;
+                };
+                tree.insert_tokens(tokens.value(), worker_url);
+                true
+            }
+        }
+    }
 
+    fn open_repair_stream(
+        &self,
+        model_id: &str,
+        tree_kind: TreeKind,
+    ) -> Option<Box<dyn Iterator<Item = RepairEntry> + Send>> {
+        let model_id = normalize_model_key(model_id);
+        match tree_kind {
+            TreeKind::String => {
+                let tree = self.string_trees.get(model_id)?.value().clone();
+                Some(Box::new(tree.iter_entries().map(|(path, tenants)| {
+                    RepairEntry::String { path, tenants }
+                })))
+            }
+            TreeKind::Token => {
+                let tree = self.token_trees.get(model_id)?.value().clone();
+                Some(Box::new(tree.iter_entries().map(|(tokens, tenants)| {
+                    RepairEntry::Token { tokens, tenants }
+                })))
+            }
+        }
+    }
+
+    fn apply_repair_page(&self, page: &TreeRepairPage) -> usize {
+        let model_id = normalize_model_key(&page.model_id);
+        let mut applied: usize = 0;
+        match page.tree_kind {
+            TreeKind::String => {
+                // Create the tree on first repair page if it
+                // doesn't exist yet locally — repair is the
+                // primary cold-start path for a fresh peer.
+                let tree = self
+                    .string_trees
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(Tree::new()))
+                    .clone();
+                for entry in &page.entries {
+                    match entry {
+                        RepairEntry::String { path, tenants } => {
+                            for (tenant, _epoch) in tenants {
+                                tree.insert_text(path, tenant);
+                            }
+                            self.hash_index
+                                .entry(model_id.to_string())
+                                .or_default()
+                                .string_tree
+                                .insert(kv_index::hash_node_path(path), path.clone());
+                            applied += 1;
+                        }
+                        RepairEntry::Token { .. } => {
+                            warn!(
+                                model_id,
+                                session_id = %page.session_id,
+                                page_index = page.page_index,
+                                "RepairEntry variant mismatch: page kind=String but entry kind=Token; skipping",
+                            );
+                        }
+                    }
+                }
+            }
+            TreeKind::Token => {
+                let tree = self
+                    .token_trees
+                    .entry(model_id.to_string())
+                    .or_insert_with(|| Arc::new(TokenTree::new()))
+                    .clone();
+                for entry in &page.entries {
+                    match entry {
+                        RepairEntry::Token { tokens, tenants } => {
+                            for (tenant, _epoch) in tenants {
+                                tree.insert_tokens(tokens, tenant);
+                            }
+                            self.hash_index
+                                .entry(model_id.to_string())
+                                .or_default()
+                                .token_tree
+                                .insert(kv_index::hash_token_path(tokens), tokens.clone());
+                            applied += 1;
+                        }
+                        RepairEntry::String { .. } => {
+                            warn!(
+                                model_id,
+                                session_id = %page.session_id,
+                                page_index = page.page_index,
+                                "RepairEntry variant mismatch: page kind=Token but entry kind=String; skipping",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        applied
+    }
+}
 
 impl LoadBalancingPolicy for CacheAwareV1Policy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
@@ -842,11 +983,10 @@ impl CacheAwareV1Policy {
                 // sends on the wire (hash of full sequence). The
                 // VALUE is only the matched prefix — not the full
                 // sequence (32K tokens × 4 bytes = 128 KB worst
-                // case). v1 never populated a token hash index;
-                // v2's `TreeHandle` impl consults this map per
-                // incoming token delta, so maintain it alongside
-                // the tree. Mirrors the string side at the
-                // analogous block; reuses the match `result`
+                // case). The `TreeHandle` impl consults this map
+                // per incoming token delta, so maintain it
+                // alongside the tree. Mirrors the string side at
+                // the analogous block; reuses the match `result`
                 // returned by match_and_insert_with.
                 if self.should_populate_hash_index() {
                     let matched_prefix: Vec<u32> = tokens[..result.matched_token_count].to_vec();

@@ -17,6 +17,8 @@ import grpc
 import msgspec
 import numpy as np
 import torch
+import zmq
+import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_servicer.vllm.kv_event_replay import KvEventReplayHub
 from smg_grpc_servicer.vllm.preemption import drain_preemption_queue
@@ -96,7 +98,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - SubscribePreemptionEvents: Stream scheduler-preempted request IDs to SMG
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None, kv_transfer_stats_log_interval_s: float = 30.0,):
+    def __init__(self, async_llm: EngineClient, start_time: float, preemption_queue: asyncio.Queue | None = None, kv_cache_manager=None, kv_transfer_stats_log_interval_s: float = 30.0, enable_kv_event_replay: bool = False,):
         """
         Initialize the servicer.
 
@@ -109,7 +111,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             kv_cache_manager: Optional PSRL ``KVCacheManager`` enabling the
                 TransferKv/PinKv/UnpinKv RPCs (cross-instance KV migration).
                 When None those RPCs return UNIMPLEMENTED.
+            enable_kv_event_replay: When True, ``SubscribeKvEvents`` is served by
+                a long-lived ``KvEventReplayHub`` that buffers recent batches so
+                gateway gap-replay can recover missed sequences. When False
+                (default), fall back to the original per-subscription inline ZMQ
+                loop with no buffering — the known-good baseline.
         """
+        self.enable_kv_event_replay = enable_kv_event_replay
         self.engine = async_llm
         self.start_time = start_time
         self.preemption_queue: asyncio.Queue[list[str]] = (
@@ -145,7 +153,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self.kv_event_id_counter = 0
 
         self._kv_replay_hub: KvEventReplayHub | None = None
-        if self.kv_events_config is not None:
+        if self.kv_events_config is not None and self.enable_kv_event_replay:
             parallel_config = self.engine.vllm_config.parallel_config
             dp_size = int(parallel_config.data_parallel_size)
             kv_decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
@@ -749,11 +757,66 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         detection and ``start_sequence_number`` replay work unchanged.
         """
         if self._kv_replay_hub is None:
-            await context.abort(
-                grpc.StatusCode.UNIMPLEMENTED,
-                "KV cache events not enabled. Launch vLLM with a kv_events_config "
-                'whose publisher == "zmq".',
+            # Replay disabled: fall back to the original per-subscription inline
+            # ZMQ loop (no buffering). Requires kv_events_config to be set.
+            if self.kv_events_config is None:
+                await context.abort(
+                    grpc.StatusCode.UNIMPLEMENTED,
+                    "KV cache events not enabled. Launch vLLM with a kv_events_config "
+                    'whose publisher == "zmq".',
+                )
+                return
+
+            config = self.kv_events_config
+            dp_rank = request.dp_rank if request.HasField("dp_rank") else 0
+
+            # The publisher binds e.g. "tcp://*:5557"; connect on localhost and offset
+            # the port by the requested dp_rank to reach that rank's stream.
+            pub_endpoint = config.endpoint.replace("*", "127.0.0.1")
+            pub_endpoint = ZmqEventPublisher.offset_endpoint_port(pub_endpoint, dp_rank)
+
+            zmq_ctx = zmq.asyncio.Context.instance()
+            sub_socket = zmq_ctx.socket(zmq.SUB)
+            sub_socket.subscribe(config.topic.encode("utf-8"))
+            sub_socket.connect(pub_endpoint)
+
+            logger.info(
+                "SubscribeKvEvents: connected to ZMQ endpoint %s (dp_rank=%d, no replay)",
+                pub_endpoint,
+                dp_rank,
             )
+
+            # Send headers immediately so the tonic client's subscribe future resolves
+            # before the first event arrives.
+            await context.send_initial_metadata(())
+
+            decoder = msgspec.msgpack.Decoder(type=KVEventBatch)
+
+            try:
+                while not context.cancelled():
+                    try:
+                        frames = await asyncio.wait_for(sub_socket.recv_multipart(), timeout=1.0)
+                    except (TimeoutError, asyncio.TimeoutError):
+                        continue
+
+                    # ZMQ multipart layout: [topic, seq(8B big-endian), msgpack payload]
+                    if len(frames) < 3:
+                        continue
+
+                    zmq_seq = int.from_bytes(frames[1], "big")
+                    payload = frames[2]
+                    try:
+                        raw_batch = decoder.decode(payload)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("Failed to decode KV event batch: %s", e)
+                        continue
+
+                    yield self._convert_kv_event_batch(raw_batch, zmq_seq)
+            except asyncio.CancelledError:
+                pass
+            finally:
+                sub_socket.close(linger=0)
+                logger.info("SubscribeKvEvents: stream closed (dp_rank=%d)", dp_rank)
             return
 
         dp_rank = request.dp_rank if request.HasField("dp_rank") else 0
