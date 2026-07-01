@@ -516,7 +516,7 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         tokens: Option<&[u32]>,
         routing_meta: Option<&RoutingMeta>,
         selected: &Arc<dyn Worker>,
-    ) -> Result<(), Response> {
+    ) -> Result<Option<i64>, Response> {
         let meta = routing_meta.ok_or_else(|| {
             error::internal_error(
                 "missing_routing_metadata",
@@ -526,14 +526,24 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
         let request_id = meta.request_id;
         let selected_instance = self.worker_instance_id(selected);
 
+        // Pin an unversioned (`-1`) request to the selected instance's synced
+        // version. Once pinned, the value never changes: later re-routes
+        // (partial-rollout loopback, subsequent agent turns) keep filtering on
+        // this version so they can only land on an instance at least as fresh.
+        let synced_version = self.version_after_sync(selected);
+        let pinned_version = if meta.version_tag < 0 {
+            synced_version
+        } else {
+            meta.version_tag
+        };
+
         if let Some(ps_client) = self.runtime.ps_manager_client.get() {
             let result = if meta.rollout_instance_hint.is_none() {
-                let version = self.version_after_sync(selected);
                 ps_client
                     .reserve_rollout_instance_requests(
                         vec![selected_instance.clone()],
                         vec![request_id],
-                        vec![version],
+                        vec![synced_version],
                         false,
                         meta.is_validate,
                     )
@@ -601,7 +611,34 @@ impl WorkerSelectorStrategy for PsrlWorkerSelector {
             }
         }
 
-        Ok(())
+        // Route-decision trace (dedicated `route_trace` target → own log file).
+        // Emitted after commit so `version_tag` reflects the pinned version
+        // rather than the pre-commit `-1`.
+        {
+            let stats = selected.engine_stats().scheduler_stats;
+            let prompt_tokens = tokens.map(<[u32]>::len).unwrap_or(0);
+            let response_tokens = meta.response_token_count.unwrap_or(0);
+            info!(
+                target: "route_trace",
+                event = "route",
+                request_id = meta.request_id,
+                prompt_id = meta.prompt_id,
+                version_tag = pinned_version,
+                prompt_tokens,
+                response_tokens,
+                total_tokens = prompt_tokens + response_tokens,
+                dst_instance = %selected_instance.0,
+                dst_dp_rank = selected_instance.1,
+                dst_running = stats.num_running_reqs,
+                dst_waiting = stats.num_waiting_reqs,
+                dst_kv_cache_usage = stats.kv_cache_usage,
+                "route"
+            );
+        }
+
+        // Signal a pin update only when the request arrived unversioned so the
+        // caller rewrites `x-version-tag` for subsequent re-routes.
+        Ok((meta.version_tag < 0).then_some(pinned_version))
     }
 }
 
@@ -737,6 +774,65 @@ mod tests {
         runtime.instance_to_version_after_sync.insert(instance, 3);
 
         assert_eq!(selector.version_after_sync(&worker), 3);
+    }
+
+    fn make_selector(runtime: &Arc<RoutingLoopRuntime>) -> PsrlWorkerSelector {
+        PsrlWorkerSelector::new(
+            Arc::new(WorkerRegistry::new()),
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            Arc::clone(runtime),
+            false,
+            CandidateSortKey::Version,
+            true,
+            None,
+        )
+    }
+
+    fn make_meta(version_tag: i64) -> RoutingMeta {
+        RoutingMeta {
+            request_id: 1,
+            prompt_id: 1,
+            version_tag,
+            is_validate: false,
+            is_sticky: false,
+            rollout_instance_hint: None,
+            response_token_count: None,
+        }
+    }
+
+    /// An unversioned (`-1`) request is pinned to the selected instance's
+    /// synced version, and the pin is signalled back to the caller.
+    #[tokio::test]
+    async fn commit_pins_unversioned_request_to_synced_version() {
+        let runtime = make_runtime();
+        let selector = make_selector(&runtime);
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
+        let instance = selector.worker_instance_id(&worker);
+        runtime.instance_to_version_after_sync.insert(instance, 5);
+
+        let meta = make_meta(-1);
+        let pinned = selector
+            .commit_single_worker("model", None, Some(&meta), &worker)
+            .await
+            .expect("commit should succeed");
+        assert_eq!(pinned, Some(5));
+    }
+
+    /// An already-versioned request keeps its version and reports no pin update.
+    #[tokio::test]
+    async fn commit_keeps_versioned_request_unchanged() {
+        let runtime = make_runtime();
+        let selector = make_selector(&runtime);
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://worker-a:8000").build());
+        let instance = selector.worker_instance_id(&worker);
+        runtime.instance_to_version_after_sync.insert(instance, 5);
+
+        let meta = make_meta(4);
+        let pinned = selector
+            .commit_single_worker("model", None, Some(&meta), &worker)
+            .await
+            .expect("commit should succeed");
+        assert_eq!(pinned, None);
     }
 
     /// Stage 2 pin: rollout_instance_hint (mig disabled) should pin to the hinted instance.

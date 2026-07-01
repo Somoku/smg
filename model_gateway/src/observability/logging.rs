@@ -1,21 +1,25 @@
 //! Logging infrastructure with non-blocking file I/O.
 
 use std::path::PathBuf;
+use std::fs::File;
 
 use tracing::Level;
-use tracing_appender::{
-    non_blocking::WorkerGuard,
-    rolling::{RollingFileAppender, Rotation},
-};
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_log::LogTracer;
 use tracing_subscriber::{
-    fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer,
+    filter::filter_fn, fmt::time::ChronoUtc, layer::SubscriberExt, util::SubscriberInitExt,
+    EnvFilter, Layer,
 };
 
 use super::otel_trace::get_otel_layer;
 use crate::config::TraceConfig;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// Dedicated tracing target for route/pop decision events. Events with this
+/// target are routed to their own `route_trace` rotating file and kept out of
+/// stdout and the main `smg` log.
+pub const ROUTE_TRACE_TARGET: &str = "route_trace";
 
 /// All workspace crate names (hyphens → underscores to match tracing targets).
 /// When no explicit log targets are configured, these crates get the configured
@@ -63,9 +67,9 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Guard that keeps the file appender thread alive.
+/// Guard that keeps the file appender threads alive.
 pub struct LogGuard {
-    _file_guard: Option<WorkerGuard>,
+    _file_guards: Vec<WorkerGuard>,
 }
 
 #[inline]
@@ -149,14 +153,20 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()));
 
     let stdout_layer = if config.json_format {
-        stdout_layer.json().flatten_event(true).boxed()
+        stdout_layer
+            .json()
+            .flatten_event(true)
+            .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+            .boxed()
     } else {
-        stdout_layer.boxed()
+        stdout_layer
+            .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+            .boxed()
     };
 
     layers.push(stdout_layer);
 
-    let mut file_guard = None;
+    let mut file_guards: Vec<WorkerGuard> = Vec::new();
 
     if let Some(log_dir) = &config.log_dir {
         let log_dir = PathBuf::from(log_dir);
@@ -168,15 +178,27 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
                 {
                     eprintln!("Failed to create log directory: {e}");
                 }
-                return LogGuard { _file_guard: None };
+                return LogGuard {
+                    _file_guards: Vec::new(),
+                };
             }
         }
 
-        let file_appender =
-            RollingFileAppender::new(Rotation::DAILY, log_dir, &config.log_file_name);
-
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        file_guard = Some(guard);
+        // Main log file: fixed filename `<log_file_name>.log`, truncated on each
+        // startup (no daily rotation).
+        let smg_path = log_dir.join(format!("{}.log", config.log_file_name));
+        let smg_writer: Box<dyn std::io::Write + Send> = match File::create(&smg_path) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!("Failed to create log file {smg_path:?}: {e}");
+                }
+                Box::new(std::io::sink())
+            }
+        };
+        let (non_blocking, guard) = tracing_appender::non_blocking(smg_writer);
+        file_guards.push(guard);
 
         let file_layer = tracing_subscriber::fmt::layer()
             .with_ansi(false)
@@ -186,12 +208,56 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
             .with_writer(non_blocking);
 
         let file_layer = if config.json_format {
-            file_layer.json().flatten_event(true).boxed()
+            file_layer
+                .json()
+                .flatten_event(true)
+                .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+                .boxed()
         } else {
-            file_layer.boxed()
+            file_layer
+                .with_filter(filter_fn(|meta| meta.target() != ROUTE_TRACE_TARGET))
+                .boxed()
         };
 
         layers.push(file_layer);
+
+        // Dedicated route/pop decision trace file. Only events emitted with the
+        // `route_trace` target land here (kept out of stdout and smg.log above).
+        // Fixed filename, truncated on each startup (no daily rotation).
+        let route_path = log_dir.join(format!("{ROUTE_TRACE_TARGET}.log"));
+        let route_writer: Box<dyn std::io::Write + Send> = match File::create(&route_path) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!("Failed to create route trace file {route_path:?}: {e}");
+                }
+                Box::new(std::io::sink())
+            }
+        };
+        let (route_non_blocking, route_guard) = tracing_appender::non_blocking(route_writer);
+        file_guards.push(route_guard);
+
+        let route_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(ChronoUtc::new(TIME_FORMAT.to_string()))
+            .with_writer(route_non_blocking);
+
+        let route_layer = if config.json_format {
+            route_layer
+                .json()
+                .flatten_event(true)
+                .with_filter(filter_fn(|meta| meta.target() == ROUTE_TRACE_TARGET))
+                .boxed()
+        } else {
+            route_layer
+                .with_filter(filter_fn(|meta| meta.target() == ROUTE_TRACE_TARGET))
+                .boxed()
+        };
+
+        layers.push(route_layer);
     }
 
     if let Some(otel_layer_config) = &otel_layer_config {
@@ -217,6 +283,6 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .try_init();
 
     LogGuard {
-        _file_guard: file_guard,
+        _file_guards: file_guards,
     }
 }

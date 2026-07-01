@@ -192,14 +192,27 @@ impl PipelineStage for WorkerSelectionStage {
             .map(|preparation| preparation.token_ids())
             .filter(|ids| !ids.is_empty());
         let routing_meta = parse_routing_request_meta_from_context(ctx);
-        strategy
+        let pinned_version = strategy
             .commit_single_worker(
                 ctx.input.model_id.as_str(),
                 tokens,
                 routing_meta.as_ref(),
                 worker,
             )
-            .await
+            .await?;
+
+        // Persist a freshly pinned version tag back into the request headers so
+        // downstream re-routes (partial-rollout loopback, later agent turns)
+        // parse the pinned version instead of the original `-1`.
+        if let Some(version) = pinned_version {
+            if let Ok(value) = http::HeaderValue::from_str(&version.to_string()) {
+                ctx.input
+                    .headers
+                    .get_or_insert_with(Default::default)
+                    .insert("x-version-tag", value);
+            }
+        }
+        Ok(())
     }
 
     fn name(&self) -> &'static str {

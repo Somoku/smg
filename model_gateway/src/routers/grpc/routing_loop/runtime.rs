@@ -22,10 +22,10 @@ use tokio::{
     task::{yield_now, JoinSet},
     time::sleep,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use super::{
-    metadata::RoutingMeta,
+    metadata::{parse_routing_request_meta_from_context, RoutingMeta},
     partial_rollout::{
         drain_stream_for_partial_rollout, merge_into_partial_state, reset_ctx_for_loopback,
     },
@@ -793,6 +793,43 @@ fn send_http_completion(completion: RoutingLoopCompletion, response: Response) {
     }
 }
 
+/// Emit a `pop` decision trace when a request leaves the router: either
+/// finished (`completed`) or temporarily pulled out by a partial-rollout /
+/// migration interruption (`interrupted`). Uses the dedicated `route_trace`
+/// target so it lands in its own log file.
+fn log_pop(
+    runtime: &RoutingLoopRuntime,
+    worker: &Arc<dyn Worker>,
+    meta: Option<&RoutingMeta>,
+    prompt_len: u32,
+    response_tokens: usize,
+    status: &str,
+    finish_reason: &str,
+    iteration_count: u32,
+) {
+    let (base_id, dp) = runtime.instance_id_for_worker(worker);
+    let stats = worker.engine_stats().scheduler_stats;
+    info!(
+        target: "route_trace",
+        event = "pop",
+        request_id = meta.map(|m| m.request_id),
+        prompt_id = meta.map(|m| m.prompt_id),
+        version_tag = meta.map(|m| m.version_tag),
+        prompt_tokens = prompt_len,
+        response_tokens,
+        total_tokens = prompt_len as usize + response_tokens,
+        instance = %base_id,
+        dp_rank = dp,
+        running = stats.num_running_reqs,
+        waiting = stats.num_waiting_reqs,
+        kv_cache_usage = stats.kv_cache_usage,
+        status,
+        finish_reason,
+        iteration_count,
+        "pop"
+    );
+}
+
 /// Full partial-rollout loopback loop for PSRL requests.
 ///
 /// Runs pipeline stages through execution on each iteration.  If the stream
@@ -809,7 +846,7 @@ async fn dispatch_entry_with_partial_rollout(
         mut ctx,
         pipeline,
         completion,
-        routing_meta,
+        mut routing_meta,
     } = entry;
 
     let mut partial_state = ctx.state.partial_rollout_state.take().unwrap_or_default();
@@ -886,6 +923,13 @@ async fn dispatch_entry_with_partial_rollout(
         runtime.cleanup_tracking(request_id, prompt_id);
         return;
     }
+    // Commit may have pinned `x-version-tag` (an unversioned `-1` request gets
+    // pinned to the selected instance's version). Refresh `routing_meta` from
+    // the context headers so the pop/route traces and any re-enqueue carry the
+    // pinned version instead of the stale `-1`.
+    if let Some(refreshed) = parse_routing_request_meta_from_context(&ctx) {
+        routing_meta = Some(refreshed);
+    }
     if let Err(response) = pipeline.execute_post_selection_execution(&mut ctx).await {
         drop(handoff_permit);
         send_http_completion(completion, response);
@@ -951,6 +995,24 @@ async fn dispatch_entry_with_partial_rollout(
             histogram!("smg_partial_rollout_accumulated_tokens").record(accumulated_tokens as f64);
             counter!("smg_partial_rollout_completed_total").increment(1);
 
+            // Pop trace: request finished. `ctx.state.workers` still holds the
+            // serving worker here (execute_remaining_stages resets it below).
+            if let Some(worker) = ctx.state.workers.as_ref().map(|sel| match sel {
+                WorkerSelection::Single { worker } => worker.clone(),
+                WorkerSelection::Dual { decode, .. } => decode.clone(),
+            }) {
+                log_pop(
+                    &runtime,
+                    &worker,
+                    routing_meta.as_ref(),
+                    partial_state.prompt_len,
+                    accumulated_tokens,
+                    "completed",
+                    drained.finish_reason.as_str(),
+                    partial_state.iteration_count,
+                );
+            }
+
             // Override the output_ids in the final complete frame with the
             // full accumulated token sequence from all loopback iterations.
             //
@@ -1015,6 +1077,14 @@ async fn dispatch_entry_with_partial_rollout(
                 if let Ok(v) = HeaderValue::from_str(&dp_rank.to_string()) {
                     headers.insert("x-target-dp-rank", v);
                 }
+                // Echo the pinned version so the SessionRouter can carry it into
+                // the next turn of the trajectory (keeping the request on an
+                // instance at least as fresh as the pinned version).
+                if let Some(version_tag) = routing_meta.as_ref().map(|m| m.version_tag) {
+                    if let Ok(v) = HeaderValue::from_str(&version_tag.to_string()) {
+                        headers.insert("x-version-tag", v);
+                    }
+                }
                 debug!(
                     request_id = ?request_id,
                     base_worker_id = %base_id,
@@ -1051,6 +1121,19 @@ async fn dispatch_entry_with_partial_rollout(
                 }
             };
             let (base_id, dp_rank) = runtime.instance_id_for_worker(&worker);
+
+            // Pop trace: request temporarily pulled out for partial rollout /
+            // migration loopback. Accumulated response length so far is echoed.
+            log_pop(
+                &runtime,
+                &worker,
+                routing_meta.as_ref(),
+                partial_state.prompt_len,
+                partial_state.token_ids.len(),
+                "interrupted",
+                "abort",
+                partial_state.iteration_count,
+            );
 
             // Reset ctx for the next iteration (clears workers, clients,
             // proto_request, dispatch, load_guards, and execution_result).

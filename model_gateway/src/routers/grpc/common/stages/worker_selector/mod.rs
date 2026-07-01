@@ -55,14 +55,21 @@ pub(crate) trait WorkerSelectorStrategy: Send + Sync {
     ) -> Option<Arc<dyn Worker>>;
 
     /// Commit external side effects for a selected worker.
+    ///
+    /// Returns the version tag the request has been pinned to when it changed
+    /// (e.g. an unversioned `version_tag == -1` request pinned to the selected
+    /// instance's synced version), or `None` when no pin update is needed. The
+    /// caller writes the returned value back into the request headers so later
+    /// re-routes (partial-rollout loopback, subsequent agent turns) filter on
+    /// the pinned version instead of `-1`.
     async fn commit_single_worker(
         &self,
         _model_id: &str,
         _tokens: Option<&[u32]>,
         _routing_meta: Option<&RoutingMeta>,
         _selected: &Arc<dyn Worker>,
-    ) -> Result<(), Response> {
-        Ok(())
+    ) -> Result<Option<i64>, Response> {
+        Ok(None)
     }
 }
 
